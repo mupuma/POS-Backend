@@ -23,7 +23,7 @@ router.post('/', auth, async (req, res) => {
             discount_id,
             payment_method,
             amount_paid,
-            tax_rate = 0, // percentage
+            tax_rate = 16, // percentage
             notes
         } = req.body;
 

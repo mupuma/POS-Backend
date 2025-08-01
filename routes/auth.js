@@ -94,7 +94,9 @@ router.post('/login', async (req, res) => {
                 id: foundUser.id,
                 username: foundUser.username,
                 full_name: foundUser.full_name,
-                role: foundUser.role
+                role: foundUser.role,
+                store_location:foundUser.store_location,
+                store_mobile_no:foundUser.store_mobile_no,
             }
         });
 

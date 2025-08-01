@@ -15,6 +15,14 @@ module.exports = (sequelize) => {
             type: DataTypes.STRING(100),
             allowNull: false
         },
+            store_location: {
+                type: DataTypes.STRING(255),
+                allowNull: false
+            },
+            store_mobile_no: {
+                type: DataTypes.STRING(10),
+                allowNull: false
+            },
         role: {
             type: DataTypes.ENUM('admin', 'cashier'),
             defaultValue: 'cashier'

@@ -5,101 +5,139 @@ module.exports = (sequelize) => {
         id: {
             type: DataTypes.INTEGER,
             primaryKey: true,
-            autoIncrement: true
+            autoIncrement: true,
         },
         receipt_number: {
             type: DataTypes.STRING(20),
             unique: true,
-            allowNull: false
+            allowNull: false,
         },
         user_id: {
             type: DataTypes.INTEGER,
             allowNull: false,
             references: {
                 model: 'users',
-                key: 'id'
-            }
+                key: 'id',
+            },
         },
         customer_id: {
             type: DataTypes.INTEGER,
             allowNull: true,
             references: {
                 model: 'customers',
-                key: 'id'
-            }
+                key: 'id',
+            },
         },
         discount_id: {
             type: DataTypes.INTEGER,
             allowNull: true,
             references: {
                 model: 'discounts',
-                key: 'id'
-            }
+                key: 'id',
+            },
         },
         subtotal: {
             type: DataTypes.DECIMAL(10, 2),
-            allowNull: false
+            allowNull: false,
         },
         discount_amount: {
             type: DataTypes.DECIMAL(10, 2),
-            defaultValue: 0.00
+            defaultValue: 0.00,
         },
         tax_amount: {
             type: DataTypes.DECIMAL(10, 2),
-            defaultValue: 0.00
+            defaultValue: 0.00,
         },
         total_amount: {
             type: DataTypes.DECIMAL(10, 2),
-            allowNull: false
+            allowNull: false,
         },
         payment_method: {
             type: DataTypes.ENUM('cash', 'card', 'mobile_money'),
-            allowNull: false
+            allowNull: false,
         },
         amount_paid: {
             type: DataTypes.DECIMAL(10, 2),
-            allowNull: false
+            allowNull: false,
         },
         change_amount: {
             type: DataTypes.DECIMAL(10, 2),
-            defaultValue: 0.00
+            defaultValue: 0.00,
         },
         sale_date: {
             type: DataTypes.DATE,
-            defaultValue: DataTypes.NOW
+            defaultValue: DataTypes.NOW,
         },
         notes: {
-            type: DataTypes.TEXT
-        }
+            type: DataTypes.TEXT,
+        },
+
+        // New fields added based on the ALTER TABLE statement
+        INVNUMBER: {
+            type: DataTypes.STRING(50),
+            allowNull: true,
+        },
+        RECEIPTNO: {
+            type: DataTypes.STRING(50),
+            allowNull: true,
+        },
+        SDCID: {
+            type: DataTypes.STRING(50),
+            allowNull: true,
+        },
+        RECEIPTSIG: {
+            type: DataTypes.STRING(50),
+            allowNull: true,
+        },
+        INTRLDATA: {
+            type: DataTypes.STRING(100),
+            allowNull: true,
+        },
+        QRCODE: {
+            type: DataTypes.STRING(255),
+            allowNull: true,
+        },
+        VSDCRCPDATE: {
+            type: DataTypes.STRING(100),
+            allowNull: true,
+        },
+        INVOICENO: {
+            type: DataTypes.STRING(100),
+            allowNull: true,
+        },
+        QRFILEPATH: {
+            type: DataTypes.STRING(255),
+            allowNull: true,
+        },
     }, {
         tableName: 'sales',
         timestamps: true,
-        underscored: true
+        underscored: true,
     });
 
     Sale.associate = function(models) {
         // Sale belongs to a user (cashier)
         Sale.belongsTo(models.user, {
             foreignKey: 'user_id',
-            as: 'cashier'
+            as: 'cashier',
         });
 
         // Sale belongs to a customer (optional)
         Sale.belongsTo(models.customer, {
             foreignKey: 'customer_id',
-            as: 'customer'
+            as: 'customer',
         });
 
         // Sale belongs to a discount (optional)
         Sale.belongsTo(models.discount, {
             foreignKey: 'discount_id',
-            as: 'discount'
+            as: 'discount',
         });
 
         // Sale has many sale items
         Sale.hasMany(models.saleitem, {
             foreignKey: 'sale_id',
-            as: 'items'
+            as: 'items',
         });
     };
 
