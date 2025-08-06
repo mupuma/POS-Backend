@@ -1,7 +1,7 @@
 const { DataTypes } = require('sequelize');
 
 module.exports = (sequelize) => {
-    const users = sequelize.define('user', {
+    const user = sequelize.define('user', {
         username: {
             type: DataTypes.STRING(50),
             unique: true,
@@ -15,14 +15,6 @@ module.exports = (sequelize) => {
             type: DataTypes.STRING(100),
             allowNull: false
         },
-            store_location: {
-                type: DataTypes.STRING(255),
-                allowNull: false
-            },
-            store_mobile_no: {
-                type: DataTypes.STRING(10),
-                allowNull: false
-            },
         role: {
             type: DataTypes.ENUM('admin', 'cashier'),
             defaultValue: 'cashier'
@@ -35,16 +27,27 @@ module.exports = (sequelize) => {
             type: DataTypes.DATE,
             defaultValue: DataTypes.NOW
         },
+        store_id: {
+            type: DataTypes.INTEGER,
+            allowNull: false,
+            references: {
+                model: 'stores', // should match the table name exactly (default is pluralized model name)
+                key: 'id'
+            }
+        }
+    }, {
+        timestamps: false
+    });
 
-
-    },
-        {
-            timestamps:false,
+    user.associate = function(models) {
+        user.belongsTo(models.store, {
+            foreignKey: 'store_id'
         });
 
-    users.associate = function(models) {
-        users.hasMany(models.sale, { foreignKey: 'user_id' });
+        user.hasMany(models.sale, {
+            foreignKey: 'user_id'
+        });
     };
 
-    return users;
+    return user;
 };

@@ -13,6 +13,8 @@ const generateReceiptNumber = () => {
 };
 
 // Create new sale
+const ZRAIntegrationService = require('../views/generateSmartInvoice');
+
 router.post('/', auth, async (req, res) => {
     const t = await sale.sequelize.transaction();
 
@@ -36,7 +38,7 @@ router.post('/', auth, async (req, res) => {
         let subtotal = 0;
         const saleItems = [];
 
-        // Validate and calculate each item
+        // Validate and calculate each item - also fetch product details for ZRA
         for (const item of items) {
             const productData = await product.findByPk(item.product_id, { transaction: t });
 
@@ -56,18 +58,21 @@ router.post('/', auth, async (req, res) => {
             const total_price = item.quantity * item.unit_price;
             subtotal += total_price;
 
+            // Include product data for ZRA integration
             saleItems.push({
                 product_id: item.product_id,
                 quantity: item.quantity,
                 unit_price: item.unit_price,
-                total_price
+                total_price,
+                product: productData // Include full product data
             });
         }
 
         // Apply discount
         let discount_amount = 0;
+        let discountData = null;
         if (discount_id) {
-            const discountData = await discount.findByPk(discount_id, { transaction: t });
+            discountData = await discount.findByPk(discount_id, { transaction: t });
             if (discountData && discountData.is_active) {
                 if (discountData.type === 'percentage') {
                     discount_amount = (subtotal * discountData.value) / 100;
@@ -87,7 +92,53 @@ router.post('/', auth, async (req, res) => {
             return res.status(400).json({ message: 'Insufficient payment amount' });
         }
 
-        // Create sale
+        // Get customer data for ZRA
+        let customerData = null;
+        if (customer_id) {
+            customerData = await customer.findByPk(customer_id, { transaction: t });
+        }
+
+        // Prepare sale data for ZRA integration
+        const saleDataForZRA = {
+            subtotal,
+            discount_amount,
+            tax_amount,
+            total_amount,
+            tax_rate,
+            payment_method,
+            amount_paid,
+            change_amount,
+            notes,
+            customer: customerData,
+            discount: discountData
+        };
+
+        // Initialize ZRA Integration Service
+        const zraService = new ZRAIntegrationService();
+
+        // Process ZRA Integration before persisting the sale
+        console.log('Processing ZRA integration...');
+        const zraResults = await zraService.processZRAIntegration(
+            saleDataForZRA,
+            saleItems,
+            req.user
+        );
+
+        // Check if ZRA integration was successful
+        if (!zraResults.success) {
+            await t.rollback();
+            console.error('ZRA Integration failed:', zraResults.errors);
+
+            return res.status(500).json({
+                message: 'Failed to process sale with ZRA system',
+                zra_errors: zraResults.errors,
+                details: 'The sale could not be completed due to ZRA integration issues'
+            });
+        }
+
+        console.log('ZRA integration successful, proceeding with sale creation...');
+
+        // Create sale (only if ZRA integration was successful)
         const newSale = await sale.create({
             receipt_number: generateReceiptNumber(),
             user_id: req.user.id,
@@ -100,14 +151,19 @@ router.post('/', auth, async (req, res) => {
             payment_method,
             amount_paid,
             change_amount,
-            notes: notes || null
+            notes: notes || null,
+            zra_processed: true, // Flag to indicate ZRA processing
+            zra_responses: JSON.stringify(zraResults.responses) // Store ZRA responses
         }, { transaction: t });
 
         // Create sale items and update stock
         for (const item of saleItems) {
             await saleitem.create({
                 sale_id: newSale.id,
-                ...item
+                product_id: item.product_id,
+                quantity: item.quantity,
+                unit_price: item.unit_price,
+                total_price: item.total_price
             }, { transaction: t });
 
             // Update product stock
@@ -140,15 +196,30 @@ router.post('/', auth, async (req, res) => {
 
         res.status(201).json({
             message: 'Sale completed successfully',
-            sale: completeSale
+            sale: completeSale,
+            zra_integration: {
+                success: true,
+                responses: zraResults.responses
+            }
         });
 
     } catch (error) {
         await t.rollback();
-        console.error(error);
+        console.error('Sale creation error:', error);
+
+        // Check if this is a ZRA-related error
+        if (error.message && error.message.includes('ZRA')) {
+            return res.status(500).json({
+                message: 'ZRA integration error',
+                error: error.message
+            });
+        }
+
         res.status(500).json({ message: 'Server error' });
     }
 });
+
+
 
 // Get all sales with pagination
 router.get('/', auth, async (req, res) => {
