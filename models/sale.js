@@ -73,39 +73,39 @@ module.exports = (sequelize) => {
         },
 
         // New fields added based on the ALTER TABLE statement
-        INVNUMBER: {
+        invnumber: {
             type: DataTypes.STRING(50),
             allowNull: true,
         },
-        RECEIPTNO: {
+        receipt_no: {
             type: DataTypes.STRING(50),
             allowNull: true,
         },
-        SDCID: {
+        sdcid: {
             type: DataTypes.STRING(50),
             allowNull: true,
         },
-        RECEIPTSIG: {
+        receiptsig: {
             type: DataTypes.STRING(50),
             allowNull: true,
         },
-        INTRLDATA: {
+        intrldata: {
             type: DataTypes.STRING(100),
             allowNull: true,
         },
-        QRCODE: {
+        qrcode_url: {
             type: DataTypes.STRING(255),
             allowNull: true,
         },
-        VSDCRCPDATE: {
+        vsdcrcpdate: {
             type: DataTypes.STRING(100),
             allowNull: true,
         },
-        INVOICENO: {
+        invoice_no: {
             type: DataTypes.STRING(100),
             allowNull: true,
         },
-        QRFILEPATH: {
+        qrfilepath: {
             type: DataTypes.STRING(255),
             allowNull: true,
         },

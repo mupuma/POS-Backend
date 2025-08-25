@@ -17,7 +17,7 @@ module.exports = (sequelize) => {
         allowNull: false,
         defaultValue: '0999999999'
     },
-    next_invoice_number: {
+    invoice_number: {
                 type: DataTypes.STRING(50),
                 allowNull: false,
                 defaultValue: 'INV-1001-1'

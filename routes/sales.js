@@ -2,8 +2,14 @@ const express = require('express');
 const { sale, saleitem, product, user, customer, discount } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
+const fs = require('fs');
+const path = require('path');
+const QRCode = require('qrcode');
 
 const router = express.Router();
+
+// Import the correct ZRA Integration Service
+const ZRAIntegrationService = require('../services/generateSmartInvoice'); // Adjust path as needed
 
 // Generate receipt number
 const generateReceiptNumber = () => {
@@ -12,9 +18,38 @@ const generateReceiptNumber = () => {
     return `RCP${timestamp}`;
 };
 
-// Create new sale
-const ZRAIntegrationService = require('../views/generateSmartInvoice');
+// Generate invoice number from SDC ID and receipt number
+function generateInvoiceNumber(sdcid, receipt_no) {
+    return "INV" + sdcid.substring(3) + "/" + receipt_no;
+}
 
+// Generate QR Code and save to file
+async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
+    try {
+        // Ensure the save directory exists
+        if (!fs.existsSync(saveDirectory)) {
+            fs.mkdirSync(saveDirectory, { recursive: true });
+        }
+
+        // Sanitize receiptNo for filename
+        const fileName = `qrcode_${receiptNo}.png`;
+        const filePath = path.resolve(saveDirectory, fileName);
+
+        // Generate QR code and save to file
+        await QRCode.toFile(filePath, qrcode_url, {
+            width: 150,
+            margin: 2,
+        });
+
+        console.log(`QR code saved to ${filePath}`);
+        return filePath;
+    } catch (err) {
+        console.error('Error generating QR code:', err);
+        throw err;
+    }
+}
+
+// Create new sale
 router.post('/', auth, async (req, res) => {
     const t = await sale.sequelize.transaction();
 
@@ -32,6 +67,12 @@ router.post('/', auth, async (req, res) => {
         // Validate items
         if (!items || items.length === 0) {
             return res.status(400).json({ message: 'Sale must have at least one item' });
+        }
+
+        // Validate user has store_id
+        if (!req.user.store_id) {
+            await t.rollback();
+            return res.status(400).json({ message: 'User must be associated with a store' });
         }
 
         // Calculate totals
@@ -55,15 +96,20 @@ router.post('/', auth, async (req, res) => {
                 });
             }
 
-            const total_price = item.quantity * item.unit_price;
-            subtotal += total_price;
+            // Unit price is tax-exclusive, calculate tax-inclusive total
+            const tax_exclusive_total = item.quantity * item.unit_price;
+            const item_tax_amount = (tax_exclusive_total * tax_rate) / 100;
+            const tax_inclusive_total = tax_exclusive_total + item_tax_amount;
+
+            subtotal += tax_exclusive_total; // Subtotal remains tax-exclusive
 
             // Include product data for ZRA integration
             saleItems.push({
                 product_id: item.product_id,
                 quantity: item.quantity,
-                unit_price: item.unit_price,
-                total_price,
+                unit_price: item.unit_price, // Tax-exclusive unit price
+                total_price: tax_exclusive_total, // Tax-exclusive total
+                tax_inclusive_total: tax_inclusive_total, // Tax-inclusive total for ZRA
                 product: productData // Include full product data
             });
         }
@@ -110,7 +156,7 @@ router.post('/', auth, async (req, res) => {
             change_amount,
             notes,
             customer: customerData,
-            discount: discountData
+            discount: discountData,
         };
 
         // Initialize ZRA Integration Service
@@ -136,7 +182,47 @@ router.post('/', auth, async (req, res) => {
             });
         }
 
-        console.log('ZRA integration successful, proceeding with sale creation...');
+        console.log('ZRA integration successful:', zraResults.responses);
+
+        // Find the saveSales response
+        const saveSalesResponse = zraResults.responses.find(r => r.endpoint === 'saveSales');
+
+        if (!saveSalesResponse || !saveSalesResponse.success) {
+            await t.rollback();
+            return res.status(500).json({
+                message: 'Failed to get valid response from ZRA saveSales endpoint',
+                zra_errors: zraResults.errors
+            });
+        }
+
+        // Get the data from the saveSales response
+        const saveSalesData = saveSalesResponse.data.data;
+
+        if (!saveSalesData) {
+            await t.rollback();
+            return res.status(500).json({
+                message: 'No data received from ZRA saveSales endpoint'
+            });
+        }
+
+        console.log('ZRA Sales Data:', saveSalesData);
+
+        // Generate QR code file path (but don't await it here to avoid blocking)
+        let qrFilePath = null;
+        if (saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
+            try {
+                qrFilePath = await generateQrCode(
+                    saveSalesData.qrCodeUrl,
+                    saveSalesData.rcptNo,
+                    "./qrcodes"
+                );
+            } catch (qrError) {
+                console.error('QR Code generation failed:', qrError);
+                // Don't fail the entire transaction for QR code generation
+            }
+        }
+
+        console.log('Creating sale record...');
 
         // Create sale (only if ZRA integration was successful)
         const newSale = await sale.create({
@@ -152,9 +238,21 @@ router.post('/', auth, async (req, res) => {
             amount_paid,
             change_amount,
             notes: notes || null,
-            zra_processed: true, // Flag to indicate ZRA processing
-            zra_responses: JSON.stringify(zraResults.responses) // Store ZRA responses
+            // ZRA fields - handle potential missing data
+            invnumber: saveSalesData.invnumber || null,
+            receipt_no: saveSalesData.rcptNo || null,
+            sdcid: saveSalesData.sdcId || null,
+            receiptsig: saveSalesData.rcptSign || null,
+            intrldata: saveSalesData.intrlData || null,
+            qrcode_url: saveSalesData.qrCodeUrl || null,
+            vsdcrcpdate: saveSalesData.vsdcRcptPbctDate || null,
+            invoice_no: (saveSalesData.sdcId && saveSalesData.rcptNo)
+                ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
+                : null,
+            qrfilepath: qrFilePath,
         }, { transaction: t });
+
+        console.log('Sale created successfully:', newSale.id);
 
         // Create sale items and update stock
         for (const item of saleItems) {
@@ -179,6 +277,7 @@ router.post('/', auth, async (req, res) => {
         }
 
         await t.commit();
+        console.log('Transaction committed successfully');
 
         // Fetch complete sale data for response
         const completeSale = await sale.findByPk(newSale.id, {
@@ -199,7 +298,12 @@ router.post('/', auth, async (req, res) => {
             sale: completeSale,
             zra_integration: {
                 success: true,
-                responses: zraResults.responses
+                responses: zraResults.responses.map(r => ({
+                    endpoint: r.endpoint,
+                    success: r.success,
+                    // Don't include full response data in API response for security
+                    message: r.success ? 'Success' : r.error
+                }))
             }
         });
 
@@ -215,11 +319,26 @@ router.post('/', auth, async (req, res) => {
             });
         }
 
-        res.status(500).json({ message: 'Server error' });
+        // Check for specific error types
+        if (error.name === 'SequelizeValidationError') {
+            return res.status(400).json({
+                message: 'Validation error',
+                errors: error.errors.map(e => e.message)
+            });
+        }
+
+        if (error.name === 'SequelizeForeignKeyConstraintError') {
+            return res.status(400).json({
+                message: 'Invalid reference to related data'
+            });
+        }
+
+        res.status(500).json({
+            message: 'Server error',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
     }
 });
-
-
 
 // Get all sales with pagination
 router.get('/', auth, async (req, res) => {
@@ -250,7 +369,7 @@ router.get('/', auth, async (req, res) => {
         });
 
     } catch (error) {
-        console.error(error);
+        console.error('Get sales error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -278,7 +397,7 @@ router.get('/:id', auth, async (req, res) => {
         res.json({ sale: saleData });
 
     } catch (error) {
-        console.error(error);
+        console.error('Get sale by ID error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -292,10 +411,18 @@ router.get('/report/date-range', auth, async (req, res) => {
             return res.status(400).json({ message: 'Start date and end date are required' });
         }
 
+        // Validate date format
+        const startDate = new Date(start_date);
+        const endDate = new Date(end_date);
+
+        if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+            return res.status(400).json({ message: 'Invalid date format' });
+        }
+
         const sales = await sale.findAll({
             where: {
                 sale_date: {
-                    [Op.between]: [new Date(start_date), new Date(end_date)]
+                    [Op.between]: [startDate, endDate]
                 }
             },
             include: [
@@ -308,24 +435,29 @@ router.get('/report/date-range', auth, async (req, res) => {
         // Calculate summary
         const summary = {
             total_sales: sales.length,
-            total_revenue: sales.reduce((sum, s) => sum + parseFloat(s.total_amount), 0),
-            total_discounts: sales.reduce((sum, s) => sum + parseFloat(s.discount_amount), 0),
+            total_revenue: sales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            total_discounts: sales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
             payment_methods: {}
         };
 
         // Group by payment method
         sales.forEach(s => {
-            summary.payment_methods[s.payment_method] =
-                (summary.payment_methods[s.payment_method] || 0) + parseFloat(s.total_amount);
+            const method = s.payment_method || 'unknown';
+            summary.payment_methods[method] =
+                (summary.payment_methods[method] || 0) + parseFloat(s.total_amount || 0);
         });
 
         res.json({
             sales,
-            summary
+            summary,
+            date_range: {
+                start_date: start_date,
+                end_date: end_date
+            }
         });
 
     } catch (error) {
-        console.error(error);
+        console.error('Date range report error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -348,17 +480,28 @@ router.get('/report/daily', auth, async (req, res) => {
         const summary = {
             date: startOfDay.toDateString(),
             total_sales: todaySales.length,
-            total_revenue: todaySales.reduce((sum, s) => sum + parseFloat(s.total_amount), 0),
-            total_discounts: todaySales.reduce((sum, s) => sum + parseFloat(s.discount_amount), 0),
+            total_revenue: todaySales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            total_discounts: todaySales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
             cash_sales: todaySales.filter(s => s.payment_method === 'cash').length,
             card_sales: todaySales.filter(s => s.payment_method === 'card').length,
-            mobile_sales: todaySales.filter(s => s.payment_method === 'mobile_money').length
+            mobile_sales: todaySales.filter(s => s.payment_method === 'mobile_money').length,
+            payment_summary: {
+                cash: todaySales
+                    .filter(s => s.payment_method === 'cash')
+                    .reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+                card: todaySales
+                    .filter(s => s.payment_method === 'card')
+                    .reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+                mobile_money: todaySales
+                    .filter(s => s.payment_method === 'mobile_money')
+                    .reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0)
+            }
         };
 
         res.json({ summary });
 
     } catch (error) {
-        console.error(error);
+        console.error('Daily report error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });

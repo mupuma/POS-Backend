@@ -16,7 +16,7 @@ module.exports = (sequelize) => {
             type: DataTypes.DECIMAL(10, 2),
             defaultValue: 0.00
         },
-        barcode: {
+        product_class_code: {
             type: DataTypes.STRING(50),
             unique: true
         },
@@ -40,7 +40,11 @@ module.exports = (sequelize) => {
             type: DataTypes.DATE,
             defaultValue: DataTypes.NOW,
             onUpdate: DataTypes.NOW
-        }
+        },
+        product_code: {
+                type: DataTypes.STRING(45),
+                unique: true
+            },
     },
         {
             timestamps:false,
