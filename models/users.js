@@ -1,6 +1,4 @@
-const { DataTypes } = require('sequelize');
-
-module.exports = (sequelize) => {
+module.exports = (sequelize, DataTypes) => {
     const user = sequelize.define('user', {
         username: {
             type: DataTypes.STRING(50),
@@ -31,21 +29,25 @@ module.exports = (sequelize) => {
             type: DataTypes.INTEGER,
             allowNull: false,
             references: {
-                model: 'stores', // should match the table name exactly (default is pluralized model name)
+                model: 'stores',
                 key: 'id'
             }
         }
     }, {
+        tableName: 'users',
+        underscored: true,
         timestamps: false
     });
 
     user.associate = function(models) {
         user.belongsTo(models.store, {
-            foreignKey: 'store_id'
+            foreignKey: 'store_id',
+            as: 'store'
         });
 
         user.hasMany(models.sale, {
-            foreignKey: 'user_id'
+            foreignKey: 'user_id',
+            as: 'sales'
         });
     };
 

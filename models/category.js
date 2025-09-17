@@ -13,12 +13,15 @@ module.exports = (sequelize) => {
             type: DataTypes.DATE,
             defaultValue: DataTypes.NOW
         }
-    },
-        {
-            timestamps:false,
-        });
+    }, {
+        tableName: 'categories', // ← ADD THIS
+        underscored: true,       // ← ADD THIS
+        timestamps: false,
+    });
+    
     category.associate = function(models) {
         category.hasMany(models.product, { foreignKey: 'category_id' });
     };
+    
     return category;
 };

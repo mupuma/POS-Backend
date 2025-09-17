@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { store, user } = require('../models'); // Adjust path as needed
+const { store, user } = require('../models');
 const { body, validationResult, param } = require('express-validator');
+const { Op } = require('sequelize');
 
 // Middleware for authentication (adjust as needed)
 // const auth = require('../middleware/auth');
@@ -110,12 +111,55 @@ router.post('/', [
         .matches(/^[0-9]+$/)
         .withMessage('Mobile number must contain only digits'),
 
-    body('next_invoice_number')
+    body('invoice_number')
         .optional()
         .isLength({ min: 1, max: 50 })
-        .withMessage('Next invoice number must be between 1 and 50 characters')
-        .matches(/^[A-Z]{3}-\d{4}-\d+$/)
-        .withMessage('Invoice number format must be like INV-1001-1')
+        .withMessage('Invoice number must be between 1 and 50 characters')
+        .matches(/^INV\d+-\d+$/)
+        .withMessage('Invoice number format must be like INV1001-1'),
+
+    // New fields for ZRA integration
+    body('store_identifier')
+        .optional()
+        .isLength({ min: 1, max: 20 })
+        .withMessage('Store identifier must be between 1 and 20 characters'),
+        
+    body('zra_tpin')
+        .optional()
+        .isLength({ min: 10, max: 10 })
+        .withMessage('ZRA TPIN must be exactly 10 characters')
+        .matches(/^[0-9]+$/)
+        .withMessage('ZRA TPIN must contain only digits'),
+        
+    body('zra_bhf_id')
+        .optional()
+        .isLength({ min: 1, max: 10 })
+        .withMessage('ZRA BHF ID must be between 1 and 10 characters'),
+        
+    body('invoice_prefix')
+        .optional()
+        .isLength({ min: 1, max: 10 })
+        .withMessage('Invoice prefix must be between 1 and 10 characters'),
+        
+    body('merchant_number')
+        .optional()
+        .isLength({ min: 1, max: 20 })
+        .withMessage('Merchant number must be between 1 and 20 characters'),
+        
+    body('receipt_sequence')
+        .optional()
+        .isInt({ min: 1 })
+        .withMessage('Receipt sequence must be a positive integer'),
+        
+    body('receipt_number_length')
+        .optional()
+        .isInt({ min: 1, max: 10 })
+        .withMessage('Receipt number length must be between 1 and 10'),
+        
+    body('zra_enabled')
+        .optional()
+        .isBoolean()
+        .withMessage('ZRA enabled must be a boolean value')
 ], async (req, res) => {
     try {
         // Check for validation errors
@@ -128,7 +172,20 @@ router.post('/', [
             });
         }
 
-        const { store_number, store_location, store_mobile_no, next_invoice_number } = req.body;
+        const { 
+            store_number, 
+            store_location, 
+            store_mobile_no, 
+            invoice_number,
+            store_identifier,
+            zra_tpin,
+            zra_bhf_id,
+            invoice_prefix,
+            merchant_number,
+            receipt_sequence,
+            receipt_number_length,
+            zra_enabled
+        } = req.body;
 
         // Check if store number already exists
         const existingStore = await store.findOne({
@@ -142,19 +199,29 @@ router.post('/', [
             });
         }
 
-        // Generate default invoice number if not provided
-        let invoiceNumber = next_invoice_number;
-        if (!invoiceNumber) {
-            // Extract numeric part from store number for invoice
-            const numericPart = store_number.replace(/[^0-9]/g, '') || '1001';
-            invoiceNumber = `INV-${numericPart}-1`;
+        // Generate default invoice number if not provided using model's logic
+        let finalInvoiceNumber = invoice_number;
+        if (!finalInvoiceNumber) {
+            // Create a temporary store instance to use its method
+            const tempStore = store.build({ store_number });
+            finalInvoiceNumber = tempStore.generateInvoiceNumber();
+            // Reset to initial value for the actual sequence
+            finalInvoiceNumber = finalInvoiceNumber.replace(/-(\d+)$/, '-1');
         }
 
         const newStore = await store.create({
             store_number,
             store_location,
             store_mobile_no,
-            next_invoice_number: invoiceNumber
+            invoice_number: finalInvoiceNumber,
+            store_identifier,
+            zra_tpin,
+            zra_bhf_id,
+            invoice_prefix,
+            merchant_number,
+            receipt_sequence: receipt_sequence || 1,
+            receipt_number_length: receipt_number_length || 6,
+            zra_enabled: zra_enabled !== undefined ? zra_enabled : true
         });
 
         res.status(201).json({
@@ -209,12 +276,55 @@ router.put('/:id', [
         .matches(/^[0-9]+$/)
         .withMessage('Mobile number must contain only digits'),
 
-    body('next_invoice_number')
+    body('invoice_number')
         .optional()
         .isLength({ min: 1, max: 50 })
-        .withMessage('Next invoice number must be between 1 and 50 characters')
-        .matches(/^[A-Z]{3}-\d{4}-\d+$/)
-        .withMessage('Invoice number format must be like INV-1001-1')
+        .withMessage('Invoice number must be between 1 and 50 characters')
+        .matches(/^INV\d+-\d+$/)
+        .withMessage('Invoice number format must be like INV1001-1'),
+        
+    // New fields for ZRA integration
+    body('store_identifier')
+        .optional()
+        .isLength({ min: 1, max: 20 })
+        .withMessage('Store identifier must be between 1 and 20 characters'),
+        
+    body('zra_tpin')
+        .optional()
+        .isLength({ min: 9, max: 9 })
+        .withMessage('ZRA TPIN must be exactly 9 characters')
+        .matches(/^[0-9]+$/)
+        .withMessage('ZRA TPIN must contain only digits'),
+        
+    body('zra_bhf_id')
+        .optional()
+        .isLength({ min: 1, max: 10 })
+        .withMessage('ZRA BHF ID must be between 1 and 10 characters'),
+        
+    body('invoice_prefix')
+        .optional()
+        .isLength({ min: 1, max: 10 })
+        .withMessage('Invoice prefix must be between 1 and 10 characters'),
+        
+    body('merchant_number')
+        .optional()
+        .isLength({ min: 1, max: 20 })
+        .withMessage('Merchant number must be between 1 and 20 characters'),
+        
+    body('receipt_sequence')
+        .optional()
+        .isInt({ min: 1 })
+        .withMessage('Receipt sequence must be a positive integer'),
+        
+    body('receipt_number_length')
+        .optional()
+        .isInt({ min: 1, max: 10 })
+        .withMessage('Receipt number length must be between 1 and 10'),
+        
+    body('zra_enabled')
+        .optional()
+        .isBoolean()
+        .withMessage('ZRA enabled must be a boolean value')
 ], async (req, res) => {
     try {
         // Check for validation errors
@@ -244,7 +354,7 @@ router.put('/:id', [
             const duplicateStore = await store.findOne({
                 where: {
                     store_number: updateData.store_number,
-                    id: { [require('sequelize').Op.ne]: storeId }
+                    id: { [Op.ne]: storeId }
                 }
             });
 
@@ -421,16 +531,16 @@ router.get('/:id/users', [
 
 /**
  * @route   PATCH /api/stores/:id/invoice-number
- * @desc    Update only the next invoice number (for admin use)
+ * @desc    Update only the invoice number (for admin use)
  * @access  Private
  */
 router.patch('/:id/invoice-number', [
     param('id').isInt().withMessage('Store ID must be a valid integer'),
-    body('next_invoice_number')
+    body('invoice_number')
         .isLength({ min: 1, max: 50 })
-        .withMessage('Next invoice number must be between 1 and 50 characters')
-        .matches(/^[A-Z]{3}-\d{4}-\d+$/)
-        .withMessage('Invoice number format must be like INV-1001-1')
+        .withMessage('Invoice number must be between 1 and 50 characters')
+        .matches(/^INV\d+-\d+$/)
+        .withMessage('Invoice number format must be like INV1001-1')
 ], async (req, res) => {
     try {
         // Check for validation errors
@@ -444,7 +554,7 @@ router.patch('/:id/invoice-number', [
         }
 
         const storeId = req.params.id;
-        const { next_invoice_number } = req.body;
+        const { invoice_number } = req.body;
 
         // Check if store exists
         const existingStore = await store.findByPk(storeId);
@@ -457,7 +567,7 @@ router.patch('/:id/invoice-number', [
 
         // Update only the invoice number
         await store.update(
-            { next_invoice_number },
+            { invoice_number },
             { where: { id: storeId } }
         );
 
@@ -470,8 +580,8 @@ router.patch('/:id/invoice-number', [
             data: {
                 id: updatedStore.id,
                 store_number: updatedStore.store_number,
-                previous_invoice_number: existingStore.next_invoice_number,
-                current_invoice_number: updatedStore.next_invoice_number
+                previous_invoice_number: existingStore.invoice_number,
+                current_invoice_number: updatedStore.invoice_number
             }
         });
     } catch (error) {
@@ -483,4 +593,74 @@ router.patch('/:id/invoice-number', [
     }
 });
 
-module.exports = router;
+/**
+ * @route   POST /api/stores/:id/generate-invoice
+ * @desc    Generate a new invoice number for a store (increments sequence)
+ * @access  Private
+ */
+router.post('/:id/generate-invoice', [
+    param('id').isInt().withMessage('Store ID must be a valid integer')
+], async (req, res) => {
+    try {
+        const storeId = req.params.id;
+
+        // Check if store exists
+        const storeInstance = await store.findByPk(storeId);
+        if (!storeInstance) {
+            return res.status(404).json({
+                success: false,
+                message: 'Store not found'
+            });
+        }
+
+        // Use the model's method to generate and save the new invoice number
+        const newInvoiceNumber = await storeInstance.generateCISInvoiceNumber();
+
+        res.json({
+            success: true,
+            message: 'New invoice number generated successfully',
+            data: {
+                id: storeInstance.id,
+                store_number: storeInstance.store_number,
+                previous_invoice_number: storeInstance.invoice_number,
+                new_invoice_number: newInvoiceNumber
+            }
+        });
+    } catch (error) {
+        console.error('Generate invoice number error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while generating invoice number'
+        });
+    }
+});
+
+// Helper function to get store configuration
+async function getStoreConfig(storeId, transaction = null) {
+    const options = {};
+    if (transaction) options.transaction = transaction;
+    
+    const storeData = await store.findByPk(storeId, options);
+    if (!storeData) {
+        throw new Error(`Store with ID ${storeId} not found`);
+    }
+    
+    return {
+        sdcid: storeData.store_identifier,
+        tpin: storeData.zra_tpin,
+        bhfId: storeData.zra_bhf_id,
+        zraEnabled: storeData.zra_enabled,
+        invoicePrefix: storeData.invoice_prefix,
+        merchantNumber: storeData.merchant_number,
+        receiptSequence: storeData.receipt_sequence,
+        receiptNumberLength: storeData.receipt_number_length,
+        invoiceNumber: storeData.invoice_number,
+        // Add method to generate invoice numbers using the model's logic
+        generateInvoiceNumber: () => storeData.generateInvoiceNumber()
+    };
+}
+
+module.exports = {
+    router,
+    getStoreConfig
+};

@@ -7,8 +7,8 @@ const axios = require('axios');
  */
 class ZRAIntegrationService {
     constructor() {
-        this.baseURL = 'http://localhost:8082/sandboxvsdc';
-        // 30 seconds timeout
+        this.baseURL = 'http://localhost:2525/sandboxvsdc/';
+        this.timeout = 30000; // 30 seconds timeout
     }
 
     /**
@@ -52,9 +52,9 @@ class ZRAIntegrationService {
         const taxInclusiveAmount = taxExclusiveAmount + taxAmount;
 
         return {
-            taxableAmount: parseFloat(taxableAmount.toFixed(4)),
+            taxableAmount: parseFloat(taxableAmount.toFixed(2)),
             taxAmount: parseFloat(taxAmount.toFixed(4)),
-            taxInclusiveAmount: parseFloat(taxInclusiveAmount.toFixed(4))
+            taxInclusiveAmount: parseFloat(taxInclusiveAmount.toFixed(2))
         };
     }
 
@@ -103,7 +103,7 @@ class ZRAIntegrationService {
     }
 
     /**
-     * Transform sale data to ZRA sales format
+     * Transform sale data to ZRA sales format with proper rounding
      * @param {object} saleData
      * @param {array} items
      * @param {object} user
@@ -113,24 +113,28 @@ class ZRAIntegrationService {
         const currentDateTime = this.formatZRADateTime();
         const currentDate = this.formatZRADate();
 
-        // Generate invoice number
+        // Generate CIS invoice number
         const cisInvoiceNo = await this.generateCISInvoiceNumber(user.store_id);
 
-        // Calculate totals
         let totalTaxableAmountA = 0;
         let totalTaxAmountA = 0;
+        let totalAmount = 0;
 
         const itemList = items.map((item, index) => {
-            // Use the tax-exclusive total price for calculations
             const taxExclusiveTotal = parseFloat(item.total_price);
+
+            // Calculate VAT
             const { taxableAmount, taxAmount, taxInclusiveAmount } = this.calculateVATAmounts(taxExclusiveTotal, saleData.tax_rate || 16);
 
-            // Calculate tax-inclusive unit price
-            const taxInclusiveUnitPrice = taxInclusiveAmount / item.quantity;
+            // Round amounts to 2 decimal places
+            const vatTaxblAmt = parseFloat(taxableAmount.toFixed(2));
+            const vatAmt = parseFloat(taxAmount.toFixed(2));
+            const totAmt = parseFloat(taxInclusiveAmount.toFixed(2));
+            const prc = parseFloat((totAmt / item.quantity).toFixed(2));
 
-            // Add to totals
-            totalTaxableAmountA += taxableAmount;
-            totalTaxAmountA += taxAmount;
+            totalTaxableAmountA += vatTaxblAmt;
+            totalTaxAmountA += vatAmt;
+            totalAmount += totAmt;
 
             return {
                 itemSeq: index + 1,
@@ -142,8 +146,8 @@ class ZRAIntegrationService {
                 pkg: 0,
                 qtyUnitCd: "BE",
                 qty: item.quantity,
-                prc: parseFloat(taxInclusiveUnitPrice.toFixed(4)),
-                splyAmt: parseFloat(taxInclusiveAmount.toFixed(4)),
+                prc,
+                splyAmt: totAmt,
                 dcRt: 0,
                 dcAmt: 0,
                 isrccCd: "",
@@ -154,17 +158,22 @@ class ZRAIntegrationService {
                 exciseTxCatCd: null,
                 tlCatCd: null,
                 iplCatCd: null,
-                vatTaxblAmt: taxableAmount,
-                vatAmt: taxAmount,
+                vatTaxblAmt,
+                vatAmt,
                 exciseTaxblAmt: 0,
                 tlTaxblAmt: 0,
                 iplTaxblAmt: 0,
                 iplAmt: 0,
                 tlAmt: 0,
                 exciseTxAmt: 0,
-                totAmt: parseFloat(taxInclusiveAmount.toFixed(4))
+                totAmt
             };
         });
+
+        // Round totals to 2 decimal places
+        totalTaxableAmountA = parseFloat(totalTaxableAmountA.toFixed(2));
+        totalTaxAmountA = parseFloat(totalTaxAmountA.toFixed(2));
+        totalAmount = parseFloat(totalAmount.toFixed(2));
 
         return {
             tpin: process.env.ZRA_TPIN || "1002010901",
@@ -179,80 +188,25 @@ class ZRAIntegrationService {
             salesSttsCd: "02",
             cfmDt: currentDateTime,
             salesDt: currentDate,
-            stockRlsDt: null,
-            cnclReqDt: null,
-            cnclDt: null,
-            rfdDt: null,
-            rfdRsnCd: null,
             totItemCnt: items.length,
-            taxblAmtA: parseFloat(totalTaxableAmountA.toFixed(4)),
-            taxblAmtB: 0,
-            taxblAmtC1: 0,
-            taxblAmtC2: 0,
-            taxblAmtC3: 0,
-            taxblAmtD: 0,
-            taxblAmtRvat: 0,
-            taxblAmtE: 0,
-            taxblAmtF: 0,
-            taxblAmtIpl1: 0,
-            taxblAmtIpl2: 0,
-            taxblAmtTl: 0,
-            taxblAmtEcm: 0,
-            taxblAmtExeeg: 0,
-            taxblAmtTot: 0,
-            taxRtA: saleData.tax_rate || 16,
-            taxRtB: 16,
-            taxRtC1: 0,
-            taxRtC2: 0,
-            taxRtC3: 0,
-            taxRtD: 0,
-            tlAmt: 0,
-            taxRtRvat: 16,
-            taxRtE: 0,
-            taxRtF: 10,
-            taxRtIpl1: 5,
-            taxRtIpl2: 0,
-            taxRtTl: 1.5,
-            taxRtEcm: 5,
-            taxRtExeeg: 3,
-            taxRtTot: 0,
-            taxAmtA: parseFloat(totalTaxAmountA.toFixed(4)),
-            taxAmtB: 0,
-            taxAmtC1: 0,
-            taxAmtC2: 0,
-            taxAmtC3: 0,
-            taxAmtD: 0,
-            taxAmtRvat: 0,
-            taxAmtE: 0,
-            taxAmtF: 0,
-            taxAmtIpl1: 0,
-            taxAmtIpl2: 0,
-            taxAmtTl: 0,
-            taxAmtEcm: 0,
-            taxAmtExeeg: 0,
-            taxAmtTot: 0,
-            totTaxblAmt: parseFloat(totalTaxableAmountA.toFixed(4)),
-            totTaxAmt: parseFloat(totalTaxAmountA.toFixed(4)),
-            totAmt: parseFloat(saleData.total_amount.toFixed(4)),
-            prchrAcptcYn: "N",
+            taxblAmtA: totalTaxableAmountA,
+            taxAmtA: totalTaxAmountA,
+            totTaxblAmt: totalTaxableAmountA,
+            totTaxAmt: totalTaxAmountA,
+            totAmt: totalAmount,
+            itemList,
             remark: saleData.notes || "",
             regrId: "admin",
             regrNm: "admin",
             modrId: "admin",
             modrNm: "admin",
             saleCtyCd: "1",
-            lpoNumber: null,
-            currencyTyCd: "ZMW",
-            exchangeRt: "1",
-            destnCountryCd: "",
-            dbtRsnCd: "",
-            invcAdjustReason: "",
-            itemList
+            currencyTyCd: "ZMW"
         };
     }
 
     /**
-     * Transform sale data to ZRA stock items format
+     * Transform sale data to ZRA stock items format with proper rounding
      * @param {object} saleData
      * @param {array} items
      * @param {object} user
@@ -263,63 +217,54 @@ class ZRAIntegrationService {
 
         let totalTaxableAmount = 0;
         let totalTaxAmount = 0;
+        let totalAmount = 0;
 
         const itemList = items.map((item, index) => {
             const taxExclusiveTotal = parseFloat(item.total_price);
+
             const { taxableAmount, taxAmount, taxInclusiveAmount } = this.calculateVATAmounts(taxExclusiveTotal, saleData.tax_rate || 16);
 
-            const taxInclusiveUnitPrice = taxInclusiveAmount / item.quantity;
+            // Round amounts to 2 decimals
+            const taxblAmt = parseFloat(taxableAmount.toFixed(2));
+            const taxAmt = parseFloat(taxAmount.toFixed(2));
+            const totAmt = parseFloat(taxInclusiveAmount.toFixed(2));
+            const prc = parseFloat((totAmt / item.quantity).toFixed(2));
 
-            totalTaxableAmount += taxableAmount;
-            totalTaxAmount += taxAmount;
+            totalTaxableAmount += taxblAmt;
+            totalTaxAmount += taxAmt;
+            totalAmount += totAmt;
 
             return {
                 itemSeq: index + 1,
                 itemCd: item.product?.product_code || `ITEM${item.product_id}`,
                 itemClsCd: item.product?.product_class_code || "50102518",
                 itemNm: item.product?.name || "Product",
-                bcd: null,
-                pkgUnitCd: "BA",
-                pkg: 0,
-                qtyUnitCd: "BE",
                 qty: item.quantity,
-                itemExprDt: null,
-                prc: parseFloat(taxInclusiveUnitPrice.toFixed(4)),
-                splyAmt: parseFloat(taxInclusiveAmount.toFixed(4)),
-                totDcAmt: 0,
-                iplCatCd: null,
-                tlCatCd: null,
-                exciseCatCd: null,
-                taxblAmt: parseFloat(taxableAmount.toFixed(4)),
+                prc,
+                splyAmt: totAmt,
+                taxblAmt,
                 vatCatCd: "A",
-                taxAmt: parseFloat(taxAmount.toFixed(4)),
-                iplAmt: null,
-                tlAmt: null,
-                exciseTxAmt: null,
-                totAmt: parseFloat(taxInclusiveAmount.toFixed(4))
+                taxAmt,
+                totAmt
             };
         });
+
+        totalTaxableAmount = parseFloat(totalTaxableAmount.toFixed(2));
+        totalTaxAmount = parseFloat(totalTaxAmount.toFixed(2));
+        totalAmount = parseFloat(totalAmount.toFixed(2));
 
         return {
             tpin: process.env.ZRA_TPIN || "1002010901",
             bhfId: process.env.ZRA_BHF_ID || "000",
-            sarNo: Math.floor(Math.random() * 900000) + 100000, // Generate 6-digit random SAR number
-            orgSarNo: 0,
-            regTyCd: "M",
-            custTpin: null,
-            custNm: null,
-            custBhfId: "000",
-            sarTyCd: "13",
-            ocrnDt: currentDate,
+            sarNo: Math.floor(Math.random() * 900000) + 100000,
             totItemCnt: items.length,
-            totTaxblAmt: parseFloat(totalTaxableAmount.toFixed(4)),
-            totTaxAmt: parseFloat(totalTaxAmount.toFixed(4)),
-            totAmt: parseFloat(saleData.total_amount.toFixed(4)),
-            remark: null,
+            totTaxblAmt: totalTaxableAmount,
+            totTaxAmt: totalTaxAmount,
+            totAmt: totalAmount,
             regrId: user.username || "Admin",
             regrNm: user.full_name || "Admin",
-            modrNm: user.full_name || "Admin",
             modrId: user.username || "Admin",
+            modrNm: user.full_name || "Admin",
             itemList
         };
     }

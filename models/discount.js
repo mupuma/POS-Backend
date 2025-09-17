@@ -22,13 +22,15 @@ module.exports = (sequelize) => {
             type: DataTypes.DATE,
             defaultValue: DataTypes.NOW
         }
-
-    },
-        {
-            timestamps:false,
-        });
+    }, {
+        tableName: 'discounts',
+        underscored: true, // ← ADD THIS
+        timestamps: false,
+    });
+    
     discount.associate = function(models) {
         discount.hasMany(models.sale, { foreignKey: 'discount_id' });
     };
+    
     return discount;
 };
