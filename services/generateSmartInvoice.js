@@ -414,7 +414,7 @@ class ZRAIntegrationService {
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    timeout: this.timeout
+
                 }
             );
 
@@ -451,7 +451,7 @@ class ZRAIntegrationService {
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    timeout: this.timeout
+
                 }
             );
 
@@ -488,7 +488,7 @@ class ZRAIntegrationService {
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    timeout: this.timeout
+
                 }
             );
 

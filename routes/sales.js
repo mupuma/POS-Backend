@@ -1,7 +1,7 @@
 const express = require('express');
 const { sale, saleitem, product, user, customer, discount } = require('../models');
 const auth = require('../middleware/auth');
-const { Op } = require('sequelize');
+const { Op,sequelize, fn, col} = require('sequelize');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
@@ -10,6 +10,8 @@ const router = express.Router();
 
 // Import the correct ZRA Integration Service
 const ZRAIntegrationService = require('../services/generateSmartInvoice'); // Adjust path as needed
+const SageShipment = require('../services/createSageShipment');
+const AccountsReceivableBatch = require("../services/createSageArBatch"); // Adjust path as needed
 
 // Generate receipt number
 const generateReceiptNumber = () => {
@@ -162,9 +164,12 @@ router.post('/', auth, async (req, res) => {
         // Initialize ZRA Integration Service
         const zraService = new ZRAIntegrationService();
 
+
         // Process ZRA Integration before persisting the sale
         console.log('Processing ZRA integration...');
-        const zraResults = await zraService.processZRAIntegration(
+
+
+      /*  const zraResults = await zraService.processZRAIntegration(
             saleDataForZRA,
             saleItems,
             req.user
@@ -305,8 +310,9 @@ router.post('/', auth, async (req, res) => {
                     message: r.success ? 'Success' : r.error
                 }))
             }
-        });
-
+        });*/
+    await persistInvoiceDataToSage(saleDataForZRA, saleItems, req.user)
+    await persistShipmentDataToSage(saleDataForZRA, saleItems, req.user)
     } catch (error) {
         await t.rollback();
         console.error('Sale creation error:', error);
@@ -339,7 +345,46 @@ router.post('/', auth, async (req, res) => {
         });
     }
 });
+async function persistShipmentDataToSage(saleData, saleItems, user) {
+    try {
+        const sageService = new SageShipment();
+        const sageResponse = await sageService.createShipmentBatch(saleData, saleItems, user);
 
+        if (!sageResponse.success) {
+            console.error('Sage shipment creation failed:', sageResponse.error);
+            return { success: false, error: 'Failed to create shipment in Sage system' };
+        }
+
+        console.log('Sage shipment created successfully:', sageResponse.data);
+        return { success: true, data: sageResponse.data };
+
+    } catch (error) {
+        console.error('Error persisting data to Sage:', error);
+        return { success: false, error: 'Error occurred while communicating with Sage system' };
+    }
+
+}
+
+async function persistInvoiceDataToSage(saleData, saleItems, user) {
+    try {
+
+        const sageService = new AccountsReceivableBatch();
+        const sageResponse = await sageService.createSageArBatch(saleData, saleItems, user);
+
+        if (!sageResponse.success) {
+            console.error('Sage AR invoice creation failed:', sageResponse.error);
+            return { success: false, error: 'Failed to create AR invoice in Sage system' };
+        }
+
+        console.log('Sage AR invoice created successfully:', sageResponse.data);
+        return { success: true, data: sageResponse.data };
+
+    } catch (error) {
+        console.error('Error persisting data to Sage:', error);
+        return { success: false, error: 'Error occurred while communicating with Sage system' };
+    }
+
+}
 // Get all sales with pagination
 router.get('/', auth, async (req, res) => {
     try {
@@ -503,6 +548,275 @@ router.get('/report/daily', auth, async (req, res) => {
     } catch (error) {
         console.error('Daily report error:', error);
         res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Get dashboard statistics
+router.get('/dashboard/stats', auth, async (req, res) => {
+    try {
+        // Get current date ranges
+        const now = new Date();
+        const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const endOfToday = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000 - 1);
+
+        const startOfWeek = new Date(startOfToday);
+        startOfWeek.setDate(startOfToday.getDate() - startOfToday.getDay());
+
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+        // Today's sales statistics
+        const todaysSales = await sale.findAll({
+            where: {
+                sale_date: {
+                    [Op.between]: [startOfToday, endOfToday]
+                }
+            },
+            order: [['sale_date', 'DESC']],
+            limit: 10 // For recent sales
+        });
+
+        const todaysSalesTotal = todaysSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+        const todaysTransactions = todaysSales.length;
+
+        // Week's sales statistics
+        const weekSales = await sale.findAll({
+            where: {
+                sale_date: {
+                    [Op.between]: [startOfWeek, endOfToday]
+                }
+            }
+        });
+
+        const weekSalesTotal = weekSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+
+        // Month's sales statistics
+        const monthSales = await sale.findAll({
+            where: {
+                sale_date: {
+                    [Op.between]: [startOfMonth, endOfToday]
+                }
+            }
+        });
+
+        const monthSalesTotal = monthSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+
+        // Product statistics
+        const totalProducts = await product.count();
+
+        const lowStockProducts = await product.count({
+            where: {
+                stock_quantity: {
+                    [Op.between]: [1, 10] // Assuming low stock is between 1-10
+                }
+            }
+        });
+
+        const outOfStockProducts = await product.count({
+            where: {
+                stock_quantity: {
+                    [Op.lte]: 0
+                }
+            }
+        });
+
+        // Customer statistics
+        const totalCustomers = await customer.count();
+
+        // Active users (assuming users who made sales today are active)
+        const activeUsers = await user.count({
+            include: [{
+                model: sale,
+                as: 'sales', // Adjust this alias based on your User model associations
+                where: {
+                    sale_date: {
+                        [Op.between]: [startOfToday, endOfToday]
+                    }
+                },
+                required: true
+            }],
+            distinct: true
+        });
+
+        // Top products (by quantity sold this month)
+        const topProductsQuery = await saleitem.findAll({
+            attributes: [
+                'product_id',
+                [fn('SUM', col('quantity')), 'total_quantity'],
+                [fn('SUM', col('total_price')), 'total_revenue']
+            ],
+            include: [
+                {
+                    model: sale,
+                    where: {
+                        sale_date: {
+                            [Op.between]: [startOfMonth, endOfToday]
+                        }
+                    },
+                    attributes: []
+                },
+                {
+                    model: product,
+                    as: 'product',
+                    attributes: ['name']
+                }
+            ],
+            group: ['product_id', 'product.id', 'product.name'],
+            order: [[fn('SUM', col('quantity')), 'DESC']],
+            limit: 3,
+            raw: false
+        });
+
+        // Format top products
+        const topProducts = topProductsQuery.map(item => ({
+            name: item.product.name,
+            quantity: parseInt(item.dataValues.total_quantity),
+            revenue: parseFloat(item.dataValues.total_revenue)
+        }));
+
+        // Recent sales (last 5 today's sales)
+        const recentSalesData = todaysSales.slice(0, 5);
+        const recentSales = await Promise.all(recentSalesData.map(async (sale) => {
+            // Get item count for this sale
+            const itemCount = await saleitem.count({
+                where: { sale_id: sale.id }
+            });
+
+            return {
+                time: new Date(sale.sale_date).toLocaleTimeString('en-GB', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false
+                }),
+                amount: parseFloat(sale.total_amount),
+                items: itemCount
+            };
+        }));
+
+        // Prepare response data
+        const dashboardStats = {
+            todaysSales: todaysSalesTotal,
+            todaysTransactions: todaysTransactions,
+            weekSales: weekSalesTotal,
+            monthSales: monthSalesTotal,
+            totalProducts: totalProducts,
+            lowStockProducts: lowStockProducts,
+            outOfStockProducts: outOfStockProducts,
+            totalCustomers: totalCustomers,
+            activeUsers: activeUsers,
+            topProducts: topProducts,
+            recentSales: recentSales
+        };
+
+        res.json({
+            success: true,
+            data: dashboardStats,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('Dashboard stats error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to load dashboard statistics',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+// Get dashboard statistics with date filter (optional)
+router.get('/dashboard/stats/:period', auth, async (req, res) => {
+    try {
+        const { period } = req.params; // 'today', 'week', 'month', 'year'
+
+        let startDate, endDate;
+        const now = new Date();
+
+        switch (period) {
+            case 'today':
+                startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                endDate = new Date(startDate.getTime() + 24 * 60 * 60 * 1000 - 1);
+                break;
+            case 'week':
+                startDate = new Date(now);
+                startDate.setDate(now.getDate() - now.getDay());
+                startDate.setHours(0, 0, 0, 0);
+                endDate = new Date();
+                break;
+            case 'month':
+                startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+                endDate = new Date();
+                break;
+            case 'year':
+                startDate = new Date(now.getFullYear(), 0, 1);
+                endDate = new Date();
+                break;
+            default:
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid period. Use: today, week, month, or year'
+                });
+        }
+
+        // Get sales for the specified period
+        const periodSales = await sale.findAll({
+            where: {
+                sale_date: {
+                    [Op.between]: [startDate, endDate]
+                }
+            },
+            include: [
+                {
+                    model: saleitem,
+                    as: 'items',
+                    include: [{
+                        model: product,
+                        as: 'product',
+                        attributes: ['name']
+                    }]
+                }
+            ]
+        });
+
+        // Calculate statistics for the period
+        const totalSales = periodSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+        const totalTransactions = periodSales.length;
+        const averageTransaction = totalTransactions > 0 ? totalSales / totalTransactions : 0;
+
+        // Payment method breakdown
+        const paymentMethods = {
+            cash: 0,
+            card: 0,
+            mobile_money: 0
+        };
+
+        periodSales.forEach(sale => {
+            if (paymentMethods.hasOwnProperty(sale.payment_method)) {
+                paymentMethods[sale.payment_method] += parseFloat(sale.total_amount || 0);
+            }
+        });
+
+        res.json({
+            success: true,
+            period: period,
+            date_range: {
+                start: startDate.toISOString(),
+                end: endDate.toISOString()
+            },
+            data: {
+                totalSales,
+                totalTransactions,
+                averageTransaction,
+                paymentMethods
+            }
+        });
+
+    } catch (error) {
+        console.error('Period stats error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to load period statistics',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
     }
 });
 
