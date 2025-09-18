@@ -164,44 +164,28 @@ router.post('/', auth, async (req, res) => {
         // Initialize ZRA Integration Service
         const zraService = new ZRAIntegrationService();
 
+        console.log('Processing ZRA sale endpoint...');
 
-        // Process ZRA Integration before persisting the sale
-        console.log('Processing ZRA integration...');
+        // Process only the ZRA Sales endpoint first
+        const salesData = await zraService.transformToZRASalesData(saleDataForZRA, saleItems, req.user);
+        const salesResponse = await zraService.sendSalesData(salesData);
 
-
-      /*  const zraResults = await zraService.processZRAIntegration(
-            saleDataForZRA,
-            saleItems,
-            req.user
-        );
-
-        // Check if ZRA integration was successful
-        if (!zraResults.success) {
+        // Check if ZRA sales integration was successful
+        if (!salesResponse.success) {
             await t.rollback();
-            console.error('ZRA Integration failed:', zraResults.errors);
+            console.error('ZRA Sales Integration failed:', salesResponse.error);
 
             return res.status(500).json({
                 message: 'Failed to process sale with ZRA system',
-                zra_errors: zraResults.errors,
-                details: 'The sale could not be completed due to ZRA integration issues'
+                zra_errors: [salesResponse.error],
+                details: 'The sale could not be completed due to ZRA sales integration issues'
             });
         }
 
-        console.log('ZRA integration successful:', zraResults.responses);
-
-        // Find the saveSales response
-        const saveSalesResponse = zraResults.responses.find(r => r.endpoint === 'saveSales');
-
-        if (!saveSalesResponse || !saveSalesResponse.success) {
-            await t.rollback();
-            return res.status(500).json({
-                message: 'Failed to get valid response from ZRA saveSales endpoint',
-                zra_errors: zraResults.errors
-            });
-        }
+        console.log('ZRA sales integration successful:', salesResponse.data);
 
         // Get the data from the saveSales response
-        const saveSalesData = saveSalesResponse.data.data;
+        const saveSalesData = salesResponse.data.data;
 
         if (!saveSalesData) {
             await t.rollback();
@@ -229,7 +213,7 @@ router.post('/', auth, async (req, res) => {
 
         console.log('Creating sale record...');
 
-        // Create sale (only if ZRA integration was successful)
+        // Create sale (only if ZRA sales integration was successful)
         const newSale = await sale.create({
             receipt_number: generateReceiptNumber(),
             user_id: req.user.id,
@@ -298,21 +282,22 @@ router.post('/', auth, async (req, res) => {
             ]
         });
 
+        // Send successful response immediately
         res.status(201).json({
             message: 'Sale completed successfully',
             sale: completeSale,
             zra_integration: {
                 success: true,
-                responses: zraResults.responses.map(r => ({
-                    endpoint: r.endpoint,
-                    success: r.success,
-                    // Don't include full response data in API response for security
-                    message: r.success ? 'Success' : r.error
-                }))
+                sales_endpoint: {
+                    success: true,
+                    message: 'Sales data submitted successfully to ZRA'
+                }
             }
-        });*/
-    await persistInvoiceDataToSage(saleDataForZRA, saleItems, req.user)
-    await persistShipmentDataToSage(saleDataForZRA, saleItems, req.user)
+        });
+
+        // Process stock endpoints in the background
+        processStockEndpointsInBackground(newSale.id, saleDataForZRA, saleItems, req.user, zraService);
+
     } catch (error) {
         await t.rollback();
         console.error('Sale creation error:', error);
@@ -345,6 +330,101 @@ router.post('/', auth, async (req, res) => {
         });
     }
 });
+
+/**
+ * Process stock endpoints in background and create notifications if they fail
+ * @param {number} saleId
+ * @param {object} saleData
+ * @param {array} items
+ * @param {object} user
+ * @param {ZRAIntegrationService} zraService
+ */
+async function processStockEndpointsInBackground(saleId, saleData, items, user, zraService) {
+    const NotificationService = require('../services/NotificationService');
+    const notificationService = new NotificationService();
+
+    try {
+        console.log('Processing stock endpoints in background for sale:', saleId);
+
+        // Transform data for stock endpoints
+        const stockItemsData = zraService.transformToZRAStockItemsData(saleData, items, user);
+        const stockMasterData = zraService.transformToZRAStockMasterData(items, user);
+
+        // Process stock items endpoint
+        const stockItemsResponse = await zraService.sendStockItemsData(stockItemsData);
+
+        if (!stockItemsResponse.success) {
+            console.error('Stock Items endpoint failed:', stockItemsResponse.error);
+
+            await notificationService.createNotification({
+                type: 'ZRA_STOCK_ITEMS_FAILED',
+                title: 'ZRA Stock Items Update Failed',
+                message: `Failed to update stock items in ZRA for sale #${saleId}. Error: ${stockItemsResponse.error}`,
+                severity: 'warning',
+                user_id: user.id,
+                metadata: {
+                    sale_id: saleId,
+                    endpoint: 'saveStockItems',
+                    error: stockItemsResponse.error
+                }
+            });
+        } else {
+            console.log('Stock Items endpoint successful for sale:', saleId);
+        }
+
+        // Process stock master endpoint
+        const stockMasterResponse = await zraService.sendStockMasterData(stockMasterData);
+
+        if (!stockMasterResponse.success) {
+            console.error('Stock Master endpoint failed:', stockMasterResponse.error);
+
+            await notificationService.createNotification({
+                type: 'ZRA_STOCK_MASTER_FAILED',
+                title: 'ZRA Stock Master Update Failed',
+                message: `Failed to update stock master in ZRA for sale #${saleId}. Error: ${stockMasterResponse.error}`,
+                severity: 'warning',
+                user_id: user.id,
+                metadata: {
+                    sale_id: saleId,
+                    endpoint: 'saveStockMaster',
+                    error: stockMasterResponse.error
+                }
+            });
+        } else {
+            console.log('Stock Master endpoint successful for sale:', saleId);
+        }
+
+        // Create success notification if both stock endpoints succeeded
+        if (stockItemsResponse.success && stockMasterResponse.success) {
+            await notificationService.createNotification({
+                type: 'ZRA_INTEGRATION_COMPLETE',
+                title: 'ZRA Integration Complete',
+                message: `All ZRA endpoints processed successfully for sale #${saleId}`,
+                severity: 'success',
+                user_id: user.id,
+                metadata: {
+                    sale_id: saleId,
+                    all_endpoints_success: true
+                }
+            });
+        }
+
+    } catch (error) {
+        console.error('Error in background stock processing:', error);
+
+        await notificationService.createNotification({
+            type: 'ZRA_BACKGROUND_ERROR',
+            title: 'ZRA Background Processing Error',
+            message: `An error occurred while processing ZRA stock endpoints for sale #${saleId}. Error: ${error.message}`,
+            severity: 'error',
+            user_id: user.id,
+            metadata: {
+                sale_id: saleId,
+                error: error.message
+            }
+        });
+    }
+}
 async function persistShipmentDataToSage(saleData, saleItems, user) {
     try {
         const sageService = new SageShipment();
