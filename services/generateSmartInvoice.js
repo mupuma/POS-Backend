@@ -114,7 +114,7 @@ class ZRAIntegrationService {
         const currentDate = this.formatZRADate();
 
         // Generate CIS invoice number
-        const cisInvoiceNo = await this.generateCISInvoiceNumber(user.store_id);
+        //const cisInvoiceNo = await this.generateCISInvoiceNumber(user.store_id);
 
         let totalTaxableAmountA = 0;
         let totalTaxAmountA = 0;
@@ -179,7 +179,7 @@ class ZRAIntegrationService {
             tpin: process.env.ZRA_TPIN || "1002010901",
             bhfId: process.env.ZRA_BHF_ID || "000",
             orgInvcNo: 0,
-            cisInvcNo: cisInvoiceNo,
+            cisInvcNo: saleData.invoiceNo,
             custTpin: saleData.customer?.tpin || null,
             custNm: saleData.customer?.name || "Walk-in Customer",
             salesTyCd: "N",

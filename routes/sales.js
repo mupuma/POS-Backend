@@ -7,7 +7,9 @@ const path = require('path');
 const QRCode = require('qrcode');
 const { body, validationResult } = require('express-validator');
 const ZRAService = require('../services/zraService');
-
+const ZRAIntegrationService = require('../services/generateSmartInvoice'); // Adjust path as needed
+const SageShipment = require('../services/createSageShipment');
+const AccountsReceivableBatch = require("../services/createSageArBatch");
 const router = express.Router();
 
 // Generate sequential receipt number and unique invoice number
@@ -17,7 +19,7 @@ async function generateInvoiceAndReceiptNumber(storeId) {
         order: [['id', 'DESC']],
     });
 
-    let nextSeq = 1;
+    let nextSeq ;
     if (lastSale && lastSale.receipt_number) {
         nextSeq = parseInt(lastSale.receipt_number, 10) + 1;
     }
@@ -39,7 +41,7 @@ async function generateQrCode(data, identifier, saveDirectory) {
         const filePath = path.join(saveDirectory, fileName);
         const publicUrl = `/qrcodes/${fileName}`;
 
-        await QRCode.toFile(filePath, qrData, { width: 250, margin: 2, errorCorrectionLevel: 'H' });
+        await QRCode.toFile(filePath, qrData, { width: 150, margin: 2, errorCorrectionLevel: 'H' });
 
         return { filePath, publicUrl };
     } catch (err) {
@@ -63,7 +65,7 @@ const validateSale = [
 ];
 
 // POST /sales - Create Sale
-router.post('/', auth, validateSale, async (req, res) => {
+router.post('/', auth,  async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ message: 'Validation failed', errors: errors.array() });
 
@@ -91,12 +93,12 @@ router.post('/', auth, validateSale, async (req, res) => {
             return res.status(400).json({ message: 'Store configuration not found' });
         }
 
-        const isZRAEnabled = storeConfig.zra_enabled === 1;
-        if (isZRAEnabled && (!storeConfig.store_identifier || !storeConfig.zra_tpin || !storeConfig.zra_bhf_id)) {
-            console.error('❌ ZRA config missing:', storeConfig);
-            await t.rollback();
-            return res.status(400).json({ message: 'Missing ZRA configuration (SDC ID, TPIN, or BHF ID)' });
-        }
+        /* const isZRAEnabled = storeConfig.zra_enabled === 1;
+         if (isZRAEnabled && (!storeConfig.store_identifier || !storeConfig.zra_tpin || !storeConfig.zra_bhf_id)) {
+             console.error('❌ ZRA config missing:', storeConfig);
+             await t.rollback();
+             return res.status(400).json({ message: 'Missing ZRA configuration (SDC ID, TPIN, or BHF ID)' });
+         }*/
 
         // Generate invoice & receipt
         const { receiptNumber, invoiceNo } = await generateInvoiceAndReceiptNumber(req.user.store_id);
@@ -121,9 +123,9 @@ router.post('/', auth, validateSale, async (req, res) => {
             }
 
             // Round item totals to 2 decimals
-            const tax_exclusive_total = parseFloat((item.quantity * item.unit_price).toFixed(2));
-            const item_tax_amount = parseFloat((tax_exclusive_total * tax_rate / 100).toFixed(2));
-            const tax_inclusive_total = parseFloat((tax_exclusive_total + item_tax_amount).toFixed(2));
+            const tax_exclusive_total = parseFloat((item.quantity * item.unit_price).toFixed(4));
+            const item_tax_amount = parseFloat((tax_exclusive_total * tax_rate / 100).toFixed(4));
+            const tax_inclusive_total = parseFloat((tax_exclusive_total + item_tax_amount).toFixed(4));
 
             subtotal += tax_exclusive_total;
 
@@ -147,19 +149,19 @@ router.post('/', auth, validateSale, async (req, res) => {
             discountData = await discount.findByPk(discount_id, { transaction: t });
             if (discountData && discountData.is_active) {
                 discount_amount = discountData.type === 'percentage'
-                    ? parseFloat(((subtotal * discountData.value) / 100).toFixed(2))
-                    : parseFloat(discountData.value.toFixed(2));
+                    ? parseFloat(((subtotal * discountData.value) / 100).toFixed(4))
+                    : parseFloat(discountData.value.toFixed(4));
             }
         }
 
         // Calculate totals safely with rounding
         let taxable_amount = subtotal - discount_amount;
-        taxable_amount = parseFloat(taxable_amount.toFixed(2));
+        taxable_amount = parseFloat(taxable_amount.toFixed(4));
 
-        const tax_amount = parseFloat((taxable_amount * tax_rate / 100).toFixed(2));
-        let total_amount = parseFloat((taxable_amount + tax_amount).toFixed(2));
-        const amount_paid_rounded = parseFloat(amount_paid.toFixed(2));
-        const change_amount = parseFloat((amount_paid_rounded - total_amount).toFixed(2));
+        const tax_amount = parseFloat((taxable_amount * tax_rate / 100).toFixed(4));
+        let total_amount = parseFloat((taxable_amount + tax_amount).toFixed(4));
+        const amount_paid_rounded = parseFloat(amount_paid.toFixed(4));
+        const change_amount = parseFloat((amount_paid_rounded - total_amount).toFixed(4));
 
         if (change_amount < 0) {
             console.error(`❌ Insufficient payment. Paid: ${amount_paid_rounded}, total: ${total_amount}`);
@@ -169,76 +171,72 @@ router.post('/', auth, validateSale, async (req, res) => {
 
         const customerData = customer_id ? await customer.findByPk(customer_id, { transaction: t }) : null;
 
-        // Process ZRA if enabled
-        let zraResults = null;
-        let zraFields = {};
+        const saleDataForZRA = {
+            subtotal,
+            discount_amount,
+            tax_amount,
+            total_amount,
+            tax_rate,
+            payment_method,
+            amount_paid: amount_paid_rounded,
+            change_amount, notes,
+            customer: customerData,
+            discount: discountData,
+            invoice_number: invoiceNo,
+
+        };
+        const zraService = new ZRAIntegrationService();
+
+        console.log('Processing ZRA sale endpoint...');
+
+        // Process only the ZRA Sales endpoint first
+        const salesData = await zraService.transformToZRASalesData(saleDataForZRA, saleItems, req.user);
+        const salesResponse = await zraService.sendSalesData(salesData);
+
+        // Check if ZRA sales integration was successful
+        if (!salesResponse.success) {
+            await t.rollback();
+            console.error('ZRA Sales Integration failed:', salesResponse.error);
+
+            return res.status(500).json({
+                message: 'Failed to process sale with ZRA system',
+                zra_errors: [salesResponse.error],
+                details: 'The sale could not be completed due to ZRA sales integration issues'
+            });
+        }
+
+        console.log('ZRA sales integration successful:', salesResponse.data);
+
+        // Get the data from the saveSales response
+        const saveSalesData = salesResponse.data.data;
+
+        if (!saveSalesData) {
+            await t.rollback();
+            return res.status(500).json({
+                message: 'No data received from ZRA saveSales endpoint'
+            });
+        }
+
+        console.log('ZRA Sales Data:', saveSalesData);
+
+        // Generate QR code file path (but don't await it here to avoid blocking)
         let qrFilePath = null;
-        let qrCodeUrl = null;
-
-        if (isZRAEnabled) {
+        if (saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
             try {
-                const zraService = new ZRAService();
-                const saleDataForZRA = {
-                    subtotal, discount_amount, tax_amount, total_amount, tax_rate,
-                    payment_method, amount_paid: amount_paid_rounded, change_amount, notes,
-                    customer: customerData, discount: discountData,
-                    items: saleItems, user: req.user, store_id: req.user.store_id,
-                    store_config: { sdcid: storeConfig.store_identifier, tpin: storeConfig.zra_tpin, bhfId: storeConfig.zra_bhf_id },
-                    invoice_number: invoiceNo, receipt_sequence: receiptNumber
-                };
-
-                zraResults = await zraService.processZRAIntegration(saleDataForZRA, saleItems, req.user);
-
-                if (!zraResults.success) throw new Error('ZRA integration failed');
-
-                const saveSalesData = zraResults.responses.find(r => r.endpoint === 'saveSales')?.data?.data;
-                const qrCodeData = saveSalesData?.qrCodeUrl || JSON.stringify({ 
-                    subtotal, tax_amount, discount_amount, total_amount, tax_rate, 
-                    sale_date: new Date().toISOString(), store_id: req.user.store_id, invoice_number: invoiceNo 
-                });
-
-                const qrResult = await generateQrCode(qrCodeData, saveSalesData?.rcptNo || invoiceNo, "./public/qrcodes");
-                qrFilePath = qrResult.filePath;
-                qrCodeUrl = qrResult.publicUrl;
-
-                zraFields = {
-                    invnumber: saveSalesData?.invnumber || null,
-                    receipt_no: saveSalesData?.rcptNo || null,
-                    sdcid: saveSalesData?.sdcId || storeConfig.store_identifier,
-                    receiptsig: saveSalesData?.rcptSign || null,
-                    intrldata: saveSalesData?.intrlData || null,
-                    vsdcrcpdate: saveSalesData?.vsdcRcptPbctDate || null,
-                    qrcode_url: qrCodeUrl || saveSalesData?.qrCodeUrl || null,
-                    qrfilepath: qrFilePath || null
-                };
-
-            } catch (err) {
-                console.error('ZRA processing error:', err);
-                if (storeConfig.zra_required === 1) {
-                    await t.rollback();
-                    return res.status(500).json({ message: 'Failed to process sale with ZRA', error: err.message });
-                }
-                // If ZRA is not required, continue with null values
-                zraResults = { success: false, errors: [{ endpoint: 'general', error: err.message }] };
-            }
-        } 
-        
-        // Generate QR code for non-ZRA enabled stores or as fallback
-        if (!qrCodeUrl) {
-            try {
-                const qrData = { 
-                    subtotal, tax_amount, discount_amount, total_amount, tax_rate, 
-                    sale_date: new Date().toISOString(), store_id: req.user.store_id, 
-                    invoice_number: invoiceNo 
-                };
-                const qrResult = await generateQrCode(qrData, invoiceNo, "./public/qrcodes");
-                qrFilePath = qrResult.filePath;
-                qrCodeUrl = qrResult.publicUrl;
+                qrFilePath = await generateQrCode(
+                    saveSalesData.qrCodeUrl,
+                    saveSalesData.rcptNo,
+                    "./qrcodes"
+                );
             } catch (qrError) {
-                console.error('Fallback QR generation failed:', qrError);
-                // Continue without QR code
+                console.error('QR Code generation failed:', qrError);
+                // Don't fail the entire transaction for QR code generation
             }
         }
+
+        console.log('Creating sale record...');
+
+
 
         // Create sale with rounded totals
         const newSale = await sale.create({
@@ -256,13 +254,17 @@ router.post('/', auth, validateSale, async (req, res) => {
             tax_rate,
             notes: notes || null,
             store_id: req.user.store_id,
-            cis_invoice_no: invoiceNo,
-            invoice_no: invoiceNo,
-            zra_response: zraResults ? JSON.stringify(zraResults) : null,
-            zra_status: isZRAEnabled ? (zraResults?.success ? 'success' : 'failed') : 'disabled',
-            qrcode_url: qrCodeUrl,
+            cis_invoice_no: saveSalesData.invnumber || null,
+            receipt_no: saveSalesData.rcptNo || null,
+            sdcid: saveSalesData.sdcId || null,
+            receiptsig: saveSalesData.rcptSign || null,
+            intrldata: saveSalesData.intrlData || null,
+            qrcode_url: saveSalesData.qrCodeUrl || null,
+            vsdcrcpdate: saveSalesData.vsdcRcptPbctDate || null,
+            invoice_no: (saveSalesData.sdcId && saveSalesData.rcptNo)
+                ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
+                : null,
             qrfilepath: qrFilePath,
-            ...zraFields
         }, { transaction: t });
 
         // Create sale items and update stock
@@ -299,21 +301,19 @@ router.post('/', auth, validateSale, async (req, res) => {
             message: 'Sale completed successfully',
             sale: completeSale,
             qr_code: qrCodeUrl,
-            zra_integration: { 
-                enabled: isZRAEnabled, 
-                status: completeSale.zra_status,
-                success: completeSale.zra_status === 'success',
-                message: completeSale.zra_status === 'success' ? 'ZRA integration successful' : 
-                        completeSale.zra_status === 'failed' ? 'ZRA integration failed' : 
-                        completeSale.zra_status === 'disabled' ? 'ZRA integration disabled' : 'ZRA integration pending'
+            zra_integration: {
+                success: true,
+                sales_endpoint: {
+                    success: true,
+                    message: 'Sales data submitted successfully to ZRA'
+                }
             }
         };
 
-        if (zraResults?.errors) {
-            response.zra_integration.errors = zraResults.errors;
-        }
 
         res.status(201).json(response);
+        processStockEndpointsInBackground(newSale.id, saleDataForZRA, saleItems, req.user, zraService);
+
 
     } catch (error) {
         await t.rollback();
@@ -340,6 +340,140 @@ router.post('/', auth, validateSale, async (req, res) => {
     }
 });
 
+/**
+ * Process stock endpoints in background and create notifications if they fail
+ * @param {number} saleId
+ * @param {object} saleData
+ * @param {array} items
+ * @param {object} user
+ * @param {ZRAIntegrationService} zraService
+ */
+async function processStockEndpointsInBackground(saleId, saleData, items, user, zraService) {
+    const NotificationService = require('../services/NotificationService');
+    const notificationService = new NotificationService();
+
+    try {
+        console.log('Processing stock endpoints in background for sale:', saleId);
+
+        // Transform data for stock endpoints
+        const stockItemsData = zraService.transformToZRAStockItemsData(saleData, items, user);
+        const stockMasterData = zraService.transformToZRAStockMasterData(items, user);
+
+        // Process stock items endpoint
+        const stockItemsResponse = await zraService.sendStockItemsData(stockItemsData);
+
+        if (!stockItemsResponse.success) {
+            console.error('Stock Items endpoint failed:', stockItemsResponse.error);
+
+            await notificationService.createNotification({
+                type: 'ZRA_STOCK_ITEMS_FAILED',
+                title: 'ZRA Stock Items Update Failed',
+                message: `Failed to update stock items in ZRA for sale #${saleId}. Error: ${stockItemsResponse.error}`,
+                severity: 'warning',
+                user_id: user.id,
+                metadata: {
+                    sale_id: saleId,
+                    endpoint: 'saveStockItems',
+                    error: stockItemsResponse.error
+                }
+            });
+        } else {
+            console.log('Stock Items endpoint successful for sale:', saleId);
+        }
+
+        // Process stock master endpoint
+        const stockMasterResponse = await zraService.sendStockMasterData(stockMasterData);
+
+        if (!stockMasterResponse.success) {
+            console.error('Stock Master endpoint failed:', stockMasterResponse.error);
+
+            await notificationService.createNotification({
+                type: 'ZRA_STOCK_MASTER_FAILED',
+                title: 'ZRA Stock Master Update Failed',
+                message: `Failed to update stock master in ZRA for sale #${saleId}. Error: ${stockMasterResponse.error}`,
+                severity: 'warning',
+                user_id: user.id,
+                metadata: {
+                    sale_id: saleId,
+                    endpoint: 'saveStockMaster',
+                    error: stockMasterResponse.error
+                }
+            });
+        } else {
+            console.log('Stock Master endpoint successful for sale:', saleId);
+        }
+
+        // Create success notification if both stock endpoints succeeded
+        if (stockItemsResponse.success && stockMasterResponse.success) {
+            await notificationService.createNotification({
+                type: 'ZRA_INTEGRATION_COMPLETE',
+                title: 'ZRA Integration Complete',
+                message: `All ZRA endpoints processed successfully for sale #${saleId}`,
+                severity: 'success',
+                user_id: user.id,
+                metadata: {
+                    sale_id: saleId,
+                    all_endpoints_success: true
+                }
+            });
+        }
+
+    } catch (error) {
+        console.error('Error in background stock processing:', error);
+
+        await notificationService.createNotification({
+            type: 'ZRA_BACKGROUND_ERROR',
+            title: 'ZRA Background Processing Error',
+            message: `An error occurred while processing ZRA stock endpoints for sale #${saleId}. Error: ${error.message}`,
+            severity: 'error',
+            user_id: user.id,
+            metadata: {
+                sale_id: saleId,
+                error: error.message
+            }
+        });
+    }
+}
+async function persistShipmentDataToSage(saleData, saleItems, user) {
+    try {
+        const sageService = new SageShipment();
+        const sageResponse = await sageService.createShipmentBatch(saleData, saleItems, user);
+
+        if (!sageResponse.success) {
+            console.error('Sage shipment creation failed:', sageResponse.error);
+            return { success: false, error: 'Failed to create shipment in Sage system' };
+        }
+
+        console.log('Sage shipment created successfully:', sageResponse.data);
+        return { success: true, data: sageResponse.data };
+
+    } catch (error) {
+        console.error('Error persisting data to Sage:', error);
+        return { success: false, error: 'Error occurred while communicating with Sage system' };
+    }
+
+}
+
+async function persistInvoiceDataToSage(saleData, saleItems, user) {
+    try {
+
+        const sageService = new AccountsReceivableBatch();
+        const sageResponse = await sageService.createSageArBatch(saleData, saleItems, user);
+
+        if (!sageResponse.success) {
+            console.error('Sage AR invoice creation failed:', sageResponse.error);
+            return { success: false, error: 'Failed to create AR invoice in Sage system' };
+        }
+
+        console.log('Sage AR invoice created successfully:', sageResponse.data);
+        return { success: true, data: sageResponse.data };
+
+    } catch (error) {
+        console.error('Error persisting data to Sage:', error);
+        return { success: false, error: 'Error occurred while communicating with Sage system' };
+    }
+
+}
 // GET /sales - Get all sales with pagination and filtering
 router.get('/', auth, async (req, res) => {
     try {
