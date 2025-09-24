@@ -425,46 +425,7 @@ async function processStockEndpointsInBackground(saleId, saleData, items, user, 
         });
     }
 }
-async function persistShipmentDataToSage(saleData, saleItems, user) {
-    try {
-        const sageService = new SageShipment();
-        const sageResponse = await sageService.createShipmentBatch(saleData, saleItems, user);
 
-        if (!sageResponse.success) {
-            console.error('Sage shipment creation failed:', sageResponse.error);
-            return { success: false, error: 'Failed to create shipment in Sage system' };
-        }
-
-        console.log('Sage shipment created successfully:', sageResponse.data);
-        return { success: true, data: sageResponse.data };
-
-    } catch (error) {
-        console.error('Error persisting data to Sage:', error);
-        return { success: false, error: 'Error occurred while communicating with Sage system' };
-    }
-
-}
-
-async function persistInvoiceDataToSage(saleData, saleItems, user) {
-    try {
-
-        const sageService = new AccountsReceivableBatch();
-        const sageResponse = await sageService.createSageArBatch(saleData, saleItems, user);
-
-        if (!sageResponse.success) {
-            console.error('Sage AR invoice creation failed:', sageResponse.error);
-            return { success: false, error: 'Failed to create AR invoice in Sage system' };
-        }
-
-        console.log('Sage AR invoice created successfully:', sageResponse.data);
-        return { success: true, data: sageResponse.data };
-
-    } catch (error) {
-        console.error('Error persisting data to Sage:', error);
-        return { success: false, error: 'Error occurred while communicating with Sage system' };
-    }
-
-}
 // Get all sales with pagination
 router.get('/', auth, async (req, res) => {
     try {
