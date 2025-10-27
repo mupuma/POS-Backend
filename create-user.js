@@ -8,16 +8,18 @@ const { sequelize } = require('./models'); // Adjust path to your models
 const args = process.argv.slice(2);
 
 async function createUser() {
+
     try {
         // Parse command line arguments
-        let username, password, fullName, role;
+        let username, password, fullName, role, store_id;
 
         if (args.length === 0) {
             // Interactive mode - you can modify these values
-            username = 'admin';
+            username = 'admin(kabwe)';
             password = 'pass2';
-            fullName = 'Sys Admin';
+            fullName = 'Ackim Chisenga';
             role = 'admin';
+            store_id = 2;
 
             console.log('Using default values:');
             console.log(`Username: ${username}`);
@@ -41,7 +43,7 @@ async function createUser() {
         }
 
         // Check if user already exists
-        const existingUser = await user.findOne({ where: { username } });
+        const existingUser = await user.findOne({where: {username}});
         if (existingUser) {
             console.error(`Error: User "${username}" already exists`);
             process.exit(1);
@@ -59,7 +61,8 @@ async function createUser() {
             password_hash: passwordHash,
             full_name: fullName,
             role: role,
-            is_active: true
+            is_active: true,
+            store_id:store_id
         });
 
         console.log('✅ User created successfully!');

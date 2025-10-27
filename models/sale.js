@@ -109,6 +109,7 @@ module.exports = (sequelize) => {
             type: DataTypes.STRING(255),
             allowNull: true,
         },
+
     }, {
         tableName: 'sales',
         timestamps: true,

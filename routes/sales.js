@@ -1,7 +1,7 @@
 const express = require('express');
-const { sale, saleitem, product, user, customer, discount } = require('../models');
+const { sale, saleitem, product, user, customer, discount,store,productinventory } = require('../models');
 const auth = require('../middleware/auth');
-const { Op,sequelize, fn, col} = require('sequelize');
+const { Op,sequelize, fn, col,literal} = require('sequelize');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
@@ -9,10 +9,7 @@ const QRCode = require('qrcode');
 const router = express.Router();
 
 // Import the correct ZRA Integration Service
-const ZRAIntegrationService = require('../services/generateSmartInvoice'); // Adjust path as needed
-const SageShipment = require('../services/createSageShipment');
-const AccountsReceivableBatch = require("../services/createSageArBatch"); // Adjust path as needed
-
+const ZRAIntegrationService = require('../services/sale/generateSmartInvoice'); // Adjust path as needed
 // Generate receipt number
 const generateReceiptNumber = () => {
     const now = new Date();
@@ -50,6 +47,7 @@ async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
         throw err;
     }
 }
+
 
 // Create new sale
 router.post('/', auth, async (req, res) => {
@@ -90,28 +88,47 @@ router.post('/', auth, async (req, res) => {
                 return res.status(400).json({ message: `Product with ID ${item.product_id} not found` });
             }
 
-            // Check stock
-            if (productData.stock_quantity < item.quantity) {
+            // Check stock from productinventory for the user's store
+          const inventory = await productinventory.findOne({
+                where: { product_id: item.product_id, store_id: req.user.store_id },
+                transaction: t
+            });
+
+            const availableQty = inventory ? inventory.stock_quantity : 0;
+
+            if (availableQty < item.quantity) {
                 await t.rollback();
                 return res.status(400).json({
-                    message: `Insufficient stock for ${productData.name}. Available: ${productData.stock_quantity}`
+                    message: `Insufficient stock for ${productData.name}. Available: ${availableQty}`
                 });
             }
 
-            // Unit price is tax-exclusive, calculate tax-inclusive total
-            const tax_exclusive_total = item.quantity * item.unit_price;
-            const item_tax_amount = (tax_exclusive_total * tax_rate) / 100;
-            const tax_inclusive_total = tax_exclusive_total + item_tax_amount;
+            // Determine effective price: store override if present, else product price (assumed tax-inclusive)
+            const effectiveUnitPrice = inventory && inventory.price_override != null
+                ? Number(inventory.price_override)
+                : Number(productData.price);
 
-            subtotal += tax_exclusive_total; // Subtotal remains tax-exclusive
+            // If client didn't send unit_price, default to effective per-store price (tax-inclusive)
+            const unit_price_inclusive = (item.unit_price == null || item.unit_price === '')
+                ? effectiveUnitPrice
+                : Number(item.unit_price);
 
-            // Include product data for ZRA integration
+            // Derive tax-exclusive values from tax-inclusive unit price
+            const taxMultiplier = 1 + (Number(tax_rate) / 100);
+            const unit_price_exclusive = unit_price_inclusive / taxMultiplier;
+
+            const tax_exclusive_total = item.quantity * unit_price_exclusive;
+            const tax_inclusive_total = item.quantity * unit_price_inclusive;
+
+            subtotal += tax_exclusive_total; // Subtotal remains tax-exclusive for tax calculations
+
+            // Include product data for ZRA integration and store inclusive for display/DB
             saleItems.push({
                 product_id: item.product_id,
                 quantity: item.quantity,
-                unit_price: item.unit_price, // Tax-exclusive unit price
-                total_price: tax_exclusive_total, // Tax-exclusive total
-                tax_inclusive_total: tax_inclusive_total, // Tax-inclusive total for ZRA
+                unit_price: unit_price_inclusive, // Tax-inclusive unit price for display/storage
+                total_price: tax_inclusive_total, // Tax-inclusive total for display/storage
+                tax_exclusive_total: tax_exclusive_total, // Provide tax-exclusive total for integrations
                 product: productData // Include full product data
             });
         }
@@ -254,15 +271,16 @@ router.post('/', auth, async (req, res) => {
             }, { transaction: t });
 
             // Update product stock
-            await product.update(
+           await productinventory.update(
                 {
-                    stock_quantity: product.sequelize.literal(`stock_quantity - ${item.quantity}`)
+                    stock_quantity: literal(`stock_quantity - ${item.quantity}`)
                 },
                 {
-                    where: { id: item.product_id },
+                    where: { product_id: item.product_id, store_id: req.user.store_id },
                     transaction: t
                 }
             );
+
         }
 
         await t.commit();
@@ -276,7 +294,9 @@ router.post('/', auth, async (req, res) => {
                     as: 'items',
                     include: [{ model: product, as: 'product' }]
                 },
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'] },
+                { model: user, as: 'cashier', attributes: ['id', 'full_name'],
+                    include:[{model:store,as:'store', attributes:['store_location','store_mobile_no']}]
+                },
                 { model: customer, as: 'customer' },
                 { model: discount, as: 'discount' }
             ]
@@ -432,16 +452,20 @@ router.get('/', auth, async (req, res) => {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
+        const filterStoreId = req.user.store_id;
+
+        const include = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+            { model: customer, as: 'customer' },
+            { model: discount, as: 'discount' },
+            { model: saleitem, as: 'items', include: [{ model: product, as: 'product' }] }
+        ];
 
         const { count, rows } = await sale.findAndCountAll({
             limit,
             offset,
             order: [['sale_date', 'DESC']],
-            include: [
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'] },
-                { model: customer, as: 'customer' },
-                { model: discount, as: 'discount' }
-            ]
+            include
         });
 
         res.json({
@@ -470,14 +494,20 @@ router.get('/:id', auth, async (req, res) => {
                     as: 'items',
                     include: [{ model: product, as: 'product' }]
                 },
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'] },
+                { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'] },
                 { model: customer, as: 'customer' },
                 { model: discount, as: 'discount' }
             ]
         });
-
         if (!saleData) {
             return res.status(404).json({ message: 'Sale not found' });
+        }
+        // Users can only access sales for their own store (applies to cashiers and admins)
+        if (req.user && (req.user.role === 'cashier' || req.user.role === 'admin')) {
+            const cashierStoreId = saleData.cashier && saleData.cashier.store_id;
+            if (!cashierStoreId || cashierStoreId !== req.user.store_id) {
+                return res.status(403).json({ message: 'Access denied' });
+            }
         }
 
         res.json({ sale: saleData });
@@ -505,16 +535,20 @@ router.get('/report/date-range', auth, async (req, res) => {
             return res.status(400).json({ message: 'Invalid date format' });
         }
 
+        const filterStoreId = req.user.store_id;
+
+        const include = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+            { model: customer, as: 'customer' }
+        ];
+
         const sales = await sale.findAll({
             where: {
                 sale_date: {
                     [Op.between]: [startDate, endDate]
                 }
             },
-            include: [
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'] },
-                { model: customer, as: 'customer' }
-            ],
+            include,
             order: [['sale_date', 'DESC']]
         });
 
@@ -555,12 +589,19 @@ router.get('/report/daily', auth, async (req, res) => {
         const startOfDay = new Date(today.setHours(0, 0, 0, 0));
         const endOfDay = new Date(today.setHours(23, 59, 59, 999));
 
+        const isAdmin = req.user && req.user.role === 'admin';
+        const filterStoreId = isAdmin ? (parseInt(req.query.store_id) || null) : req.user.store_id;
+        const include = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) }
+        ];
+
         const todaySales = await sale.findAll({
             where: {
                 sale_date: {
                     [Op.between]: [startOfDay, endOfDay]
                 }
-            }
+            },
+            include
         });
 
         const summary = {
@@ -593,8 +634,11 @@ router.get('/report/daily', auth, async (req, res) => {
 });
 
 // Get dashboard statistics
+// Get dashboard statistics
 router.get('/dashboard/stats', auth, async (req, res) => {
     try {
+        const { creditnote, creditnoteitem } = require('../models');
+
         // Get current date ranges
         const now = new Date();
         const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -605,6 +649,19 @@ router.get('/dashboard/stats', auth, async (req, res) => {
 
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
+        const filterStoreId = req.user.store_id;
+
+        // Base include for sales queries - filter by store
+        const salesInclude = [
+            {
+                model: user,
+                as: 'cashier',
+                attributes: ['id', 'full_name', 'store_id'],
+                where: { store_id: filterStoreId },
+                required: true
+            }
+        ];
+
         // Today's sales statistics
         const todaysSales = await sale.findAll({
             where: {
@@ -612,6 +669,7 @@ router.get('/dashboard/stats', auth, async (req, res) => {
                     [Op.between]: [startOfToday, endOfToday]
                 }
             },
+            include: salesInclude,
             order: [['sale_date', 'DESC']],
             limit: 10 // For recent sales
         });
@@ -625,7 +683,8 @@ router.get('/dashboard/stats', auth, async (req, res) => {
                 sale_date: {
                     [Op.between]: [startOfWeek, endOfToday]
                 }
-            }
+            },
+            include: salesInclude
         });
 
         const weekSalesTotal = weekSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
@@ -636,49 +695,78 @@ router.get('/dashboard/stats', auth, async (req, res) => {
                 sale_date: {
                     [Op.between]: [startOfMonth, endOfToday]
                 }
-            }
+            },
+            include: salesInclude
         });
 
         const monthSalesTotal = monthSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
 
-        // Product statistics
-        const totalProducts = await product.count();
-
-        const lowStockProducts = await product.count({
+        // Product statistics - count products available in this store
+        const totalProducts = await productinventory.count({
             where: {
+                store_id: filterStoreId
+            },
+            distinct: true,
+            col: 'product_id'
+        });
+
+        // Inventory stats per current user's store
+        const lowStockProducts = await productinventory.count({
+            where: {
+                store_id: filterStoreId,
                 stock_quantity: {
-                    [Op.between]: [1, 10] // Assuming low stock is between 1-10
+                    [Op.between]: [1, 10]
                 }
             }
         });
 
-        const outOfStockProducts = await product.count({
+        const outOfStockProducts = await productinventory.count({
             where: {
+                store_id: filterStoreId,
                 stock_quantity: {
                     [Op.lte]: 0
                 }
             }
         });
 
-        // Customer statistics
-        const totalCustomers = await customer.count();
-
-        // Active users (assuming users who made sales today are active)
-        const activeUsers = await user.count({
+        // Customer statistics - count customers who have made purchases at this store
+        const totalCustomers = await customer.count({
             include: [{
                 model: sale,
-                as: 'sales', // Adjust this alias based on your User model associations
-                where: {
-                    sale_date: {
-                        [Op.between]: [startOfToday, endOfToday]
-                    }
-                },
+                as: 'sales',
+                include: [{
+                    model: user,
+                    as: 'cashier',
+                    where: { store_id: filterStoreId },
+                    attributes: [],
+                    required: true
+                }],
+                attributes: [],
                 required: true
             }],
             distinct: true
         });
 
-        // Top products (by quantity sold this month)
+        // Active users - users from this store who made sales today
+        const activeUsers = await user.count({
+            where: {
+                store_id: filterStoreId
+            },
+            include: [{
+                model: sale,
+                as: 'sales',
+                where: {
+                    sale_date: {
+                        [Op.between]: [startOfToday, endOfToday]
+                    }
+                },
+                attributes: [],
+                required: true
+            }],
+            distinct: true
+        });
+
+        // Top products (by quantity sold this month) - filtered by store
         const topProductsQuery = await saleitem.findAll({
             attributes: [
                 'product_id',
@@ -693,6 +781,13 @@ router.get('/dashboard/stats', auth, async (req, res) => {
                             [Op.between]: [startOfMonth, endOfToday]
                         }
                     },
+                    include: [{
+                        model: user,
+                        as: 'cashier',
+                        where: { store_id: filterStoreId },
+                        attributes: [],
+                        required: true
+                    }],
                     attributes: []
                 },
                 {
@@ -716,22 +811,90 @@ router.get('/dashboard/stats', auth, async (req, res) => {
 
         // Recent sales (last 5 today's sales)
         const recentSalesData = todaysSales.slice(0, 5);
-        const recentSales = await Promise.all(recentSalesData.map(async (sale) => {
+        const recentSales = await Promise.all(recentSalesData.map(async (s) => {
             // Get item count for this sale
             const itemCount = await saleitem.count({
-                where: { sale_id: sale.id }
+                where: { sale_id: s.id }
             });
 
             return {
-                time: new Date(sale.sale_date).toLocaleTimeString('en-GB', {
+                time: new Date(s.sale_date).toLocaleTimeString('en-GB', {
                     hour: '2-digit',
                     minute: '2-digit',
                     hour12: false
                 }),
-                amount: parseFloat(sale.total_amount),
-                items: itemCount
+                amount: parseFloat(s.total_amount),
+                items: itemCount,
+                receipt_number: s.receipt_number,
+                payment_method: s.payment_method
             };
         }));
+
+        // Recent returns/credit notes (last 10) - filtered by store
+        const recentReturnsData = await creditnote.findAll({
+            limit: 10,
+            order: [['createdAt', 'DESC']],
+            include: [
+                {
+                    model: creditnoteitem,
+                    as: 'items',
+                    include: [{ model: product, as: 'product' }]
+                },
+                {
+                    model: user,
+                    as: 'cashier',
+                    attributes: ['id', 'full_name', 'store_id'],
+                    where: { store_id: filterStoreId },
+                    required: true
+                },
+                { model: customer, as: 'customer' }
+            ]
+        });
+
+        // Transform returns data to match expected format
+        const recentReturns = recentReturnsData.map(creditNote => ({
+            receipt_number: creditNote.receipt_number || creditNote.id?.toString() || '-',
+            credit_note_number: creditNote.receipt_number,
+            time: creditNote.createdAt?.toISOString() || '',
+            timestamp: creditNote.createdAt?.toISOString() || '',
+            created_at: creditNote.createdAt?.toISOString() || '',
+            createdAt: creditNote.createdAt?.toISOString() || '',
+            date: creditNote.createdAt?.toISOString() || '',
+            refund_amount: parseFloat(creditNote.total_amount || 0),
+            total_refund: parseFloat(creditNote.total_amount || 0),
+            refund: parseFloat(creditNote.total_amount || 0),
+            amount: parseFloat(creditNote.total_amount || 0),
+            total: parseFloat(creditNote.total_amount || 0),
+            grand_total: parseFloat(creditNote.total_amount || 0),
+            items_count: creditNote.items ? creditNote.items.length : 0,
+            itemsCount: creditNote.items ? creditNote.items.length : 0,
+            items: creditNote.items ? creditNote.items.length : 0,
+            quantity: creditNote.items ? creditNote.items.reduce((sum, item) => sum + (item.quantity || 0), 0) : 0
+        }));
+
+        // Calculate returns statistics - filtered by store
+        const returnsStats = await creditnote.findAll({
+            attributes: [
+                [fn('COUNT', col('creditnote.id')), 'count'],
+                [fn('SUM', col('creditnote.total_amount')), 'total']
+            ],
+            where: {
+                createdAt: {
+                    [Op.between]: [startOfToday, endOfToday]
+                }
+            },
+            include: [{
+                model: user,
+                as: 'cashier',
+                where: { store_id: filterStoreId },
+                attributes: [],
+                required: true
+            }],
+            raw: true
+        });
+
+        const totalReturnsToday = parseInt(returnsStats[0]?.count || 0);
+        const totalReturnsAmount = parseFloat(returnsStats[0]?.total || 0);
 
         // Prepare response data
         const dashboardStats = {
@@ -745,7 +908,12 @@ router.get('/dashboard/stats', auth, async (req, res) => {
             totalCustomers: totalCustomers,
             activeUsers: activeUsers,
             topProducts: topProducts,
-            recentSales: recentSales
+            recentSales: recentSales,
+            recentReturns: recentReturns,
+            recentCreditNotes: recentReturns,
+            recent_returns: recentReturns,
+            totalReturnsToday: totalReturnsToday,
+            totalReturnsAmount: parseFloat(totalReturnsAmount)
         };
 
         res.json({
@@ -763,7 +931,6 @@ router.get('/dashboard/stats', auth, async (req, res) => {
         });
     }
 });
-
 // Get dashboard statistics with date filter (optional)
 router.get('/dashboard/stats/:period', auth, async (req, res) => {
     try {
@@ -799,23 +966,26 @@ router.get('/dashboard/stats/:period', auth, async (req, res) => {
         }
 
         // Get sales for the specified period
+        const filterStoreId = req.user.store_id;
+        const include = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+            {
+                model: saleitem,
+                as: 'items',
+                include: [{
+                    model: product,
+                    as: 'product',
+                    attributes: ['name']
+                }]
+            }
+        ];
         const periodSales = await sale.findAll({
             where: {
                 sale_date: {
                     [Op.between]: [startDate, endDate]
                 }
             },
-            include: [
-                {
-                    model: saleitem,
-                    as: 'items',
-                    include: [{
-                        model: product,
-                        as: 'product',
-                        attributes: ['name']
-                    }]
-                }
-            ]
+            include
         });
 
         // Calculate statistics for the period

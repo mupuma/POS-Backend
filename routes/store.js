@@ -3,17 +3,25 @@ const router = express.Router();
 const { store, user } = require('../models'); // Adjust path as needed
 const { body, validationResult, param } = require('express-validator');
 
-// Middleware for authentication (adjust as needed)
-// const auth = require('../middleware/auth');
+// Middleware for authentication
+const auth = require('../middleware/auth');
 
 /**
  * @route   GET /api/stores
  * @desc    Get all stores
  * @access  Private
  */
-router.get('/', async (req, res) => {
+router.get('/', auth, async (req, res) => {
     try {
+        const isAdmin = req.user && req.user.role === 'admin';
+        const whereClause = {};
+        if (!isAdmin) {
+            // Cashiers only see their own store
+            whereClause.id = req.user.store_id;
+        }
+
         const stores = await store.findAll({
+            where: whereClause,
             include: [
                 {
                     model: user,
@@ -44,6 +52,7 @@ router.get('/', async (req, res) => {
  * @access  Private
  */
 router.get('/:id', [
+    auth,
     param('id').isInt().withMessage('Store ID must be a valid integer')
 ], async (req, res) => {
     try {
@@ -55,6 +64,11 @@ router.get('/:id', [
                 message: 'Validation failed',
                 errors: errors.array()
             });
+        }
+
+        // Cashiers can only access their own store
+        if (req.user && req.user.role === 'cashier' && parseInt(req.params.id) !== req.user.store_id) {
+            return res.status(403).json({ success: false, message: 'Access denied' });
         }
 
         const storeData = await store.findByPk(req.params.id, {
@@ -110,10 +124,10 @@ router.post('/', [
         .matches(/^[0-9]+$/)
         .withMessage('Mobile number must contain only digits'),
 
-    body('next_invoice_number')
+    body('invoice_number')
         .optional()
         .isLength({ min: 1, max: 50 })
-        .withMessage('Next invoice number must be between 1 and 50 characters')
+        .withMessage('Invoice number must be between 1 and 50 characters')
         .matches(/^[A-Z]{3}-\d{4}-\d+$/)
         .withMessage('Invoice number format must be like INV-1001-1')
 ], async (req, res) => {
@@ -128,7 +142,7 @@ router.post('/', [
             });
         }
 
-        const { store_number, store_location, store_mobile_no, next_invoice_number } = req.body;
+        const { store_number,store_rev_account, store_location, store_mobile_no, invoice_number } = req.body;
 
         // Check if store number already exists
         const existingStore = await store.findOne({
@@ -143,7 +157,7 @@ router.post('/', [
         }
 
         // Generate default invoice number if not provided
-        let invoiceNumber = next_invoice_number;
+        let invoiceNumber = invoice_number;
         if (!invoiceNumber) {
             // Extract numeric part from store number for invoice
             const numericPart = store_number.replace(/[^0-9]/g, '') || '1001';
@@ -153,8 +167,9 @@ router.post('/', [
         const newStore = await store.create({
             store_number,
             store_location,
+            store_rev_account,
             store_mobile_no,
-            next_invoice_number: invoiceNumber
+            invoice_number: invoiceNumber
         });
 
         res.status(201).json({
@@ -209,10 +224,10 @@ router.put('/:id', [
         .matches(/^[0-9]+$/)
         .withMessage('Mobile number must contain only digits'),
 
-    body('next_invoice_number')
+    body('invoice_number')
         .optional()
         .isLength({ min: 1, max: 50 })
-        .withMessage('Next invoice number must be between 1 and 50 characters')
+        .withMessage('Invoice number must be between 1 and 50 characters')
         .matches(/^[A-Z]{3}-\d{4}-\d+$/)
         .withMessage('Invoice number format must be like INV-1001-1')
 ], async (req, res) => {
@@ -426,9 +441,9 @@ router.get('/:id/users', [
  */
 router.patch('/:id/invoice-number', [
     param('id').isInt().withMessage('Store ID must be a valid integer'),
-    body('next_invoice_number')
+    body('invoice_number')
         .isLength({ min: 1, max: 50 })
-        .withMessage('Next invoice number must be between 1 and 50 characters')
+        .withMessage('Invoice number must be between 1 and 50 characters')
         .matches(/^[A-Z]{3}-\d{4}-\d+$/)
         .withMessage('Invoice number format must be like INV-1001-1')
 ], async (req, res) => {
@@ -444,7 +459,7 @@ router.patch('/:id/invoice-number', [
         }
 
         const storeId = req.params.id;
-        const { next_invoice_number } = req.body;
+        const { invoice_number } = req.body;
 
         // Check if store exists
         const existingStore = await store.findByPk(storeId);
@@ -457,7 +472,7 @@ router.patch('/:id/invoice-number', [
 
         // Update only the invoice number
         await store.update(
-            { next_invoice_number },
+            { invoice_number },
             { where: { id: storeId } }
         );
 
@@ -470,8 +485,8 @@ router.patch('/:id/invoice-number', [
             data: {
                 id: updatedStore.id,
                 store_number: updatedStore.store_number,
-                previous_invoice_number: existingStore.next_invoice_number,
-                current_invoice_number: updatedStore.next_invoice_number
+                previous_invoice_number: existingStore.invoice_number,
+                current_invoice_number: updatedStore.invoice_number
             }
         });
     } catch (error) {

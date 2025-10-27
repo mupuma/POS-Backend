@@ -1,5 +1,5 @@
 const express = require('express');
-const { product, category, saleitem } = require('../models');
+const { product, category, saleitem,productinventory ,store} = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
 
@@ -14,6 +14,7 @@ router.get('/', auth, async (req, res) => {
     const search = req.query.search || '';
     const category_id = req.query.category_id;
     const active_only = req.query.active_only === 'true';
+    const store_id = (req.user && req.user.store_id) || null;
 
     // Build where clause
     const whereClause = {};
@@ -33,18 +34,56 @@ router.get('/', auth, async (req, res) => {
       whereClause.is_active = true;
     }
 
+    const include = [
+      { model: category, as: 'category' }
+    ];
+
+    // If store_id is provided/available, require an inventory row for that store
+    if (store_id) {
+      include.push({
+        model: productinventory,
+        as: 'inventories',
+        where: { store_id, is_active: true },
+        required: true,
+        attributes: ['store_id', 'stock_quantity', 'min_stock_level', 'price_override'],
+        include: [{ model: store, as: 'store', attributes: ['id', 'store_location'] }]
+      });
+    } else {
+      // If no store context, include inventories as optional for visibility
+      include.push({
+        model: productinventory,
+        as: 'inventories',
+        required: false,
+        attributes: ['store_id', 'stock_quantity', 'min_stock_level', 'price_override']
+      });
+    }
+
     const { count, rows } = await product.findAndCountAll({
       where: whereClause,
       limit,
       offset,
       order: [['name', 'ASC']],
-      include: [
-        { model: category, as: 'category' }
-      ]
+      include
     });
 
+     const productsWithEffective = rows.map(p => {
+      const json = p.toJSON();
+      const inv = Array.isArray(json.inventories) && json.inventories.length > 0 ? json.inventories[0] : null;
+      const effective_price = inv && inv.price_override != null ? Number(inv.price_override) : Number(json.price);
+      // Prefer per-store inventory values when available
+      const stock_quantity = inv && inv.stock_quantity != null ? Number(inv.stock_quantity) : (json.stock_quantity != null ? Number(json.stock_quantity) : null);
+      const min_stock_level = inv && inv.min_stock_level != null ? Number(inv.min_stock_level) : (json.min_stock_level != null ? Number(json.min_stock_level) : null);
+      return {
+        ...json,
+        effective_price,
+        // Override top-level fields so consumers read store inventory
+        stock_quantity,
+        min_stock_level
+      };
+    });
+    console.log(productsWithEffective)
     res.json({
-      products: rows,
+      products: productsWithEffective,
       pagination: {
         current_page: page,
         total_pages: Math.ceil(count / limit),
@@ -61,18 +100,37 @@ router.get('/', auth, async (req, res) => {
 
 // Get product by ID
 router.get('/:id', auth, async (req, res) => {
-  try {
-    const productData = await product.findByPk(req.params.id, {
-      include: [
-        { model: category, as: 'category' }
-      ]
-    });
+   try {
+    const store_id = (req.user && req.user.store_id) || null;
+
+    const include = [
+      { model: category, as: 'category' }
+    ];
+
+    if (store_id) {
+      include.push({
+        model: productinventory,
+        as: 'inventories',
+        where: { store_id },
+        required: false,
+        attributes: ['store_id', 'stock_quantity', 'min_stock_level', 'price_override']
+      });
+    }
+
+    const productData = await product.findByPk(req.params.id, { include });
 
     if (!productData) {
       return res.status(404).json({ message: 'Product not found' });
     }
 
-    res.json({ product: productData });
+    const json = productData.toJSON();
+    const inv = Array.isArray(json.inventories) && json.inventories.length > 0 ? json.inventories[0] : null;
+    const effective_price = inv && inv.price_override != null ? Number(inv.price_override) : Number(json.price);
+    // Prefer per-store inventory values when available
+    const stock_quantity = inv && inv.stock_quantity != null ? Number(inv.stock_quantity) : (json.stock_quantity != null ? Number(json.stock_quantity) : null);
+    const min_stock_level = inv && inv.min_stock_level != null ? Number(inv.min_stock_level) : (json.min_stock_level != null ? Number(json.min_stock_level) : null);
+
+    res.json({ product: { ...json, effective_price, stock_quantity, min_stock_level } });
 
   } catch (error) {
     console.error(error);
@@ -80,30 +138,54 @@ router.get('/:id', auth, async (req, res) => {
   }
 });
 
+
 // Get product by barcode (for scanning)
 router.get('/barcode/:barcode', auth, async (req, res) => {
-  try {
+   try {
+    const store_id = (req.user && req.user.store_id) || null;
+
+    const include = [
+      { model: category, as: 'category' }
+    ];
+
+    if (store_id) {
+      include.push({
+        model: productinventory,
+        as: 'inventories',
+        where: { store_id, is_active: true },
+        required: true,
+        attributes: ['store_id', 'stock_quantity', 'min_stock_level', 'price_override']
+      });
+    }
+
     const productData = await product.findOne({
       where: {
         barcode: req.params.barcode,
         is_active: true
       },
-      include: [
-        { model: category, as: 'category' }
-      ]
+      include
     });
 
     if (!productData) {
       return res.status(404).json({ message: 'Product not found' });
     }
 
-    res.json({ product: productData });
+    const json = productData.toJSON();
+    const inv = Array.isArray(json.inventories) && json.inventories.length > 0 ? json.inventories[0] : null;
+    const effective_price = inv && inv.price_override != null ? Number(inv.price_override) : Number(json.price);
+    // Prefer per-store inventory values when available
+    const stock_quantity = inv && inv.stock_quantity != null ? Number(inv.stock_quantity) : (json.stock_quantity != null ? Number(json.stock_quantity) : null);
+    const min_stock_level = inv && inv.min_stock_level != null ? Number(inv.min_stock_level) : (json.min_stock_level != null ? Number(json.min_stock_level) : null);
+
+    res.json({ product: { ...json, effective_price, stock_quantity, min_stock_level } });
+
 
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
   }
 });
+
 
 // Create new product (admin only)
 router.post('/', auth, async (req, res) => {
@@ -120,8 +202,11 @@ router.post('/', auth, async (req, res) => {
       cost,
       barcode,
       category_id,
+      // store-specific initial inventory (optional)
+      store_id,
       stock_quantity,
-      min_stock_level
+      min_stock_level,
+      price_override
     } = req.body;
 
     // Validate required fields
@@ -152,18 +237,34 @@ router.post('/', auth, async (req, res) => {
       cost: cost ? parseFloat(cost) : 0.00,
       barcode,
       category_id,
-      stock_quantity: stock_quantity || 0,
-      min_stock_level: min_stock_level || 0
+      // keep product-level stock fields untouched for backward compatibility
     });
 
-    // Fetch with category info
-    const productWithCategory = await product.findByPk(newProduct.id, {
-      include: [{ model: category, as: 'category' }]
+    // Optionally seed inventory row for a particular store
+    let inventoryRow = null;
+    if (store_id) {
+      inventoryRow = await productinventory.create({
+        product_id: newProduct.id,
+        store_id,
+        stock_quantity: stock_quantity || 0,
+        min_stock_level: min_stock_level || 0,
+        price_override: price_override !== undefined && price_override !== null
+          ? parseFloat(price_override) : null
+      });
+    }
+
+    // Fetch with category + inventories info
+    const productWithRelations = await product.findByPk(newProduct.id, {
+      include: [
+        { model: category, as: 'category' },
+        { model: productinventory, as: 'inventories' }
+      ]
     });
 
     res.status(201).json({
       message: 'Product created successfully',
-      product: productWithCategory
+      product: productWithRelations,
+      created_inventory: inventoryRow
     });
 
   } catch (error) {
@@ -194,7 +295,12 @@ router.put('/:id', auth, async (req, res) => {
       category_id,
       stock_quantity,
       min_stock_level,
-      is_active
+      min_price,
+      max_price,
+      is_active,
+      // optional: update a specific store's inventory
+      store_id,
+      price_override
     } = req.body;
 
     // Check if barcode already exists (exclude current product)
@@ -218,7 +324,22 @@ router.put('/:id', auth, async (req, res) => {
       }
     }
 
-    // Update product
+    // Validate and compute min/max price
+    const parsedMin = (min_price !== undefined && min_price !== null && min_price !== '') ? parseFloat(min_price) : null;
+    const parsedMax = (max_price !== undefined && max_price !== null && max_price !== '') ? parseFloat(max_price) : null;
+
+    if ((parsedMin !== null && isNaN(parsedMin)) || (parsedMax !== null && isNaN(parsedMax))) {
+      return res.status(400).json({ message: 'min_price and max_price must be valid numbers' });
+    }
+
+    const finalMin = (parsedMin !== null) ? parsedMin : productData.min_price;
+    const finalMax = (parsedMax !== null) ? parsedMax : productData.max_price;
+
+    if (finalMin !== null && finalMax !== null && Number(finalMin) > Number(finalMax)) {
+      return res.status(400).json({ message: 'min_price cannot be greater than max_price' });
+    }
+
+    // Update product fields (catalog-level)
     await product.update({
       name: name || productData.name,
       description: description !== undefined ? description : productData.description,
@@ -226,16 +347,42 @@ router.put('/:id', auth, async (req, res) => {
       cost: cost !== undefined ? parseFloat(cost) : productData.cost,
       barcode: barcode !== undefined ? barcode : productData.barcode,
       category_id: category_id !== undefined ? category_id : productData.category_id,
-      stock_quantity: stock_quantity !== undefined ? stock_quantity : productData.stock_quantity,
-      min_stock_level: min_stock_level !== undefined ? min_stock_level : productData.min_stock_level,
+      min_price: finalMin,
+      max_price: finalMax,
       is_active: is_active !== undefined ? is_active : productData.is_active
     }, {
       where: { id: req.params.id }
     });
 
-    // Fetch updated product with category
+    // If store_id provided, optionally upsert the per-store inventory
+    if (store_id) {
+      const [inv] = await productinventory.findOrCreate({
+        where: { product_id: req.params.id, store_id },
+        defaults: {
+          stock_quantity: stock_quantity || 0,
+          min_stock_level: min_stock_level || 0,
+          price_override: price_override !== undefined && price_override !== null
+            ? parseFloat(price_override) : null
+        }
+      });
+
+      const fieldsToUpdate = {};
+      if (stock_quantity !== undefined) fieldsToUpdate.stock_quantity = stock_quantity;
+      if (min_stock_level !== undefined) fieldsToUpdate.min_stock_level = min_stock_level;
+      if (price_override !== undefined) {
+        fieldsToUpdate.price_override = (price_override === null || price_override === '') ? null : parseFloat(price_override);
+      }
+      if (Object.keys(fieldsToUpdate).length > 0) {
+        await inv.update(fieldsToUpdate);
+      }
+    }
+
+    // Fetch updated product with category + inventories
     const updatedProduct = await product.findByPk(req.params.id, {
-      include: [{ model: category, as: 'category' }]
+      include: [
+        { model: category, as: 'category' },
+        { model: productinventory, as: 'inventories' }
+      ]
     });
 
     res.json({
@@ -249,7 +396,7 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
-// Update stock quantity
+// Update stock quantity (per store)
 router.patch('/:id/stock', auth, async (req, res) => {
   try {
     // Check if user is admin
@@ -257,7 +404,12 @@ router.patch('/:id/stock', auth, async (req, res) => {
       return res.status(403).json({ message: 'Only admins can update stock' });
     }
 
-    const { stock_quantity, adjustment_type, adjustment_reason } = req.body;
+    const { stock_quantity, adjustment_type, adjustment_reason, store_id: body_store_id } = req.body;
+
+    const store_id = parseInt(body_store_id) || req.user.store_id;
+    if (!store_id) {
+      return res.status(400).json({ message: 'store_id is required for stock updates' });
+    }
 
     if (stock_quantity === undefined) {
       return res.status(400).json({ message: 'Stock quantity is required' });
@@ -268,12 +420,17 @@ router.patch('/:id/stock', auth, async (req, res) => {
       return res.status(404).json({ message: 'Product not found' });
     }
 
+    const [inventory] = await productinventory.findOrCreate({
+      where: { product_id: req.params.id, store_id },
+      defaults: { stock_quantity: 0, min_stock_level: 0 }
+    });
+
     let newStockQuantity;
 
     if (adjustment_type === 'add') {
-      newStockQuantity = productData.stock_quantity + parseInt(stock_quantity);
+      newStockQuantity = inventory.stock_quantity + parseInt(stock_quantity);
     } else if (adjustment_type === 'subtract') {
-      newStockQuantity = productData.stock_quantity - parseInt(stock_quantity);
+      newStockQuantity = inventory.stock_quantity - parseInt(stock_quantity);
     } else {
       newStockQuantity = parseInt(stock_quantity);
     }
@@ -283,20 +440,35 @@ router.patch('/:id/stock', auth, async (req, res) => {
       return res.status(400).json({ message: 'Stock cannot be negative' });
     }
 
-    await product.update(
-        { stock_quantity: newStockQuantity },
-        { where: { id: req.params.id } }
-    );
+    await inventory.update({ stock_quantity: newStockQuantity });
 
     const updatedProduct = await product.findByPk(req.params.id, {
-      include: [{ model: category, as: 'category' }]
+      include: [
+        { model: category, as: 'category' },
+        {
+          model: productinventory,
+          as: 'inventories',
+          where: { store_id },
+          required: false
+        }
+      ]
     });
+
+    // Override top-level stock fields in response using the store inventory
+    const updatedJson = updatedProduct ? updatedProduct.toJSON() : null;
+    const inv = updatedJson && Array.isArray(updatedJson.inventories) && updatedJson.inventories.length > 0 ? updatedJson.inventories[0] : null;
+    const responseProduct = updatedJson ? {
+      ...updatedJson,
+      stock_quantity: inv && inv.stock_quantity != null ? Number(inv.stock_quantity) : (updatedJson.stock_quantity != null ? Number(updatedJson.stock_quantity) : null),
+      min_stock_level: inv && inv.min_stock_level != null ? Number(inv.min_stock_level) : (updatedJson.min_stock_level != null ? Number(updatedJson.min_stock_level) : null)
+    } : null;
 
     res.json({
       message: 'Stock updated successfully',
-      product: updatedProduct,
-      previous_stock: productData.stock_quantity,
-      new_stock: newStockQuantity
+      product: responseProduct,
+      previous_stock: inventory.stock_quantity,
+      new_stock: newStockQuantity,
+      store_id
     });
 
   } catch (error) {
@@ -305,103 +477,42 @@ router.patch('/:id/stock', auth, async (req, res) => {
   }
 });
 
-// Get low stock products
+
+// Get low stock products (per store)
 router.get('/reports/low-stock', auth, async (req, res) => {
   try {
-    const lowStockProducts = await product.findAll({
-      where: {
-        [Op.and]: [
-          { is_active: true },
-          product.sequelize.where(
-              product.sequelize.col('stock_quantity'),
-              Op.lte,
-              product.sequelize.col('min_stock_level')
-          )
-        ]
-      },
-      include: [{ model: category, as: 'category' }],
-      order: [['stock_quantity', 'ASC']]
-    });
-
-    res.json({
-      message: `Found ${lowStockProducts.length} products with low stock`,
-      products: lowStockProducts
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Get product sales report
-router.get('/:id/sales-report', auth, async (req, res) => {
-  try {
-    const { start_date, end_date } = req.query;
-
-    const whereClause = { product_id: req.params.id };
-
-    if (start_date && end_date) {
-      whereClause['$sale.sale_date$'] = {
-        [Op.between]: [new Date(start_date), new Date(end_date)]
-      };
+    const store_id = (req.user && req.user.store_id) || null;
+    if (!store_id) {
+      return res.status(400).json({ message: 'store_id is required' });
     }
 
-    const salesData = await saleitem.findAll({
-      where: whereClause,
+    const lowStockProducts = await product.findAll({
+      where: { is_active: true },
       include: [
+        { model: category, as: 'category' },
         {
-          model: product,
-          as: 'product',
-          include: [{ model: category, as: 'category' }]
-        },
-        {
-          model: sale,
-          as: 'sale',
-          attributes: ['id', 'receipt_number', 'sale_date']
+          model: productinventory,
+          as: 'inventories',
+          where: {
+            store_id
+          },
+          required: true,
+          attributes: ['stock_quantity', 'min_stock_level']
         }
       ],
-      order: [['sale', 'sale_date', 'DESC']]
+      order: [['name', 'ASC']]
     });
 
-    const summary = {
-      total_quantity_sold: salesData.reduce((sum, item) => sum + item.quantity, 0),
-      total_revenue: salesData.reduce((sum, item) => sum + parseFloat(item.total_price), 0),
-      total_transactions: salesData.length,
-      average_quantity_per_sale: salesData.length > 0 ?
-          salesData.reduce((sum, item) => sum + item.quantity, 0) / salesData.length : 0
-    };
+    // Filter those where inventory.stock_quantity <= inventory.min_stock_level
+    const filtered = lowStockProducts.filter(p => {
+      const inv = Array.isArray(p.inventories) ? p.inventories[0] : null;
+      return inv && inv.stock_quantity <= inv.min_stock_level;
+    });
 
     res.json({
-      product_sales: salesData,
-      summary
+      message: `Found ${filtered.length} products with low stock at store ${store_id}`,
+      products: filtered
     });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Delete product (soft delete - set is_active to false)
-router.delete('/:id', auth, async (req, res) => {
-  try {
-    // Check if user is admin
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Only admins can delete products' });
-    }
-
-    const productData = await product.findByPk(req.params.id);
-    if (!productData) {
-      return res.status(404).json({ message: 'Product not found' });
-    }
-
-    await product.update(
-        { is_active: false },
-        { where: { id: req.params.id } }
-    );
-
-    res.json({ message: 'Product deleted successfully' });
 
   } catch (error) {
     console.error(error);

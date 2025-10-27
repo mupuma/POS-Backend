@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { user } = require('../models');
+const { user, store } = require('../models');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -60,12 +60,16 @@ router.post('/login', async (req, res) => {
             return res.status(400).json({ message: 'Username and password are required' });
         }
 
-        // Find user
+        // Find user with store information
         const foundUser = await user.findOne({
             where: {
                 username,
                 is_active: true
-            }
+            },
+            include: [{
+                model: store,
+                attributes: ['id', 'store_location', 'store_mobile_no', 'store_number']
+            }]
         });
 
         if (!foundUser) {
@@ -82,7 +86,8 @@ router.post('/login', async (req, res) => {
         const payload = {
             id: foundUser.id,
             username: foundUser.username,
-            role: foundUser.role
+            role: foundUser.role,
+            store_id: foundUser.store_id
         };
 
         const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '24h' });
@@ -95,10 +100,15 @@ router.post('/login', async (req, res) => {
                 username: foundUser.username,
                 full_name: foundUser.full_name,
                 role: foundUser.role,
-                store_id:foundUser.store_id,
+                store_id: foundUser.store_id,
+                store: foundUser.store ? {
+                    id: foundUser.store.id,
+                    store_location: foundUser.store.store_location,
+                    store_mobile_no: foundUser.store.store_mobile_no,
+                    store_number: foundUser.store.store_number
+                } : null
             }
         });
-
 
     } catch (error) {
         console.error(error);
@@ -123,6 +133,47 @@ router.get('/me', auth, async (req, res) => {
     }
 });
 
+router.post('/verify-admin', auth, async (req, res) => {
+    try {
+        const { password, username } = req.body; // or email
+
+        // Validate input
+        if (!password || !username) {
+            return res.status(400).json({ message: 'Username and password are required' });
+        }
+
+        // Find the admin user
+        const foundUser = await user.findOne({
+            where: {
+                username: username, // or email: email
+                is_active: true,
+                role: 'admin' // Ensure they have admin privileges
+            }
+        });
+
+        if (!foundUser) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
+
+        // Check password
+        const isMatch = await bcrypt.compare(password, foundUser.password_hash);
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
+
+        // Send success response
+        return res.status(200).json({
+            message: 'Admin verified successfully',
+            isAdmin: true,
+           success:true,
+
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
 // Change password
 router.put('/change-password', auth, async (req, res) => {
     try {

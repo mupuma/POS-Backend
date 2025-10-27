@@ -1,5 +1,5 @@
 const express = require('express');
-const { category, product } = require('../models');
+const { category, product, productinventory, store } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
 
@@ -30,7 +30,14 @@ router.get('/', auth, async (req, res) => {
             includeOptions.push({
                 model: product,
                 as: 'products',
-                attributes: ['id', 'name', 'price', 'stock_quantity', 'is_active']
+                attributes: ['id', 'name', 'price', 'is_active'],
+                include: [{
+                    model: productinventory,
+                    as: 'inventories',
+                    required: false,
+                    attributes: ['store_id', 'stock_quantity', 'min_stock_level'],
+                    include: [{ model: store, as: 'store', attributes: ['id', 'store_location'] }]
+                }]
             });
         }
 
@@ -84,7 +91,13 @@ router.get('/:id', auth, async (req, res) => {
                 {
                     model: product,
                     as: 'products',
-                    attributes: ['id', 'name', 'price', 'stock_quantity', 'is_active']
+                    attributes: ['id', 'name', 'price', 'is_active'],
+                    include: [{
+                        model: productinventory,
+                        as: 'inventories',
+                        required: false,
+                        attributes: ['store_id', 'stock_quantity', 'min_stock_level']
+                    }]
                 }
             ]
         });
@@ -240,22 +253,53 @@ router.get('/:id/stats', auth, async (req, res) => {
             return res.status(404).json({ message: 'Category not found' });
         }
 
+        // Determine store context for stats
+        const isAdmin = req.user && req.user.role === 'admin';
+        const store_id = isAdmin ? (parseInt(req.query.store_id) || req.user.store_id || null) : (req.user && req.user.store_id);
+
         const products = await product.findAll({
             where: { category_id: req.params.id },
-            attributes: ['id', 'name', 'price', 'cost', 'stock_quantity', 'is_active']
+            attributes: ['id', 'name', 'price', 'cost', 'is_active'],
+            include: [{
+                model: productinventory,
+                as: 'inventories',
+                required: false,
+                attributes: ['store_id', 'stock_quantity', 'min_stock_level']
+            }]
         });
 
         const activeProducts = products.filter(p => p.is_active);
-        const totalStockValue = products.reduce((sum, p) => sum + (parseFloat(p.price) * p.stock_quantity), 0);
-        const totalCostValue = products.reduce((sum, p) => sum + (parseFloat(p.cost || 0) * p.stock_quantity), 0);
-        const lowStockProducts = products.filter(p => p.stock_quantity <= (p.min_stock_level || 0));
+
+        // Helper to get stock for the relevant store (or sum across stores if none)
+        const getStock = (p) => {
+            const invs = Array.isArray(p.inventories) ? p.inventories : [];
+            if (store_id) {
+                const inv = invs.find(i => i.store_id === store_id);
+                return inv ? parseInt(inv.stock_quantity || 0) : 0;
+            }
+            return invs.reduce((s, i) => s + parseInt(i.stock_quantity || 0), 0);
+        };
+        const getMinLevel = (p) => {
+            const invs = Array.isArray(p.inventories) ? p.inventories : [];
+            if (store_id) {
+                const inv = invs.find(i => i.store_id === store_id);
+                return inv ? parseInt(inv.min_stock_level || 0) : 0;
+            }
+            // If no store specified, use min across stores as threshold
+            return invs.reduce((min, i) => Math.min(min, parseInt(i.min_stock_level || 0)), Number.POSITIVE_INFINITY) || 0;
+        };
+
+        const total_stock_quantity = products.reduce((sum, p) => sum + getStock(p), 0);
+        const totalStockValue = products.reduce((sum, p) => sum + (parseFloat(p.price) * getStock(p)), 0);
+        const totalCostValue = products.reduce((sum, p) => sum + (parseFloat(p.cost || 0) * getStock(p)), 0);
+        const lowStockProducts = products.filter(p => getStock(p) <= getMinLevel(p));
 
         const stats = {
             category: categoryData,
             total_products: products.length,
             active_products: activeProducts.length,
             inactive_products: products.length - activeProducts.length,
-            total_stock_quantity: products.reduce((sum, p) => sum + p.stock_quantity, 0),
+            total_stock_quantity,
             total_stock_value: totalStockValue,
             total_cost_value: totalCostValue,
             potential_profit: totalStockValue - totalCostValue,
@@ -301,13 +345,22 @@ router.get('/:id/products', auth, async (req, res) => {
             ];
         }
 
+        const isAdmin = req.user && req.user.role === 'admin';
+        const store_id = isAdmin ? (parseInt(req.query.store_id) || req.user.store_id || null) : (req.user && req.user.store_id);
+
         const { count, rows } = await product.findAndCountAll({
             where: whereClause,
             limit,
             offset,
             order: [['name', 'ASC']],
             include: [
-                { model: category, as: 'category' }
+                { model: category, as: 'category' },
+                {
+                    model: productinventory,
+                    as: 'inventories',
+                    required: false,
+                    attributes: ['store_id', 'stock_quantity', 'min_stock_level']
+                }
             ]
         });
 
@@ -319,7 +372,8 @@ router.get('/:id/products', auth, async (req, res) => {
                 total_pages: Math.ceil(count / limit),
                 total_records: count,
                 per_page: limit
-            }
+            },
+            store_id
         });
 
     } catch (error) {

@@ -8,6 +8,9 @@ module.exports = (sequelize) => {
         description: {
             type: DataTypes.TEXT
         },
+            image_url: {
+            type: DataTypes.TEXT
+        },
         price: {
             type: DataTypes.DECIMAL(10, 2),
             allowNull: false
@@ -27,6 +30,14 @@ module.exports = (sequelize) => {
         min_stock_level: {
             type: DataTypes.INTEGER,
             defaultValue: 0
+        },
+        min_price: {
+            type: DataTypes.DECIMAL(10, 2),
+            allowNull: true
+        },
+        max_price: {
+            type: DataTypes.DECIMAL(10, 2),
+            allowNull: true
         },
         is_active: {
             type: DataTypes.BOOLEAN,
@@ -53,6 +64,8 @@ module.exports = (sequelize) => {
     product.associate = function(models) {
         product.hasMany(models.saleitem, { foreignKey: 'product_id' });
         product.belongsTo(models.category, { foreignKey: 'category_id' });
+        // Add per-store inventory
+        product.hasMany(models.productinventory, { foreignKey: 'product_id', as: 'inventories' });
     };
     return product;
 };
