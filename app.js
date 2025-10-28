@@ -29,7 +29,7 @@ app.use('/api/stores', require('./routes/store'));
 app.use('/api/inventory', require('./routes/inventory'));
 // Use the new credit notes router that writes to dedicated tables
 app.use('/api/creditnotes', require('./routes/creditnotes_v2'));
-
+app.use('api/vsdc/', require('./routes/zra-device'));
 app.get('/', (req, res) => {
     res.json({ message: 'POS API is running!' });
 });

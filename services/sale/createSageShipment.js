@@ -142,13 +142,14 @@ class SageShipment {
                 try {
                     const username = process.env.SAGE_USERNAME || "ADMIN";
                     const password = process.env.SAGE_PASSWORD || "Admin123!";
+                    const baseUrl = process.env.SAGE_BASE_URL || "http://localhost/Sage300WebApi/v1.0/-/INDCOM";
 
                     const auth = `${username}:${password}`;
                     const encodedAuth = Buffer.from(auth, "utf-8").toString("base64");
                     const authorization = `Basic ${encodedAuth}`;
 
                     const response = await axios.post(
-                        "http://localhost/Sage300WebApi/v1.0/-/INDCOM/IC/ICShipments",
+                        `${baseUrl}/IC/ICShipments`,
                         consolidatedShipment,
                         {
                             headers: {

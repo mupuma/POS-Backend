@@ -7,7 +7,7 @@ const ZRAIntegrationService = require('./generateSmartInvoiceCreditNote');
  */
 class AccountsReceivableBatchReturn {
     constructor() {
-        this.baseURL = 'http://localhost/Sage300WebApi/v1.0/-/INDCOM/AR/ARInvoiceBatches';
+        this.baseURL = process.env.SAGE_BASE_URL|| 'http://localhost/Sage300WebApi/v1.0/-/INDCOM';
         this.timeout = 30000; // 30 seconds
     }
 
@@ -116,7 +116,7 @@ class AccountsReceivableBatchReturn {
                 AsOfDate: utcDate,
                 DocumentDate: utcDate,
                 DocumentType: "CreditNote",
-                TransactionType: "CreditNoteItemIssued",
+                TransactionType: "CreditNoteSummaryIssued",
                 InvoiceDescription: sale?.notes || `Receipt: ${sale?.receipt_number || entryNumber}`,
                 InvoicePrinted: "No",
                 CurrencyCode: sale?.currency || "ZMW",
@@ -172,7 +172,7 @@ class AccountsReceivableBatchReturn {
             const authorization = `Basic ${encodedAuth}`;
 
             const response = await axios.post(
-                this.baseURL,
+                `${this.baseURL}/AR/ARInvoiceBatches`,
                 consolidatedBatch,
                 {
                     headers: {

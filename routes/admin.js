@@ -12,6 +12,7 @@ const AccountsReceivableBatch = require("../services/sale/createSageArBatch");
 const SageShipmentReturn = require('../services/credit-note/createSageShipmentReturn');
 const AccountsReceivableBatchReturn = require('../services/credit-note/createSageArBatchReturn');
 const ZRAIntegrationServiceStockDisposal = require("../services/stock-disposal/zraEndPoints");
+const SageInternalUsage = require("../services/stock-disposal/sageInternalUsages");
 
 /**
  * Creates a consolidated shipment batch for all sales of a day
@@ -208,6 +209,59 @@ async function persistConsolidatedCreditNoteInvoiceDataToSage(creditNotesForDay,
     } catch (error) {
         console.error('Error persisting consolidated credit note invoice data to Sage:', error);
         return { success: false, error: 'Error occurred while communicating with Sage system' };
+    }
+}
+
+/**
+ * Creates internal usage for disposed stock
+ */
+async function createInternalUsageForDisposal(disposalItems, user, usageAccount = '') {
+    try {
+        const sageService = new SageInternalUsage();
+
+        // Generate a unique usage number for the disposal
+        const timestamp = Date.now();
+        const usageNumber = `DISPOSAL-${timestamp}`;
+
+        // Prepare disposal data for internal usage
+        const usageDataArray = [{
+            items: disposalItems.map(item => ({
+                product_id: item.product_id,
+                quantity: Number(item.quantity),
+                unit_cost: Number(item.unit_cost || item.product?.price || 0),
+                total_price: Number(item.total_price),
+                product: item.product || null,
+                product_code: item.product?.product_code,
+                product_name: item.product?.name
+            })),
+            usageNumber: usageNumber,
+            employeeNumber: user?.employee_number || '',
+            usageAccount: usageAccount || 'DISPOSAL'
+        }];
+
+        const sageResponse = await sageService.createConsolidatedInternalUsageBatch(usageDataArray, user);
+
+        if (!sageResponse.success) {
+            console.error('Internal usage creation for disposal failed:', sageResponse.error);
+            return {
+                success: false,
+                error: sageResponse.error || 'Failed to create internal usage for disposal in Sage system'
+            };
+        }
+
+        return {
+            success: true,
+            data: sageResponse.data,
+            usageNumber: usageNumber,
+            itemsProcessed: sageResponse.itemsProcessed,
+            usagesProcessed: sageResponse.usagesProcessed
+        };
+    } catch (error) {
+        console.error('Error creating internal usage for disposal:', error);
+        return {
+            success: false,
+            error: 'Error occurred while creating internal usage for disposal'
+        };
     }
 }
 
@@ -483,25 +537,40 @@ router.post('/zero-stock', auth, async (req, res) => {
             0 // Remaining quantity after zeroing out
         );
 
-        // Send data to ZRA
-        const [stockItemsResult, stockMasterResult] = await Promise.all([
+        // Send data to ZRA and create internal usage for disposal
+        const [stockItemsResult, stockMasterResult, internalUsageResult] = await Promise.all([
             zraService.sendStockItemsData(stockItemsData),
-            zraService.sendStockMasterData(stockMasterData)
+            zraService.sendStockMasterData(stockMasterData),
+            createInternalUsageForDisposal(disposalItems, fullUser, 'DISPOSAL')
         ]);
 
-        // Check if both ZRA calls were successful
+        // Check if ZRA calls were successful
         if (!stockItemsResult.success || !stockMasterResult.success) {
             return res.status(500).json({
                 success: false,
                 error: 'ZRA submission failed',
                 results: {
                     stockItems: stockItemsResult,
-                    stockMaster: stockMasterResult
+                    stockMaster: stockMasterResult,
+                    internalUsage: internalUsageResult
                 }
             });
         }
 
-        // Update local inventory to zero only if ZRA submission was successful
+        // Check if internal usage was successful
+        if (!internalUsageResult.success) {
+            return res.status(500).json({
+                success: false,
+                error: 'Internal usage creation failed',
+                results: {
+                    stockItems: stockItemsResult,
+                    stockMaster: stockMasterResult,
+                    internalUsage: internalUsageResult
+                }
+            });
+        }
+
+        // Update local inventory to zero only if both ZRA submission and internal usage were successful
         await productinventory.update(
             { stock_quantity: 0 },
             {
@@ -516,6 +585,11 @@ router.post('/zero-stock', auth, async (req, res) => {
             success: true,
             message: `Successfully zeroed out stock for ${productsWithInventory.length} products`,
             productsAffected: productsWithInventory.length,
+            internalUsage: {
+                usageNumber: internalUsageResult.usageNumber,
+                itemsProcessed: internalUsageResult.itemsProcessed,
+                usagesProcessed: internalUsageResult.usagesProcessed
+            },
             totalValueDisposed: totalAmount,
             zraResults: {
                 stockItems: stockItemsResult,

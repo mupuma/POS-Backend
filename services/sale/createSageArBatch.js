@@ -7,8 +7,7 @@ const ZRAIntegrationService = require('./generateSmartInvoice');
  */
 class AccountsReceivableBatch {
     constructor() {
-        this.baseURL = 'http://localhost/Sage300WebApi/v1.0/-/INDCOM/AR/ARInvoiceBatches';
-        this.timeout = 30000; // 30 seconds
+
     }
 
     // Round a value to 2 decimal places and return a number
@@ -165,6 +164,7 @@ class AccountsReceivableBatch {
         try {
             const username = process.env.SAGE_USERNAME || "ADMIN";
             const password = process.env.SAGE_PASSWORD || "Admin123!";
+            const baseURL= process.env.SAGE_BASE_URL || "http://localhost/Sage300WebApi/v1.0/-/INDCOM";
 
             // Encode auth as Base64
             const auth = `${username}:${password}`;
@@ -172,7 +172,7 @@ class AccountsReceivableBatch {
             const authorization = `Basic ${encodedAuth}`;
 
             const response = await axios.post(
-                this.baseURL,
+                `${baseURL}/AR/ARInvoiceBatches`,
                 consolidatedBatch,
                 {
                     headers: {

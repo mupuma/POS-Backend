@@ -1,7 +1,7 @@
 const axios = require('axios');
 
 class Sage300InventoryService {
-  constructor(baseUrl = 'http://localhost/Sage300WebApi/v1.0/-/INDCOM') {
+  constructor(baseUrl = process.env.SAGE_BASE_URL || 'http://localhost/Sage300WebApi/v1.0/-/INDCOM') {
       const username = process.env.SAGE_USERNAME || "ADMIN";
             const password = process.env.SAGE_PASSWORD || "Admin123!";
 
