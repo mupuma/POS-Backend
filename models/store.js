@@ -16,6 +16,11 @@ module.exports = (sequelize) => {
         allowNull: false,
         defaultValue: '13031000001'
     },
+    store_customer_number: {
+        type: DataTypes.STRING(255),
+        allowNull: false,
+        defaultValue: '1303'
+    },
     store_mobile_no: {
         type: DataTypes.STRING(10),
         allowNull: false,

@@ -113,7 +113,7 @@ class SageShipment {
                     ShipDate: utcDate,
                     Reference: `Receipt ${receiptNumber}`,
                     EntryType: "Shipment",
-                    CustomerNumber: "WALK-IN",
+                    CustomerNumber: user?.store?.store_customer_number,
                     SourceCurrency: "ZMW",
                     PriceList: "01",
                     ExchangeRate: 1,

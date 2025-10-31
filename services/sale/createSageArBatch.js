@@ -108,7 +108,7 @@ class AccountsReceivableBatch {
            const invoice = {
                 BatchNumber: 0,
                 EntryNumber: entryNumber,
-                CustomerNumber: "WALK-IN",
+                CustomerNumber: user?.store?.store_customer_number,
                 DateGenerated: utcDate,
                 PostingDate: utcDate,
                 DueDate: utcDate,

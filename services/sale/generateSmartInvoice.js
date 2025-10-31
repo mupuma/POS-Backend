@@ -7,7 +7,7 @@ const axios = require('axios');
  */
 class ZRAIntegrationService {
     constructor() {
-        this.baseURL = process.env.ZRA_BASE_URL||'http://localhost:8082/sandboxvsdc';
+        this.baseURL = process.env.ZRA_BASE_URL;
         // 30 seconds timeout
     }
 

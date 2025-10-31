@@ -541,7 +541,7 @@ router.post('/zero-stock', auth, async (req, res) => {
         const [stockItemsResult, stockMasterResult, internalUsageResult] = await Promise.all([
             zraService.sendStockItemsData(stockItemsData),
             zraService.sendStockMasterData(stockMasterData),
-            createInternalUsageForDisposal(disposalItems, fullUser, 'DISPOSAL')
+           // createInternalUsageForDisposal(disposalItems, fullUser, 'DISPOSAL')
         ]);
 
         // Check if ZRA calls were successful
@@ -557,7 +557,7 @@ router.post('/zero-stock', auth, async (req, res) => {
             });
         }
 
-        // Check if internal usage was successful
+        /* Check if internal usage was successful
         if (!internalUsageResult.success) {
             return res.status(500).json({
                 success: false,
@@ -568,7 +568,7 @@ router.post('/zero-stock', auth, async (req, res) => {
                     internalUsage: internalUsageResult
                 }
             });
-        }
+        }*/
 
         // Update local inventory to zero only if both ZRA submission and internal usage were successful
         await productinventory.update(
@@ -585,11 +585,7 @@ router.post('/zero-stock', auth, async (req, res) => {
             success: true,
             message: `Successfully zeroed out stock for ${productsWithInventory.length} products`,
             productsAffected: productsWithInventory.length,
-            internalUsage: {
-                usageNumber: internalUsageResult.usageNumber,
-                itemsProcessed: internalUsageResult.itemsProcessed,
-                usagesProcessed: internalUsageResult.usagesProcessed
-            },
+           
             totalValueDisposed: totalAmount,
             zraResults: {
                 stockItems: stockItemsResult,

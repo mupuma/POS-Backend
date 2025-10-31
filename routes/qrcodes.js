@@ -8,7 +8,8 @@ const router = require("./auth");
 router.get('/:filename', (req, res) => {
   console.log(req.params);
     const filename = req.params.filename;
-  const qrCodePath = path.join('C:\\Users\\HP\\WebstormProjects\\pos_backend\\', 'qrcodes', filename);
+  const qrCodePath = path.join('C:\\Users\\administrator.ZMNHQ\\POS-Backend\\', 'qrcodes', filename);
+
   console.log(qrCodePath)
   // Check if file exists
   if (fs.existsSync(qrCodePath)) {

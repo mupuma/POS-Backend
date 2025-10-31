@@ -176,7 +176,7 @@ class ZRACreditNoteIntegrationService {
             bhfId: process.env.ZRA_BHF_ID || "000",
             orgInvcNo: originalInvoiceNo,
             cisInvcNo: cisCreditNoteNo,
-            orgSdcId:"SDC0010000775",
+            orgSdcId:"SDC0010020838",
             custTpin: saleData.customer?.tpin || null,
             custNm: saleData.customer?.name || "Walk-in Customer",
             salesTyCd: "N",
