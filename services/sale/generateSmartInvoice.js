@@ -1,4 +1,4 @@
-const { store } = require('../../models');
+const { store, productinventory } = require('../../models');
 const axios = require('axios');
 
 /**
@@ -334,15 +334,44 @@ class ZRAIntegrationService {
      * Transform sale data to ZRA stock master format
      * @param {array} items
      * @param {object} user
-     * @param remainingQty
+
      * @returns {object}
      */
-    transformToZRAStockMasterData(items, user, remainingQty) {
-        const stockItemList = items.map(item => ({
-            itemCd: item.product?.product_code || `ITEM${item.product_id}`,
-            itemClsCd: item.product?.product_class_code || "50102518",
-            // Remaining stock quantity should come from inventory; we no longer read product-level stock
-            rsdQty: remainingQty
+    async transformToZRAStockMasterData(items, user) {
+        // rsdQty should reflect current stock for the specific shop (store) for each item
+        // Determine store_id from user or fallback to item-level store_id if present
+        const storeId = user?.store_id;
+
+        const stockItemList = await Promise.all(items.map(async (item) => {
+            const productId = item.product_id || item.product?.id;
+
+            let qty = 0;
+            try {
+                const whereClause = {
+                    product_id: productId
+                };
+                if (storeId) {
+                    whereClause.store_id = storeId;
+                } else if (item.store_id) {
+                    whereClause.store_id = item.store_id;
+                }
+
+                if (whereClause.store_id) {
+                    const inv = await productinventory.findOne({ where: whereClause });
+                    qty = inv?.stock_quantity ?? 0;
+                } else {
+                    // No store context — default to 0 to avoid sending incorrect totals
+                    qty = 0;
+                }
+            } catch (e) {
+                console.error('Error fetching inventory for stock master data:', e.message);
+            }
+
+            return {
+                itemCd: item.product?.product_code || `ITEM${item.product_id}`,
+                itemClsCd: item.product?.product_class_code || "50102518",
+                rsdQty: qty
+            };
         }));
 
         return {
@@ -544,7 +573,7 @@ class ZRAIntegrationService {
             // Transform data for each endpoint
             const salesData = await this.transformToZRASalesData(saleData, items, user);
             const stockItemsData = this.transformToZRAStockItemsData(saleData, items, user);
-            const stockMasterData = this.transformToZRAStockMasterData(items, user);
+            const stockMasterData = await this.transformToZRAStockMasterData(items, user);
 
             // Send requests to all three endpoints sequentially to avoid race conditions
             const salesResponse = await this.sendSalesData(salesData);

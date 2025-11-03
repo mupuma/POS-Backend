@@ -368,7 +368,7 @@ async function processStockEndpointsInBackground(saleId, saleData, items, user, 
 
         // Transform data for stock endpoints
         const stockItemsData = zraService.transformToZRAStockItemsData(saleData, items, user);
-        const stockMasterData = zraService.transformToZRAStockMasterData(items, user);
+        const stockMasterData = await zraService.transformToZRAStockMasterData(items, user);
 
         // Process stock items endpoint
         const stockItemsResponse = await zraService.sendStockItemsData(stockItemsData);
