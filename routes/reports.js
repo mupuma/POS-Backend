@@ -1,7 +1,7 @@
 // Add these routes to your backend router
 const express = require("express");
 const router = express.Router();
-const { sale, saleitem, product, user, customer, category, productinventory, sequelize } = require('../models');
+const { sale, saleitem, product, user, customer, category, productinventory, sequelize, creditnote, creditnoteitem } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
 // Dashboard Statistics
@@ -127,6 +127,8 @@ router.get('/sales', auth, async (req, res) => {
             total_revenue: sales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
             total_discounts: sales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
             total_tax: sales.reduce((sum, s) => sum + parseFloat(s.tax_amount || 0), 0),
+            items_count: sales.reduce((sum, s) => sum + (s.items ? s.items.length : 0), 0),
+            items_quantity: sales.reduce((sum, s) => sum + (s.items ? s.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0),
             payment_methods: {},
             daily_breakdown: {}
         };
@@ -159,6 +161,95 @@ router.get('/sales', auth, async (req, res) => {
     }
 });
 
+// Transaction List Report - Grouped by Item
+router.get('/transaction-list', auth, async (req, res) => {
+    try {
+        const { start_date, end_date, period = 'day' } = req.query;
+
+        if (!start_date || !end_date) {
+            return res.status(400).json({ message: 'Start date and end date are required' });
+        }
+
+        const startDate = new Date(start_date);
+        const endDate = new Date(end_date);
+        const filterStoreId = req.user.store_id;
+
+        const cashierInclude = [{
+            model: user,
+            as: 'cashier',
+            attributes: ['id', 'full_name', 'store_id'],
+            ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {})
+        }];
+
+        // Get all sales in the period
+        const sales = await sale.findAll({
+            where: {
+                sale_date: { [Op.between]: [startDate, endDate] }
+            },
+            include: [
+                ...cashierInclude,
+                {
+                    model: saleitem,
+                    as: 'items',
+                    include: [{
+                        model: product,
+                        as: 'product',
+                        attributes: ['id', 'name', 'barcode', 'price']
+                    }]
+                }
+            ],
+            order: [['sale_date', 'DESC']]
+        });
+
+        // Group items across all sales
+        const itemMap = {};
+
+        sales.forEach(s => {
+            (s.items || []).forEach(item => {
+                const productId = item.product_id;
+                const productName = item.product?.name || 'Unknown Product';
+
+                if (!itemMap[productId]) {
+                    itemMap[productId] = {
+                        product_id: productId,
+                        product_name: productName,
+                        barcode: item.product?.barcode || '',
+                        total_quantity: 0,
+                        total_amount: 0,
+                        transaction_count: 0
+                    };
+                }
+
+                itemMap[productId].total_quantity += parseInt(item.quantity || 0);
+                itemMap[productId].total_amount += parseFloat(item.total_price || 0);
+                itemMap[productId].transaction_count += 1;
+            });
+        });
+
+        const itemsSummary = Object.values(itemMap).sort((a, b) =>
+            b.total_amount - a.total_amount
+        );
+
+        const summary = {
+            period,
+            total_transactions: sales.length,
+            total_items_sold: itemsSummary.reduce((sum, item) => sum + item.total_quantity, 0),
+            total_revenue: itemsSummary.reduce((sum, item) => sum + item.total_amount, 0),
+            unique_products: itemsSummary.length
+        };
+
+        res.json({
+            date_range: { start_date, end_date },
+            period,
+            summary,
+            items: itemsSummary
+        });
+
+    } catch (error) {
+        console.error('Transaction list report error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
 // Product Performance Report
 router.get('/products', auth, async (req, res) => {
     try {
@@ -921,4 +1012,200 @@ router.post('/:reportType/email', auth, async (req, res) => {
         });
     }
 });
+// Returns Report (credit notes)
+router.get('/returns', auth, async (req, res) => {
+    try {
+        const { start_date, end_date, report_type = 'summary', category_id, product_id } = req.query;
+
+        if (!start_date || !end_date) {
+            return res.status(400).json({ message: 'Start date and end date are required' });
+        }
+
+        const startDate = new Date(start_date);
+        const endDate = new Date(end_date);
+
+        const filterStoreId = req.user.store_id;
+
+        const includeClause = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+            { model: customer, as: 'customer' },
+            {
+                model: creditnoteitem,
+                as: 'items',
+                include: [{
+                    model: product,
+                    as: 'product',
+                    include: [{ model: category, as: 'category' }]
+                }]
+            }
+        ];
+
+        // Filter by category or product if specified
+        if (category_id || product_id) {
+            includeClause[2].where = {};
+            if (product_id) {
+                includeClause[2].where.product_id = product_id;
+            }
+            if (category_id) {
+                includeClause[2].include[0].where = { category_id };
+            }
+        }
+
+        const returnsList = await creditnote.findAll({
+            where: { credit_note_date: { [Op.between]: [startDate, endDate] } },
+            include: includeClause,
+            order: [['credit_note_date', 'DESC']]
+        });
+
+        const summary = {
+            total_returns: returnsList.length,
+            total_amount: returnsList.reduce((sum, r) => sum + parseFloat(r.total_amount || 0), 0),
+            total_discounts: returnsList.reduce((sum, r) => sum + parseFloat(r.discount_amount || 0), 0),
+            total_tax: returnsList.reduce((sum, r) => sum + parseFloat(r.tax_amount || 0), 0),
+            items_count: returnsList.reduce((sum, r) => sum + (r.items ? r.items.length : 0), 0),
+            items_quantity: returnsList.reduce((sum, r) => sum + (r.items ? r.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0),
+            payment_methods: {},
+            daily_breakdown: {}
+        };
+
+        returnsList.forEach(r => {
+            const method = r.payment_method || 'unknown';
+            const date = new Date(r.credit_note_date).toDateString();
+
+            summary.payment_methods[method] = (summary.payment_methods[method] || 0) + parseFloat(r.total_amount || 0);
+
+            if (!summary.daily_breakdown[date]) {
+                summary.daily_breakdown[date] = { returns: 0, amount: 0 };
+            }
+            summary.daily_breakdown[date].returns++;
+            summary.daily_breakdown[date].amount += parseFloat(r.total_amount || 0);
+        });
+
+        res.json({
+            report_type,
+            date_range: { start_date, end_date },
+            returns: returnsList,
+            summary
+        });
+
+    } catch (error) {
+        console.error('Returns report error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Combined Transactions Report (sales + returns)
+router.get('/transactions', auth, async (req, res) => {
+    try {
+        const { start_date, end_date, report_type = 'summary', category_id, product_id } = req.query;
+
+        if (!start_date || !end_date) {
+            return res.status(400).json({ message: 'Start date and end date are required' });
+        }
+
+        const startDate = new Date(start_date);
+        const endDate = new Date(end_date);
+        const filterStoreId = req.user.store_id;
+
+        // SALES
+        const salesInclude = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+            {
+                model: saleitem,
+                as: 'items',
+                include: [{
+                    model: product,
+                    as: 'product',
+                    include: [{ model: category, as: 'category' }]
+                }]
+            }
+        ];
+        if (category_id || product_id) {
+            salesInclude[1].where = {};
+            if (product_id) salesInclude[1].where.product_id = product_id;
+            if (category_id) salesInclude[1].include[0].where = { category_id };
+        }
+        const salesList = await sale.findAll({
+            where: { sale_date: { [Op.between]: [startDate, endDate] } },
+            include: salesInclude
+        });
+
+        // RETURNS
+        const returnsInclude = [
+            { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+            {
+                model: creditnoteitem,
+                as: 'items',
+                include: [{
+                    model: product,
+                    as: 'product',
+                    include: [{ model: category, as: 'category' }]
+                }]
+            }
+        ];
+        if (category_id || product_id) {
+            returnsInclude[1].where = {};
+            if (product_id) returnsInclude[1].where.product_id = product_id;
+            if (category_id) returnsInclude[1].include[0].where = { category_id };
+        }
+        const returnsList = await creditnote.findAll({
+            where: { credit_note_date: { [Op.between]: [startDate, endDate] } },
+            include: returnsInclude
+        });
+
+        const overall = {
+            total_sales: salesList.length,
+            total_returns: returnsList.length,
+            items_count: (salesList.reduce((s, x) => s + (x.items ? x.items.length : 0), 0)) + (returnsList.reduce((s, x) => s + (x.items ? x.items.length : 0), 0)),
+            items_quantity: (salesList.reduce((s, x) => s + (x.items ? x.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0)) + (returnsList.reduce((s, x) => s + (x.items ? x.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0)),
+            revenue: salesList.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0) - returnsList.reduce((sum, r) => sum + parseFloat(r.total_amount || 0), 0),
+        };
+
+        // Per-category breakdown
+        const categoryMap = {};
+        const addToCategory = (catId, catName, qty, amount) => {
+            if (!categoryMap[catId || 'uncategorized']) {
+                categoryMap[catId || 'uncategorized'] = { category_id: catId || null, category_name: catName || 'Uncategorized', items_quantity: 0, revenue: 0 };
+            }
+            categoryMap[catId || 'uncategorized'].items_quantity += qty;
+            categoryMap[catId || 'uncategorized'].revenue += amount;
+        };
+
+        // Sales items positive
+        salesList.forEach(s => {
+            (s.items || []).forEach(i => {
+                const cat = i.product && i.product.category;
+                addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), Number(i.total_price || 0));
+            });
+        });
+        // Returns items negative revenue and quantities
+        returnsList.forEach(r => {
+            (r.items || []).forEach(i => {
+                const cat = i.product && i.product.category;
+                addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), -Number(i.total_price || 0));
+            });
+        });
+
+        const categories = Object.values(categoryMap);
+
+        const payload = {
+            report_type,
+            date_range: { start_date, end_date },
+            summary: overall,
+            categories
+        };
+
+        if (report_type === 'detailed') {
+            payload.sales = salesList;
+            payload.returns = returnsList;
+        }
+
+        res.json(payload);
+
+    } catch (error) {
+        console.error('Transactions report error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
 module.exports = router;
