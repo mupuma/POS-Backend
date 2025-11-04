@@ -194,7 +194,7 @@ router.get('/transaction-list', auth, async (req, res) => {
                     include: [{
                         model: product,
                         as: 'product',
-                        attributes: ['id', 'name', 'barcode', 'price']
+                        attributes: ['id', 'name', 'product_class_code', 'price']
                     }]
                 }
             ],
