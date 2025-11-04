@@ -20,6 +20,14 @@ module.exports = (sequelize) => {
                 key: 'id',
             },
         },
+        approver_user_id: {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+            references: {
+                model: 'users',
+                key: 'id',
+            },
+        },
         customer_id: {
             type: DataTypes.INTEGER,
             allowNull: true,
@@ -125,6 +133,12 @@ module.exports = (sequelize) => {
         CreditNote.belongsTo(models.user, {
             foreignKey: 'user_id',
             as: 'cashier',
+        });
+
+        // Approver user (who approved the credit note)
+        CreditNote.belongsTo(models.user, {
+            foreignKey: 'approver_user_id',
+            as: 'approver',
         });
 
         // Credit Note belongs to a customer (optional)

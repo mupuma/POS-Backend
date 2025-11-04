@@ -40,7 +40,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
     try {
         const { saleId } = req.params;
-        const { items, reason, reason_code, reason_label } = req.body;
+        const { items, reason, reason_code, reason_label, approver_user_id } = req.body;
 
         if (!items || items.length === 0) {
             await t.rollback();
@@ -176,6 +176,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
         const cn = await creditnote.create({
             receipt_number: `CN-${originalSale.receipt_number}`,
             user_id: req.user.id,
+            approver_user_id: approver_user_id || req.user.id,
             customer_id: originalSale.customer_id || null,
             subtotal,
             discount_amount,
@@ -196,8 +197,6 @@ router.post('/:saleId/return', auth, async (req, res) => {
             qrfilepath:qrFilePath,
             original_sale_id: originalSale.id,
             reason_label: reason || reason_label || 'Return',
-
-
         }, { transaction: t });
 
         // Store items and update stock (add back)
@@ -222,6 +221,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
             include: [
                 { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
                 { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
+                { model: user, as: 'approver', attributes: ['id', 'full_name'] },
                 { model: customer, as: 'customer' }
             ]
         });
