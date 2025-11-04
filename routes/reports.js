@@ -213,7 +213,7 @@ router.get('/transaction-list', auth, async (req, res) => {
                     itemMap[productId] = {
                         product_id: productId,
                         product_name: productName,
-                        barcode: item.product?.barcode || '',
+                        product_class_code: item.product?.product_class_code || '',
                         total_quantity: 0,
                         total_amount: 0,
                         transaction_count: 0
@@ -569,7 +569,7 @@ const generateProductsReport = async (startDate, endDate, storeId, additionalPar
         SELECT 
             p.product_id,
             p.product_name,
-            p.barcode,
+            p.product_class_code,
             c.category_name,
             p.unit_price,
             p.stock_quantity,
@@ -593,7 +593,7 @@ const generateInventoryReport = async (startDate, endDate, storeId, additionalPa
         SELECT 
             p.product_id,
             p.product_name,
-            p.barcode,
+            p.product_class_code,
             c.category_name,
             p.unit_price,
             p.stock_quantity,
@@ -732,7 +732,7 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
             columns = [
                 { header: 'Product ID', key: 'product_id', width: 12 },
                 { header: 'Product Name', key: 'product_name', width: 30 },
-                { header: 'Barcode', key: 'barcode', width: 20 },
+                { header: 'Classification code', key: 'product_class_code', width: 20 },
                 { header: 'Category', key: 'category_name', width: 20 },
                 { header: 'Unit Price', key: 'unit_price', width: 15 },
                 { header: 'Stock Qty', key: 'stock_quantity', width: 12 },
@@ -744,7 +744,7 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
             columns = [
                 { header: 'Product ID', key: 'product_id', width: 12 },
                 { header: 'Product Name', key: 'product_name', width: 30 },
-                { header: 'Barcode', key: 'barcode', width: 20 },
+                { header: 'Classification code', key: 'product_class_code', width: 20 },
                 { header: 'Category', key: 'category_name', width: 20 },
                 { header: 'Unit Price', key: 'unit_price', width: 15 },
                 { header: 'Stock Qty', key: 'stock_quantity', width: 12 },
