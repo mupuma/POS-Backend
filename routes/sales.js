@@ -518,6 +518,42 @@ router.get('/:id', auth, async (req, res) => {
     }
 });
 
+// Mark a sale as receipt printed (idempotent)
+router.post('/:id/mark-printed', auth, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const saleData = await sale.findByPk(id, {
+            include: [
+                { model: user, as: 'cashier', attributes: ['id', 'store_id'] }
+            ]
+        });
+        if (!saleData) {
+            return res.status(404).json({ message: 'Sale not found' });
+        }
+        // Enforce store access: cashiers/admins can only modify within their store
+        if (req.user && (req.user.role === 'cashier' || req.user.role === 'admin')) {
+            const cashierStoreId = saleData.cashier && saleData.cashier.store_id;
+            if (!cashierStoreId || cashierStoreId !== req.user.store_id) {
+                return res.status(403).json({ message: 'Access denied' });
+            }
+        }
+
+        const wasPrinted = !!saleData.receipt_printed;
+        if (!wasPrinted) {
+            saleData.receipt_printed = true;
+            await saleData.save();
+        }
+        return res.json({
+            sale: saleData,
+            updated: !wasPrinted,
+            message: wasPrinted ? 'Already marked as printed' : 'Marked as printed'
+        });
+    } catch (error) {
+        console.error('Mark printed error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
 // Get sales by date range
 router.get('/report/date-range', auth, async (req, res) => {
     try {
