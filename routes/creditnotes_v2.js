@@ -245,6 +245,42 @@ router.post('/:saleId/return', auth, async (req, res) => {
     }
 });
 
+// Mark a credit note as receipt printed (idempotent)
+router.post('/:id/mark-printed', auth, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const cn = await creditnote.findByPk(id, {
+            include: [
+                { model: user, as: 'cashier', attributes: ['id', 'store_id'] }
+            ]
+        });
+        if (!cn) {
+            return res.status(404).json({ message: 'Credit note not found' });
+        }
+        // Enforce store access: cashiers/admins can only modify within their store
+        if (req.user && (req.user.role === 'cashier' || req.user.role === 'admin')) {
+            const cashierStoreId = cn.cashier && cn.cashier.store_id;
+            if (!cashierStoreId || cashierStoreId !== req.user.store_id) {
+                return res.status(403).json({ message: 'Access denied' });
+            }
+        }
+
+        const wasPrinted = !!cn.receipt_printed;
+        if (!wasPrinted) {
+            cn.receipt_printed = true;
+            await cn.save();
+        }
+        return res.json({
+            creditNote: cn,
+            updated: !wasPrinted,
+            message: wasPrinted ? 'Already marked as printed' : 'Marked as printed'
+        });
+    } catch (error) {
+        console.error('Mark printed (credit note) error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
 // List credit notes
 router.get('/', auth, async (req, res) => {
     try {

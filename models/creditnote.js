@@ -88,6 +88,12 @@ module.exports = (sequelize) => {
             type: DataTypes.STRING(255),
             allowNull: true,
         },
+        // Flag indicating whether the credit note receipt has ever been printed
+        receipt_printed: {
+            type: DataTypes.BOOLEAN,
+            allowNull: false,
+            defaultValue: false,
+        },
         vsdcrcpdate: {
             type: DataTypes.STRING(100),
             allowNull: true,
