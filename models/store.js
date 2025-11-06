@@ -39,6 +39,12 @@ module.exports = (sequelize) => {
                 defaultValue: 'CRN-1001-1'
             },
 
+            receipt_number: {
+                type: DataTypes.STRING(50),
+                allowNull: false,
+                defaultValue: 'RCP1001-1'
+            },
+
             // Tracks the last date a day-end was completed for this store (YYYY-MM-DD)
     last_day_end_date: {
                 type: DataTypes.DATEONLY,

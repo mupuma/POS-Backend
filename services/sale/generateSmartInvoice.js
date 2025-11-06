@@ -103,6 +103,44 @@ class ZRAIntegrationService {
     }
 
     /**
+     * Generate incremental Receipt Number per store
+     * Format expected: RCP{storeDigits}-{n}, e.g., RCP1001-1
+     * @param {number} store_id
+     * @returns {Promise<string>}
+     */
+    async generateReceiptNumber(store_id) {
+        try {
+            let storeObj = await store.findByPk(store_id);
+            if (!storeObj) {
+                throw new Error('Store not found');
+            }
+
+            const currentReceipt = storeObj.receipt_number;
+            // Match pattern like RCP1001-1
+            const match = currentReceipt && currentReceipt.match(/^(RCP\d+-)(\d+)$/);
+
+            if (!match) {
+                // If format is invalid or empty, derive from store_number if possible
+                const storeNumDigits = (storeObj.store_number || '').match(/(\d+)/)?.[1] || '1001';
+                const fallback = `RCP${storeNumDigits}-1`;
+                await storeObj.update({ receipt_number: fallback });
+                return fallback;
+            }
+
+            const prefix = match[1];
+            const number = parseInt(match[2], 10);
+            const newNumber = number + 1;
+            const newReceiptNumber = `${prefix}${newNumber}`;
+
+            await storeObj.update({ receipt_number: newReceiptNumber });
+            return newReceiptNumber;
+        } catch (error) {
+            console.error('Error generating receipt number:', error);
+            throw error;
+        }
+    }
+
+    /**
      * Transform sale data to ZRA sales format
      * @param {object} saleData
      * @param {array} items

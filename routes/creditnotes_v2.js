@@ -186,7 +186,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
             amount_paid: total_amount,
             change_amount: 0,
             notes: `Credit Note for Sale #${originalSale.id} - ${reason || reason_label || 'Return'}`,
-            invnumber: saveSalesData.invnumber || null,
+            invnumber: (salesData && salesData.cisInvcNo) || saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber || null,
             receipt_no: saveSalesData.rcptNo || null,
             sdcid: saveSalesData.sdcId || null,
             receiptsig: saveSalesData.rcptSign || null,

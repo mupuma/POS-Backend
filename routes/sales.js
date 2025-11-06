@@ -10,12 +10,12 @@ const router = express.Router();
 
 // Import the correct ZRA Integration Service
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice'); // Adjust path as needed
-// Generate receipt number
-const generateReceiptNumber = () => {
-    const now = new Date();
-    const timestamp = now.getTime().toString().slice(-8);
-    return `RCP${timestamp}`;
-};
+// Deprecated random receipt generator (kept for reference)
+// const generateReceiptNumber = () => {
+//     const now = new Date();
+//     const timestamp = now.getTime().toString().slice(-8);
+//     return `RCP${timestamp}`;
+// };
 
 // Generate invoice number from SDC ID and receipt number
 function generateInvoiceNumber(sdcid, receipt_no) {
@@ -230,9 +230,12 @@ router.post('/', auth, async (req, res) => {
 
         console.log('Creating sale record...');
 
+        // Generate incremental receipt number per store
+        const receiptNumber = await zraService.generateReceiptNumber(req.user.store_id);
+
         // Create sale (only if ZRA sales integration was successful)
         const newSale = await sale.create({
-            receipt_number: generateReceiptNumber(),
+            receipt_number: receiptNumber,
             user_id: req.user.id,
             customer_id: customer_id || null,
             subtotal,
@@ -245,7 +248,7 @@ router.post('/', auth, async (req, res) => {
             change_amount,
             notes: notes || null,
             // ZRA fields - handle potential missing data
-            invnumber: saveSalesData.invnumber || null,
+            invnumber: (salesData && salesData.cisInvcNo) || saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber || null,
             receipt_no: saveSalesData.rcptNo || null,
             sdcid: saveSalesData.sdcId || null,
             receiptsig: saveSalesData.rcptSign || null,

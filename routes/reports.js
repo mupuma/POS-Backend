@@ -148,6 +148,110 @@ router.get('/sales', auth, async (req, res) => {
             summary.daily_breakdown[date].revenue += parseFloat(s.total_amount || 0);
         });
 
+        // Traditional X/Z format support on /reports/sales using the same endpoint
+        if (['x', 'z', 'X', 'Z'].includes(report_type)) {
+            const isZ = report_type.toLowerCase() === 'z';
+
+            // Fetch returns within the same date range to net against sales
+            const returnsInclude = [
+                { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+                {
+                    model: creditnoteitem,
+                    as: 'items',
+                    include: [{
+                        model: product,
+                        as: 'product',
+                        include: [{ model: category, as: 'category' }]
+                    }]
+                }
+            ];
+
+            const returnsList = await creditnote.findAll({
+                where: { credit_note_date: { [Op.between]: [startDate, endDate] } },
+                include: returnsInclude
+            });
+
+            const grossSales = sales.reduce((sum, s) => sum + Number(s.subtotal || 0), 0);
+            const discounts = sales.reduce((sum, s) => sum + Number(s.discount_amount || 0), 0);
+            const tax = sales.reduce((sum, s) => sum + Number(s.tax_amount || 0), 0);
+            const salesTotalAmount = sales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+            const returnsTotalAmount = returnsList.reduce((sum, r) => sum + Number(r.total_amount || 0), 0);
+            const returnsTax = returnsList.reduce((sum, r) => sum + Number(r.tax_amount || 0), 0);
+            const returnsDiscount = returnsList.reduce((sum, r) => sum + Number(r.discount_amount || 0), 0);
+
+            // Normalize to CASH, CARD, MOBILE_MONEY, OTHER
+            const normalizeMethod = (m) => {
+                const x = (m || '').toString().trim().toLowerCase();
+                if (x === 'cash') return 'CASH';
+                if (['card', 'visa', 'mastercard', 'debit', 'credit', 'pos'].includes(x)) return 'CARD';
+                if (['mobile', 'mobile money', 'mobile_money', 'mpesa', 'm-pesa', 'm pesa', 'momo', 'airtel money', 'tigo pesa'].includes(x)) return 'MOBILE_MONEY';
+                return 'OTHER';
+            };
+
+            const paymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
+            sales.forEach(s => {
+                const key = normalizeMethod(s.payment_method);
+                paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(s.total_amount || 0);
+            });
+            returnsList.forEach(r => {
+                const key = normalizeMethod(r.payment_method);
+                paymentBreakdown[key] = (paymentBreakdown[key] || 0) - Number(r.total_amount || 0);
+            });
+
+            const itemsSold = sales.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
+            const itemsReturned = returnsList.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
+
+            // Category summary (net of returns)
+            const categoryMap = {};
+            const addToCategory = (catId, catName, qty, amount) => {
+                const key = catId || 'uncategorized';
+                if (!categoryMap[key]) {
+                    categoryMap[key] = { category_id: catId || null, category_name: catName || 'Uncategorized', items_quantity: 0, revenue: 0 };
+                }
+                categoryMap[key].items_quantity += qty;
+                categoryMap[key].revenue += amount;
+            };
+            sales.forEach(saleRow => {
+                (saleRow.items || []).forEach(i => {
+                    const cat = i.product && i.product.category;
+                    addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), Number(i.total_price || 0));
+                });
+            });
+            returnsList.forEach(ret => {
+                (ret.items || []).forEach(i => {
+                    const cat = i.product && i.product.category;
+                    addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), -Number(i.total_price || 0));
+                });
+            });
+
+            const traditional = {
+                report_name: isZ ? 'Z Report' : 'X Report',
+                period: { start: start_date, end: end_date },
+                store_id: req.user && req.user.store_id ? req.user.store_id : null,
+                cashier: req.user && req.user.full_name ? { id: req.user.id, name: req.user.full_name } : undefined,
+                counts: {
+                    transactions: sales.length,
+                    returns: returnsList.length,
+                    items_sold: itemsSold,
+                    items_returned: itemsReturned
+                },
+                totals: {
+                    gross_sales: grossSales,
+                    discounts: discounts,
+                    net_sales_before_tax: Math.max(grossSales - discounts, 0),
+                    tax_collected: tax,
+                    returns_amount: returnsTotalAmount,
+                    returns_tax: returnsTax,
+                    returns_discount: returnsDiscount,
+                    net_revenue: salesTotalAmount - returnsTotalAmount
+                },
+                payments: paymentBreakdown,
+                categories: Object.values(categoryMap)
+            };
+
+            return res.json({ report_type: isZ ? 'Z' : 'X', date_range: { start_date, end_date }, traditional });
+        }
+
         res.json({
             report_type,
             date_range: { start_date, end_date },
@@ -1198,6 +1302,56 @@ router.get('/transactions', auth, async (req, res) => {
         if (report_type === 'detailed') {
             payload.sales = salesList;
             payload.returns = returnsList;
+        }
+
+        // Traditional X/Z format support using the same endpoint
+        if (['x', 'z', 'X', 'Z'].includes(report_type)) {
+            const isZ = report_type.toLowerCase() === 'z';
+            const grossSales = salesList.reduce((sum, s) => sum + Number(s.subtotal || 0), 0);
+            const discounts = salesList.reduce((sum, s) => sum + Number(s.discount_amount || 0), 0);
+            const tax = salesList.reduce((sum, s) => sum + Number(s.tax_amount || 0), 0);
+            const salesTotalAmount = salesList.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+            const returnsTotalAmount = returnsList.reduce((sum, r) => sum + Number(r.total_amount || 0), 0);
+            const returnsTax = returnsList.reduce((sum, r) => sum + Number(r.tax_amount || 0), 0);
+            const returnsDiscount = returnsList.reduce((sum, r) => sum + Number(r.discount_amount || 0), 0);
+
+            // Payment methods breakdown (net of returns if method matches)
+            const paymentBreakdown = {};
+            salesList.forEach(s => {
+                const method = s.payment_method || 'unknown';
+                paymentBreakdown[method] = (paymentBreakdown[method] || 0) + Number(s.total_amount || 0);
+            });
+            returnsList.forEach(r => {
+                const method = r.payment_method || 'unknown';
+                paymentBreakdown[method] = (paymentBreakdown[method] || 0) - Number(r.total_amount || 0);
+            });
+
+            const traditional = {
+                report_name: isZ ? 'Z Report' : 'X Report',
+                period: { start: start_date, end: end_date },
+                store_id: req.user && req.user.store_id ? req.user.store_id : null,
+                cashier: req.user && req.user.full_name ? { id: req.user.id, name: req.user.full_name } : undefined,
+                counts: {
+                    transactions: salesList.length,
+                    returns: returnsList.length,
+                    items_sold: salesList.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0),
+                    items_returned: returnsList.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0)
+                },
+                totals: {
+                    gross_sales: grossSales,
+                    discounts: discounts,
+                    net_sales_before_tax: Math.max(grossSales - discounts, 0),
+                    tax_collected: tax,
+                    returns_amount: returnsTotalAmount,
+                    returns_tax: returnsTax,
+                    returns_discount: returnsDiscount,
+                    net_revenue: salesTotalAmount - returnsTotalAmount
+                },
+                payments: paymentBreakdown,
+                categories
+            };
+
+            return res.json({ report_type: isZ ? 'Z' : 'X', date_range: { start_date, end_date }, traditional });
         }
 
         res.json(payload);

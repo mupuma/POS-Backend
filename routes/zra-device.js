@@ -1,9 +1,10 @@
 const express = require('express');
+const axios = require('axios');
 const router = express.Router();
 
 /**
  * Initialize device route for ZRA VSDC system
- * Handles device initialization with TPIN, Branch ID, and Device Serial Number
+ * Proxies the request to the ZRA service and returns its response as-is
  */
 router.post('/initializer/selectInitInfo', async (req, res) => {
     try {
@@ -12,76 +13,53 @@ router.post('/initializer/selectInitInfo', async (req, res) => {
         // Validate required fields
         if (!tpin || !bhfId || !dvcSrlNo) {
             return res.status(400).json({
-                success: false,
-                error: 'Missing required fields',
-                message: 'tpin, bhfId, and dvcSrlNo are required'
-            });
-        }
-
-        // Validate field formats
-        if (typeof tpin !== 'string' || tpin.length < 8) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid tpin format',
-                message: 'tpin must be a string with at least 8 characters'
-            });
-        }
-
-        if (typeof bhfId !== 'string' || bhfId.length !== 3) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid bhfId format',
-                message: 'bhfId must be a 3-character string'
-            });
-        }
-
-        if (typeof dvcSrlNo !== 'string' || dvcSrlNo.length < 5) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid dvcSrlNo format',
-                message: 'dvcSrlNo must be a string with at least 5 characters'
-            });
-        }
-
-        console.log('Device initialization request:', { tpin, bhfId, dvcSrlNo });
-
-        // Prepare initialization response data
-        const initializationData = {
-            tpin: tpin,
-            bhfId: bhfId,
-            dvcSrlNo: dvcSrlNo,
-            initializationDate: new Date().toISOString(),
-            status: 'initialized',
-            taxServerUrl: process.env.ZRA_TAX_SERVER_URL || 'http://localhost:8082',
-            bhfNm: process.env.ZRA_BHF_NAME || 'Main Branch',
-            bhfOpenDt: process.env.ZRA_BHF_OPEN_DATE || '20240101',
-            prvncNm: process.env.ZRA_PROVINCE_NAME || 'Lusaka',
-            dstrtNm: process.env.ZRA_DISTRICT_NAME || 'Lusaka',
-            sctrNm: process.env.ZRA_SECTOR_NAME || 'Urban',
-            locDesc: process.env.ZRA_LOCATION_DESC || 'City Center'
-        };
-
-        // Store device information (in a real implementation, you might save to database)
-        console.log('Device initialized successfully:', initializationData);
-
-        return res.status(200).json({
-            success: true,
-            message: 'Device initialized successfully',
-            data: {
-                resultCd: '000',
-                resultMsg: 'Success',
+                resultCd: '400',
+                resultMsg: 'Missing required fields',
                 resultDt: new Date().toISOString(),
-                data: initializationData
-            }
-        });
+                data: null
+            });
+        }
 
+        // Basic format validation (kept minimal to avoid blocking valid upstream cases)
+        if (typeof tpin !== 'string' || typeof bhfId !== 'string' || typeof dvcSrlNo !== 'string') {
+            return res.status(400).json({
+                resultCd: '400',
+                resultMsg: 'Invalid field types: tpin, bhfId, and dvcSrlNo must be strings',
+                resultDt: new Date().toISOString(),
+                data: null
+            });
+        }
+
+        const baseUrl = process.env.ZRA_BASE_URL
+        const url = `${baseUrl}/initializer/selectInitInfo`;
+
+        console.log('Proxying device initialization to ZRA:', { url, tpin, bhfId, dvcSrlNo });
+
+        const response = await axios.post(
+            url,
+            { tpin, bhfId, dvcSrlNo },
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+
+        // Forward the upstream JSON exactly
+        return res.status(200).json(response.data);
     } catch (error) {
-        console.error('Device initialization error:', error);
+        // If upstream returned an error response, relay its status and body
+        if (error.response) {
+            console.error('ZRA upstream error:', {
+                status: error.response.status,
+                data: error.response.data
+            });
+            return res.status(error.response.status).json(error.response.data);
+        }
+
+        // Network or unexpected error
+        console.error('Device initialization error:', error.message);
         return res.status(500).json({
-            success: false,
-            error: 'Internal server error',
-            message: 'Failed to initialize device',
-            details: error.message
+            resultCd: '500',
+            resultMsg: 'Failed to initialize device',
+            resultDt: new Date().toISOString(),
+            data: null
         });
     }
 });
