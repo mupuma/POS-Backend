@@ -1,10 +1,10 @@
 const cron = require('node-cron');
 const Sage300InventoryService = require('../services/getSageStockQuantityOnHand');
-
+const mssqlDb = require('../models_mssql');
 class InventorySyncJob {
   constructor(models) {
     this.models = models;
-    this.inventoryService = new Sage300InventoryService();
+    this.inventoryService = new Sage300InventoryService(mssqlDb);
     this.isRunning = false;
     this.cronJob = null;
     this.lastSyncedDate = null; // in-memory tracking to avoid duplicate daily syncs
@@ -63,6 +63,7 @@ class InventorySyncJob {
         'CP',
         locationStoreMap
       );
+      console.log(results);
 
       const endTime = new Date();
       const durationSeconds = Math.floor((endTime - startTime) / 1000);

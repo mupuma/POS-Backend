@@ -182,40 +182,31 @@ router.post('/', auth, async (req, res) => {
         const zraService = new ZRAIntegrationService();
 
         console.log('Processing ZRA sale endpoint...');
+        let zraFailed = false;
+        let zraError = null;
+        let saveSalesData = null;
 
         // Process only the ZRA Sales endpoint first
         const salesData = await zraService.transformToZRASalesData(saleDataForZRA, saleItems, req.user);
         const salesResponse = await zraService.sendSalesData(salesData);
 
-        // Check if ZRA sales integration was successful
         if (!salesResponse.success) {
-            await t.rollback();
+            // Do NOT rollback the sale — mark for retry and continue saving locally
+            zraFailed = true;
             console.error('ZRA Sales Integration failed:', salesResponse.error);
-
-            return res.status(500).json({
-                message: 'Failed to process sale with ZRA system',
-                zra_errors: [salesResponse.error],
-                details: 'The sale could not be completed due to ZRA sales integration issues'
-            });
+            zraError = typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error);
+        } else {
+            console.log('ZRA sales integration successful:', salesResponse.data);
+            saveSalesData = salesResponse.data.data || null;
         }
 
-        console.log('ZRA sales integration successful:', salesResponse.data);
-
-        // Get the data from the saveSales response
-        const saveSalesData = salesResponse.data.data;
-
-        if (!saveSalesData) {
-            await t.rollback();
-            return res.status(500).json({
-                message: 'No data received from ZRA saveSales endpoint'
-            });
+        if (saveSalesData) {
+            console.log('ZRA Sales Data:', saveSalesData);
         }
-
-        console.log('ZRA Sales Data:', saveSalesData);
 
         // Generate QR code file path (but don't await it here to avoid blocking)
         let qrFilePath = null;
-        if (saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
+        if (saveSalesData && saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
             try {
                 qrFilePath = await generateQrCode(
                     saveSalesData.qrCodeUrl,
@@ -233,7 +224,7 @@ router.post('/', auth, async (req, res) => {
         // Generate incremental receipt number per store
         const receiptNumber = await zraService.generateReceiptNumber(req.user.store_id);
 
-        // Create sale (only if ZRA sales integration was successful)
+        // Create sale regardless of ZRA status
         const newSale = await sale.create({
             receipt_number: receiptNumber,
             user_id: req.user.id,
@@ -247,18 +238,24 @@ router.post('/', auth, async (req, res) => {
             amount_paid,
             change_amount,
             notes: notes || null,
-            // ZRA fields - handle potential missing data
-            invnumber: (salesData && salesData.cisInvcNo) || saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber || null,
-            receipt_no: saveSalesData.rcptNo || null,
-            sdcid: saveSalesData.sdcId || null,
-            receiptsig: saveSalesData.rcptSign || null,
-            intrldata: saveSalesData.intrlData || null,
-            qrcode_url: saveSalesData.qrCodeUrl || null,
-            vsdcrcpdate: saveSalesData.vsdcRcptPbctDate || null,
-            invoice_no: (saveSalesData.sdcId && saveSalesData.rcptNo)
+            // ZRA fields - may be null if offline
+            invnumber: (salesData && salesData.cisInvcNo) || (saveSalesData ? (saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber) : null),
+            receipt_no: saveSalesData ? (saveSalesData.rcptNo || null) : null,
+            sdcid: saveSalesData ? (saveSalesData.sdcId || null) : null,
+            receiptsig: saveSalesData ? (saveSalesData.rcptSign || null) : null,
+            intrldata: saveSalesData ? (saveSalesData.intrlData || null) : null,
+            qrcode_url: saveSalesData ? (saveSalesData.qrCodeUrl || null) : null,
+            vsdcrcpdate: saveSalesData ? (saveSalesData.vsdcRcptPbctDate || null) : null,
+            invoice_no: (saveSalesData && saveSalesData.sdcId && saveSalesData.rcptNo)
                 ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
                 : null,
             qrfilepath: qrFilePath,
+            // Retry/Offline flags
+            zra_status: zraFailed ? 'pending' : 'sent',
+            zra_error: zraFailed ? (typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error)) : null,
+            retry_count: zraFailed ? 0 : 0,
+            next_retry_at: zraFailed ? new Date(Date.now() + 1 * 60 * 1000) : null,
+            last_retry_at: null,
         }, { transaction: t });
 
         console.log('Sale created successfully:', newSale.id);
@@ -305,21 +302,23 @@ router.post('/', auth, async (req, res) => {
             ]
         });
 
-        // Send successful response immediately
+        // Send response immediately
         res.status(201).json({
-            message: 'Sale completed successfully',
+            message: zraFailed ? 'Sale saved (ZRA pending due to network). Will retry automatically.' : 'Sale completed successfully',
             sale: completeSale,
             zra_integration: {
-                success: true,
+                success: !zraFailed,
                 sales_endpoint: {
-                    success: true,
-                    message: 'Sales data submitted successfully to ZRA'
+                    success: !zraFailed,
+                    message: zraFailed ? (zraError || 'ZRA unavailable; queued for retry') : 'Sales data submitted successfully to ZRA'
                 }
             }
         });
 
-        // Process stock endpoints in the background
-        processStockEndpointsInBackground(newSale.id, saleDataForZRA, saleItems, req.user, zraService);
+        // Process stock endpoints in the background only if ZRA succeeded (to keep sequence)
+        if (!zraFailed) {
+            processStockEndpointsInBackground(newSale.id, saleDataForZRA, saleItems, req.user, zraService);
+        }
 
     } catch (error) {
         await t.rollback();

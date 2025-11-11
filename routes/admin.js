@@ -4,15 +4,63 @@ const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
 
 const router = express.Router();
+const authMiddleware = auth;
 
 const SageShipment = require('../services/sale/createSageShipment');
 const AccountsReceivableBatch = require("../services/sale/createSageArBatch");
+const SageOrdersService = require('../services/sale/createSageOrder');
+const ZraRetryJob = require('../jobs/zraRetryJob');
 
 // Credit note Sage services (processed at day-end)
 const SageShipmentReturn = require('../services/credit-note/createSageShipmentReturn');
 const AccountsReceivableBatchReturn = require('../services/credit-note/createSageArBatchReturn');
 const ZRAIntegrationServiceStockDisposal = require("../services/stock-disposal/zraEndPoints");
 const SageInternalUsage = require("../services/stock-disposal/sageInternalUsages");
+
+/**
+ * Creates Sage OE Orders for all sales of a day
+ */
+async function persistConsolidatedOrderDataToSage(salesForDay, user, date) {
+    try {
+        const sageService = new SageOrdersService();
+        const salesDataArray = salesForDay.map(sale => ({
+            items: (sale.items || []).map(item => ({
+                product_id: item.product_id,
+                quantity: Number(item.quantity),
+                unit_price: Number(item.unit_price),
+                total_price: Number(item.total_price),
+                product: item.product || null,
+                product_code: item.product?.product_code
+            })),
+            salesData: {
+                id: sale.id,
+                receipt_number: sale.receipt_number,
+                subtotal: Number(sale.subtotal),
+                discount_amount: Number(sale.discount_amount || 0),
+                tax_amount: Number(sale.tax_amount || 0),
+                total_amount: Number(sale.total_amount),
+                tax_rate: 16,
+                payment_method: sale.payment_method,
+                amount_paid: Number(sale.amount_paid),
+                change_amount: Number(sale.change_amount || 0),
+                notes: sale.notes,
+                customer: sale.customer,
+                discount: sale.discount,
+                currency: "ZMW"
+            },
+            receiptNumber: sale.receipt_number
+        }));
+
+        const sageResponse = await sageService.createConsolidatedOrder(salesDataArray, user, date);
+        if (!sageResponse.success) {
+            console.error('Sage OE consolidated Order creation failed:', sageResponse);
+        }
+        return sageResponse;
+    } catch (error) {
+        console.error('Error persisting orders to Sage (OE Orders):', error);
+        return { success: false, error: 'Error occurred while communicating with Sage for OE Orders' };
+    }
+}
 
 /**
  * Creates a consolidated shipment batch for all sales of a day
@@ -266,19 +314,35 @@ async function createInternalUsageForDisposal(disposalItems, user, usageAccount 
 }
 
 // Day-end sync: process and display data from the last completed day-end date up to the selected date (default: today)
+/*
 router.post('/day-end-sync', auth, async (req, res) => {
     try {
         const { date, includeShipment = true, includeInvoice = true } = req.body || {};
+        // ... OLD MULTI-FLOW DAY-END LOGIC (shipments, AR invoices, credit notes) ...
+        // The original implementation has been commented out per requirement to only create OE Orders.
+    } catch (err) {
+        console.error('Day-end sync error:', err);
+        return res.status(500).json({
+            message: 'Failed to complete day-end sync',
+            error: err.message
+        });
+    }
+});
+*/
 
-        // Compute end date for processing (provided date or today)
+// New simplified day-end route: only creates OE Orders for the selected day
+router.post('/day-end-sync', auth, async (req, res) => {
+    try {
+        const { date } = req.body || {};
+
+        // Determine date (default: today)
         const baseDate = date ? new Date(date) : new Date();
         if (isNaN(baseDate.getTime())) {
             return res.status(400).json({ message: 'Invalid date. Use YYYY-MM-DD.' });
         }
-        const endOfSelected = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 23, 59, 59, 999);
-        const endDateString = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 0, 0, 0, 0).toISOString().slice(0, 10);
-
-        console.log(`Starting day-end sync up to ${endDateString}`);
+        const startOfDay = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 0, 0, 0, 0);
+        const endOfDay = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 23, 59, 59, 999);
+        const dateString = startOfDay.toISOString().slice(0, 10);
 
         // Ensure user is scoped to a store
         const storeId = req.user?.store_id;
@@ -286,207 +350,41 @@ router.post('/day-end-sync', auth, async (req, res) => {
             return res.status(400).json({ message: 'Authenticated user is not assigned to a store.' });
         }
 
-        // Load target store to read last_day_end_date
-        const targetStore = await store.findByPk(storeId);
-        if (!targetStore) {
-            return res.status(400).json({ message: 'Unable to determine store for day-end.' });
-        }
+        // Fetch sales for the day restricted to the user’s store
+        const salesForDay = await sale.findAll({
+            where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
+            include: [
+                { model: saleitem, as: 'items', include: [{ model: product }] },
+                { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
+                { model: customer, as: 'customer' },
+                { model: discount, as: 'discount' },
+            ],
+            order: [['id', 'ASC']]
+        });
 
-        // Determine start date for range: the day AFTER the last completed day-end (so we don't reprocess that day)
-        let rangeStartDate;
-        if (targetStore.last_day_end_date) {
-            const lastDate = new Date(targetStore.last_day_end_date);
-            // start next day 00:00:00
-            rangeStartDate = new Date(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate() + 1, 0, 0, 0, 0);
-        } else {
-            // If never processed before, start from the selected date (only that date)
-            rangeStartDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), 0, 0, 0, 0);
-        }
-
-        // If the start date is after the selected end date, nothing to process
-        if (rangeStartDate > endOfSelected) {
+        if (salesForDay.length === 0) {
             return res.status(200).json({
-                message: `No new days to process. Last day-end date (${targetStore.last_day_end_date || 'none'}) is on/after ${endDateString}.`,
-                summary: { from: null, to: endDateString, daysProcessed: 0 }
+                message: `No sales found on ${dateString} for store. Nothing to create.`,
+                result: { success: true, ordersAttempted: 0, ordersSucceeded: 0, results: [] }
             });
         }
 
-        // Iterate day by day from rangeStartDate to endOfSelected (inclusive)
-        const daySummaries = [];
-        const overallTotals = {
-            totalSales: 0,
-            totalCreditNotes: 0,
-            shipments: { success: 0, failed: 0, itemsProcessed: 0 },
-            invoices: { success: 0, failed: 0, invoicesProcessed: 0, batchTotal: 0 },
-            creditNotesShipments: { success: 0, failed: 0, itemsProcessed: 0 },
-            creditNotesInvoices: { success: 0, failed: 0, invoicesProcessed: 0, batchTotal: 0 }
-        };
+        // Derive user info from first sale
+        const userInfoForDay = salesForDay[0]?.cashier || null;
 
-        // We will capture the last successful date to update last_day_end_date at the end
-        let lastProcessedDateString = null;
-        let userInfoForDay = null;
-
-        for (let d = new Date(rangeStartDate); d <= endOfSelected; d.setDate(d.getDate() + 1)) {
-            const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
-            const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
-            const dateString = startOfDay.toISOString().slice(0, 10);
-
-            // Fetch sales for the day restricted to the user’s store
-            const salesForDay = await sale.findAll({
-                where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
-                include: [
-                    { model: saleitem, as: 'items', include: [{ model: product }] },
-                    { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
-                    { model: customer, as: 'customer' },
-                    { model: discount, as: 'discount' },
-                ],
-                order: [['id', 'ASC']]
-            });
-
-            // Fetch credit notes for the day restricted to the user’s store
-            const creditNotesForDay = await creditnote.findAll({
-                where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
-                include: [
-                    { model: creditnoteitem, as: 'items', include: [{ model: product }] },
-                    { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
-                    { model: customer, as: 'customer' }
-                ],
-                order: [['id', 'ASC']]
-            });
-
-            // Determine user info once (from first available doc across range)
-            if (!userInfoForDay) {
-                const firstSale = salesForDay[0];
-                const firstCN = creditNotesForDay[0];
-                userInfoForDay = (firstSale?.cashier) || (firstCN?.cashier) || null;
-            }
-
-            const results = {
-                date: dateString,
-                totalSales: salesForDay.length,
-                totalCreditNotes: creditNotesForDay.length,
-                shipment: { sales: null, creditNotes: null },
-                invoice: { sales: null, creditNotes: null }
-            };
-
-            // Create consolidated shipment batches if requested
-            if (includeShipment) {
-                if (salesForDay.length > 0) {
-                    console.log(`Creating consolidated shipment batch for ${salesForDay.length} sales on ${dateString}`);
-                    results.shipment.sales = await persistConsolidatedShipmentDataToSage(salesForDay, userInfoForDay, dateString);
-                } else {
-                    results.shipment.sales = { success: true, skipped: true, reason: 'no-sales' };
-                }
-
-                if (creditNotesForDay.length > 0) {
-                    console.log(`Creating consolidated shipment return batch for ${creditNotesForDay.length} credit notes on ${dateString}`);
-                    results.shipment.creditNotes = await persistConsolidatedShipmentReturnDataToSage(creditNotesForDay, userInfoForDay, dateString);
-                } else {
-                    results.shipment.creditNotes = { success: true, skipped: true, reason: 'no-credit-notes' };
-                }
-            }
-
-            // Create consolidated invoice batches if requested
-            if (includeInvoice) {
-                if (salesForDay.length > 0) {
-                    console.log(`Creating consolidated invoice batch for ${salesForDay.length} sales on ${dateString}`);
-                    results.invoice.sales = await persistConsolidatedInvoiceDataToSage(salesForDay, userInfoForDay, dateString);
-                } else {
-                    results.invoice.sales = { success: true, skipped: true, reason: 'no-sales' };
-                }
-
-                if (creditNotesForDay.length > 0) {
-                    console.log(`Creating consolidated AR credit note batch for ${creditNotesForDay.length} credit notes on ${dateString}`);
-                    results.invoice.creditNotes = await persistConsolidatedCreditNoteInvoiceDataToSage(creditNotesForDay, userInfoForDay, dateString);
-                } else {
-                    results.invoice.creditNotes = { success: true, skipped: true, reason: 'no-credit-notes' };
-                }
-            }
-
-            // Aggregate per-day summary
-            const summary = {
-                date: dateString,
-                totalSales: salesForDay.length,
-                totalCreditNotes: creditNotesForDay.length,
-                shipments: {
-                    success: results.shipment.sales?.success ? 1 : 0,
-                    failed: results.shipment.sales?.success ? 0 : (includeShipment ? 1 : 0),
-                    itemsProcessed: results.shipment.sales?.itemsProcessed || 0
-                },
-                invoices: {
-                    success: results.invoice.sales?.success ? 1 : 0,
-                    failed: results.invoice.sales?.success ? 0 : (includeInvoice ? 1 : 0),
-                    invoicesProcessed: results.invoice.sales?.invoicesProcessed || 0,
-                    batchTotal: results.invoice.sales?.batchTotal || 0
-                },
-                creditNotesShipments: {
-                    success: results.shipment.creditNotes?.success ? 1 : 0,
-                    failed: results.shipment.creditNotes?.success ? 0 : (includeShipment ? 1 : 0),
-                    itemsProcessed: results.shipment.creditNotes?.itemsProcessed || 0
-                },
-                creditNotesInvoices: {
-                    success: results.invoice.creditNotes?.success ? 1 : 0,
-                    failed: results.invoice.creditNotes?.success ? 0 : (includeInvoice ? 1 : 0),
-                    invoicesProcessed: results.invoice.creditNotes?.invoicesProcessed || 0,
-                    batchTotal: results.invoice.creditNotes?.batchTotal || 0
-                }
-            };
-
-            daySummaries.push(summary);
-
-            // Update overall totals
-            overallTotals.totalSales += salesForDay.length;
-            overallTotals.totalCreditNotes += creditNotesForDay.length;
-            overallTotals.shipments.itemsProcessed += summary.shipments.itemsProcessed;
-            overallTotals.shipments.success += summary.shipments.success;
-            overallTotals.shipments.failed += summary.shipments.failed;
-            overallTotals.invoices.invoicesProcessed += summary.invoices.invoicesProcessed;
-            overallTotals.invoices.batchTotal += summary.invoices.batchTotal;
-            overallTotals.invoices.success += summary.invoices.success;
-            overallTotals.invoices.failed += summary.invoices.failed;
-            overallTotals.creditNotesShipments.itemsProcessed += summary.creditNotesShipments.itemsProcessed;
-            overallTotals.creditNotesShipments.success += summary.creditNotesShipments.success;
-            overallTotals.creditNotesShipments.failed += summary.creditNotesShipments.failed;
-            overallTotals.creditNotesInvoices.invoicesProcessed += summary.creditNotesInvoices.invoicesProcessed;
-            overallTotals.creditNotesInvoices.batchTotal += summary.creditNotesInvoices.batchTotal;
-            overallTotals.creditNotesInvoices.success += summary.creditNotesInvoices.success;
-            overallTotals.creditNotesInvoices.failed += summary.creditNotesInvoices.failed;
-
-            // Track last processed date if operations succeeded for that day
-            const shipmentOk = includeShipment ? (!!(results.shipment.sales?.success) && !!(results.shipment.creditNotes?.success)) : true;
-            const invoiceOk = includeInvoice ? (!!(results.invoice.sales?.success) && !!(results.invoice.creditNotes?.success)) : true;
-            if (shipmentOk && invoiceOk) {
-                lastProcessedDateString = dateString;
-            }
-        }
-
-        // Update last_day_end_date to the last successfully processed day
-        if (lastProcessedDateString) {
-            try {
-                await store.update({ last_day_end_date: lastProcessedDateString }, { where: { id: targetStore.id } });
-            } catch (e) {
-                console.warn('Warning: Failed to update last_day_end_date:', e.message);
-            }
-        }
-
-        const responseSummary = {
-            from: rangeStartDate.toISOString().slice(0, 10),
-            to: endDateString,
-            daysProcessed: daySummaries.length,
-            totals: overallTotals,
-            perDay: daySummaries
-        };
-
-        console.log(`Day-end sync completed for range ${responseSummary.from} -> ${responseSummary.to}`);
-
+        // Create OE Orders only
+        const orderResult = await persistConsolidatedOrderDataToSage(salesForDay, userInfoForDay, dateString);
+        console.log(orderResult)
         return res.json({
-            message: 'Day-end sync complete - consolidated batches created for date range',
-            summary: responseSummary
+            message: `OE Orders creation complete for ${dateString}`,
+            date: dateString,
+            totalSales: salesForDay.length,
+            result: orderResult
         });
     } catch (err) {
-        console.error('Day-end sync error:', err);
+        console.error('Day-end OE Orders error:', err);
         return res.status(500).json({
-            message: 'Failed to complete day-end sync',
+            message: 'Failed to create OE Orders for the day',
             error: err.message
         });
     }

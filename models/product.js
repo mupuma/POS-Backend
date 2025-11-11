@@ -56,6 +56,10 @@ module.exports = (sequelize) => {
                 type: DataTypes.STRING(45),
                 unique: true
             },
+        formatted_product_code: {
+                type: DataTypes.STRING(100),
+                allowNull: true
+            },
     },
         {
             timestamps:false,

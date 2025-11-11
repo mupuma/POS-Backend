@@ -1,24 +1,12 @@
-const axios = require('axios');
+const { Op, fn, col, where } = require('sequelize');
 
 class Sage300InventoryService {
-  constructor(baseUrl = process.env.SAGE_BASE_URL || 'http://localhost/Sage300WebApi/v1.0/-/INDCOM') {
-      const username = process.env.SAGE_USERNAME || "ADMIN";
-            const password = process.env.SAGE_PASSWORD || "Admin123!";
-
-            // Encode auth as Base64
-            const auth = `${username}:${password}`;
-            const encodedAuth = Buffer.from(auth, "utf-8").toString("base64");
-            const authorization = `Basic ${encodedAuth}`;
-
-      this.baseUrl = baseUrl;
-    this.client = axios.create({
-      baseURL: baseUrl,
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-          'Authorization': authorization,
-      }
-    });
+  constructor(mssqlDb) {
+    // Pass in the mssqlDb instance
+    if (!mssqlDb) {
+      throw new Error('mssqlDb instance is required');
+    }
+    this.mssqlDb = mssqlDb;
   }
 
   /**
@@ -28,24 +16,59 @@ class Sage300InventoryService {
    */
   async getInventoryByPrefix(itemPrefix) {
     try {
-      const response = await this.client.get("/IC/ICLocationDetails?$filter=startswith(ItemNumber,'CP')", {
-        data: {}
+      // Access the model through the mssqlDb instance
+      const items = await this.mssqlDb.ICILOC.findAll({
+        where: {
+          ITEMNO: {
+            [Op.like]: `${itemPrefix}%`
+          }
+        },
+        raw: true
       });
 
-      if (!response.data || !response.data.value) {
-        throw new Error('Invalid response format from Sage 300 API');
-      }
-
-      // Filter items that start with the specified prefix
-      const filteredItems = response.data.value.filter(item =>
-        item.ItemNumber && item.ItemNumber.startsWith(itemPrefix)
-      );
-
-      return filteredItems;
+      // Map database fields to API-like format for backward compatibility
+      return items.map(item => ({
+        ItemNumber: item.ITEMNO.trim(),
+        Location: item.LOCATION.trim(),
+        QuantityOnHand: parseFloat(item.QTYONHAND) || 0,
+        QuantityOnOrder: parseFloat(item.QTYONORDER) || 0,
+        QuantityCommitted: parseFloat(item.QTYCOMMIT) || 0,
+        QuantityAvailableToShip: parseFloat(item.QTYONHAND) - parseFloat(item.QTYCOMMIT) || 0,
+        AverageCost: parseFloat(item.TOTALCOST) / parseFloat(item.QTYONHAND) || 0,
+        TotalCost: parseFloat(item.TOTALCOST) || 0,
+        LastReceiptDate: this.convertSageDate(item.LASTRCPTDT),
+        MostRecentCost: parseFloat(item.RECENTCOST) || 0,
+        LastShipDate: this.convertSageDate(item.LASTSHIPDT),
+        StandardCost: parseFloat(item.STDCOST) || 0,
+        LastStandardCost: parseFloat(item.LASTSTDCST) || 0,
+        IsActive: item.ACTIVE === 1,
+        // Additional fields available from ICILOC
+        PickingSequence: item.PICKINGSEQ.trim(),
+        LeadTime: item.LEADTIME,
+        MinQuantityRequired: parseFloat(item.QTYMINREQ) || 0
+      }));
     } catch (error) {
-      console.error('Error fetching inventory from Sage 300:', error.message);
+      console.error('Error fetching inventory from Sage 300 DB:', error.message);
       throw error;
     }
+  }
+
+  /**
+   * Convert Sage 300 date format (YYYYMMDD as decimal) to ISO date string
+   * @param {number} sageDate - Date in Sage format (e.g., 20240115)
+   * @returns {string|null} ISO date string or null
+   */
+  convertSageDate(sageDate) {
+    if (!sageDate || sageDate === 0) return null;
+
+    const dateStr = sageDate.toString();
+    if (dateStr.length !== 8) return null;
+
+    const year = dateStr.substring(0, 4);
+    const month = dateStr.substring(4, 6);
+    const day = dateStr.substring(6, 8);
+
+    return `${year}-${month}-${day}`;
   }
 
   /**
@@ -56,19 +79,15 @@ class Sage300InventoryService {
    */
   async getQuantityOnHand(itemNumber, location) {
     try {
-      const response = await this.client.get('/IC/ICLocationDetails', {
-        data: {}
+      const item = await this.mssqlDb.ICILOC.findOne({
+        where: {
+          ITEMNO: itemNumber.padEnd(24, ' '),
+          LOCATION: location.padEnd(6, ' ')
+        },
+        raw: true
       });
-        console.log(response)
-      if (!response.data || !response.data.value) {
-        return null;
-      }
 
-      const item = response.data.value.find(i =>
-        i.ItemNumber === itemNumber && i.Location === location
-      );
-
-      return item ? item.QuantityOnHand : null;
+      return item ? parseFloat(item.QTYONHAND) : null;
     } catch (error) {
       console.error(`Error fetching quantity for ${itemNumber} at ${location}:`, error.message);
       return null;
@@ -76,8 +95,36 @@ class Sage300InventoryService {
   }
 
   /**
+   * Get all inventory for a specific item across all locations
+   * @param {string} itemNumber - Item number
+   * @returns {Promise<Array>} Array of location details
+   */
+  async getItemInventory(itemNumber) {
+    try {
+      const items = await this.mssqlDb.ICILOC.findAll({
+        where: {
+          ITEMNO: itemNumber.padEnd(24, ' ')
+        },
+        raw: true
+      });
+
+      return items.map(item => ({
+        Location: item.LOCATION.trim(),
+        QuantityOnHand: parseFloat(item.QTYONHAND) || 0,
+        QuantityCommitted: parseFloat(item.QTYCOMMIT) || 0,
+        QuantityAvailable: parseFloat(item.QTYONHAND) - parseFloat(item.QTYCOMMIT) || 0,
+        TotalCost: parseFloat(item.TOTALCOST) || 0,
+        RecentCost: parseFloat(item.RECENTCOST) || 0
+      }));
+    } catch (error) {
+      console.error(`Error fetching inventory for ${itemNumber}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Group inventory by item number with locations
-   * @param {Array} inventoryData - Raw inventory data from API
+   * @param {Array} inventoryData - Raw inventory data
    * @returns {Object} Grouped inventory by item number
    */
   groupInventoryByItem(inventoryData) {
@@ -93,14 +140,16 @@ class Sage300InventoryService {
 
       grouped[item.ItemNumber].locations.push({
         location: item.Location,
-        locationName: item.Name,
         quantityOnHand: item.QuantityOnHand,
+        quantityCommitted: item.QuantityCommitted,
+        quantityAvailableToShip: item.QuantityAvailableToShip,
         averageCost: item.AverageCost,
         totalCost: item.TotalCost,
-        quantityAvailableToShip: item.QuantityAvailableToShip,
-        quantityCommitted: item.QuantityCommitted,
         lastReceiptDate: item.LastReceiptDate,
-        mostRecentCost: item.MostRecentCost
+        mostRecentCost: item.MostRecentCost,
+        standardCost: item.StandardCost,
+        isActive: item.IsActive,
+        leadTime: item.LeadTime
       });
     });
 
@@ -109,7 +158,7 @@ class Sage300InventoryService {
 
   /**
    * Update product inventory in database for all stores
-   * @param {Object} models - Sequelize models
+   * @param {Object} models - Sequelize models (PostgreSQL)
    * @param {string} itemPrefix - Item prefix to filter (e.g., "CP")
    * @param {Object} locationStoreMap - Map of Sage location codes to store IDs
    * @returns {Promise<Object>} Update results
@@ -124,7 +173,7 @@ class Sage300InventoryService {
     };
 
     try {
-      // Fetch inventory from Sage 300
+      // Fetch inventory from Sage 300 database
       const inventoryData = await this.getInventoryByPrefix(itemPrefix);
       console.log(`Found ${inventoryData.length} inventory records for items starting with ${itemPrefix}`);
 
@@ -134,9 +183,9 @@ class Sage300InventoryService {
       // Process each item
       for (const [itemNumber, itemData] of Object.entries(groupedInventory)) {
         try {
-          // Find product by product_code
+          // Find product by product_code (trim trailing spaces before comparing)
           const product = await models.product.findOne({
-            where: { product_code: itemNumber }
+            where: where(fn('RTRIM', col('product_code')), itemNumber.trim())
           });
 
           if (!product) {
@@ -194,10 +243,10 @@ class Sage300InventoryService {
             });
           }
 
-          // Do not update product-level stock; stock is managed per store in productinventory
-          // Optionally, update product cost based on first location's average cost
+          // Update product cost based on first location's average cost
+          const firstLocation = itemData.locations[0];
           await product.update({
-            cost: itemData.locations[0]?.averageCost || product.cost,
+            cost: firstLocation?.averageCost || product.cost,
             updated_at: new Date()
           });
 
@@ -221,7 +270,7 @@ class Sage300InventoryService {
 
   /**
    * Get location to store mapping from database
-   * @param {Object} models - Sequelize models
+   * @param {Object} models - Sequelize models (PostgreSQL)
    * @returns {Promise<Object>} Map of location codes to store IDs
    */
   async getLocationStoreMapping(models) {
@@ -241,7 +290,7 @@ class Sage300InventoryService {
 
   /**
    * Convenience method to sync inventory with automatic store mapping
-   * @param {Object} models - Sequelize models
+   * @param {Object} models - Sequelize models (PostgreSQL)
    * @param {string} itemPrefix - Item prefix to filter
    * @returns {Promise<Object>} Update results
    */
@@ -249,5 +298,40 @@ class Sage300InventoryService {
     const locationStoreMap = await this.getLocationStoreMapping(models);
     return this.syncInventoryToDatabase(models, itemPrefix, locationStoreMap);
   }
+
+  /**
+   * Get inventory summary statistics
+   * @param {string} itemPrefix - Item prefix filter
+   * @returns {Promise<Object>} Summary statistics
+   */
+  async getInventorySummary(itemPrefix = 'CP') {
+    try {
+      const items = await this.mssqlDb.ICILOC.findAll({
+        where: {
+          ITEMNO: {
+            [Op.like]: `${itemPrefix}%`
+          }
+        },
+        raw: true
+      });
+
+      const totalItems = new Set(items.map(i => i.ITEMNO.trim())).size;
+      const totalLocations = items.length;
+      const totalQuantity = items.reduce((sum, i) => sum + parseFloat(i.QTYONHAND), 0);
+      const totalValue = items.reduce((sum, i) => sum + parseFloat(i.TOTALCOST), 0);
+
+      return {
+        totalItems,
+        totalLocations,
+        totalQuantity,
+        totalValue,
+        averageQuantityPerLocation: totalLocations > 0 ? totalQuantity / totalLocations : 0
+      };
+    } catch (error) {
+      console.error('Error getting inventory summary:', error.message);
+      throw error;
+    }
+  }
 }
+
 module.exports = Sage300InventoryService;
