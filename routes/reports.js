@@ -9,6 +9,7 @@ router.get('/dashboard', auth, async (req, res) => {
     try {
         const { computeDashboardStats } = require('../services/reports/dashboardStats');
         const data = await computeDashboardStats(req);
+        console.log(data);
         res.json({ success: true, data, timestamp: new Date().toISOString() });
     } catch (error) {
         console.error('Dashboard stats error:', error);
@@ -76,13 +77,27 @@ router.get('/sales', auth, async (req, res) => {
             daily_breakdown: {}
         };
 
-        // Group by payment method and daily breakdown
+        // Group by payment method (allocating mixed payments) and daily breakdown
         sales.forEach(s => {
-            const method = s.payment_method || 'unknown';
             const date = s.sale_date.toDateString();
 
-            summary.payment_methods[method] =
-                (summary.payment_methods[method] || 0) + parseFloat(s.total_amount || 0);
+            // Allocate by payment breakdown if present
+            const bd = s.payments_breakdown;
+            if (bd && typeof bd === 'object') {
+                const total = Object.values(bd).reduce((a, v) => a + Number(v || 0), 0) || 0;
+                if (total > 0) {
+                    Object.entries(bd).forEach(([method, amt]) => {
+                        const key = method || 'unknown';
+                        summary.payment_methods[key] = (summary.payment_methods[key] || 0) + Number(amt || 0);
+                    });
+                } else {
+                    const method = s.payment_method || 'unknown';
+                    summary.payment_methods[method] = (summary.payment_methods[method] || 0) + parseFloat(s.total_amount || 0);
+                }
+            } else {
+                const method = s.payment_method || 'unknown';
+                summary.payment_methods[method] = (summary.payment_methods[method] || 0) + parseFloat(s.total_amount || 0);
+            }
 
             if (!summary.daily_breakdown[date]) {
                 summary.daily_breakdown[date] = { sales: 0, revenue: 0 };
@@ -133,8 +148,16 @@ router.get('/sales', auth, async (req, res) => {
 
             const paymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
             sales.forEach(s => {
-                const key = normalizeMethod(s.payment_method);
-                paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(s.total_amount || 0);
+                const bd = s.payments_breakdown;
+                if (bd && typeof bd === 'object') {
+                    Object.entries(bd).forEach(([method, amt]) => {
+                        const key = normalizeMethod(method);
+                        paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(amt || 0);
+                    });
+                } else {
+                    const key = normalizeMethod(s.payment_method);
+                    paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(s.total_amount || 0);
+                }
             });
             returnsList.forEach(r => {
                 const key = normalizeMethod(r.payment_method);
@@ -1261,8 +1284,16 @@ router.get('/transactions', auth, async (req, res) => {
             // Payment methods breakdown (net of returns if method matches)
             const paymentBreakdown = {};
             salesList.forEach(s => {
-                const method = s.payment_method || 'unknown';
-                paymentBreakdown[method] = (paymentBreakdown[method] || 0) + Number(s.total_amount || 0);
+                const bd = s.payments_breakdown;
+                if (bd && typeof bd === 'object') {
+                    Object.entries(bd).forEach(([method, amt]) => {
+                        const key = (method || 'unknown').toString();
+                        paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(amt || 0);
+                    });
+                } else {
+                    const method = s.payment_method || 'unknown';
+                    paymentBreakdown[method] = (paymentBreakdown[method] || 0) + Number(s.total_amount || 0);
+                }
             });
             returnsList.forEach(r => {
                 const method = r.payment_method || 'unknown';

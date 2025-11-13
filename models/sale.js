@@ -53,7 +53,7 @@ module.exports = (sequelize) => {
             allowNull: false,
         },
         payment_method: {
-            type: DataTypes.ENUM('cash', 'card', 'mobile_money'),
+            type: DataTypes.ENUM('cash', 'card', 'mobile_money', 'mixed'),
             allowNull: false,
         },
         amount_paid: {
@@ -138,7 +138,10 @@ module.exports = (sequelize) => {
             type: DataTypes.DATE,
             allowNull: true,
         },
-
+        payments_breakdown: {
+            type: DataTypes.JSON,
+            allowNull: true,
+        },
     }, {
         tableName: 'sales',
         timestamps: true,

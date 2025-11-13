@@ -31,7 +31,6 @@ app.use('/api/inventory', require('./routes/inventory'));
 app.use('/api/creditnotes', require('./routes/creditnotes_v2'));
 // Unified print status check for sales and credit notes
 app.use('/api/print-status', require('./routes/printStatus'));
-app.use('/api/admin', require('./routes/zra-device'));
 app.get('/', (req, res) => {
     res.json({ message: 'POS API is running!' });
 });

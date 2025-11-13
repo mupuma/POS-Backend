@@ -86,6 +86,7 @@ class SageOrdersService {
       TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
       TaxClass1: 1,
       OrderCompleted: 'IncompleteNotIncluded',
+
       PostInvoice: false,
       TaxReportingTRCurrency: user?.store?.currency || 'ZMW',
       TRRateType: 'SP',

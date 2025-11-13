@@ -54,12 +54,14 @@ router.post('/', auth, async (req, res) => {
     const t = await sale.sequelize.transaction();
 
     try {
+        console.log(req.body)
         const {
             items, // [{ product_id, quantity, unit_price }]
             customer_id,
             discount_id,
             payment_method,
             amount_paid,
+            payments, // optional: { cash: number, card: number, mobile_money: number }
             tax_rate = 16, // percentage
             notes
         } = req.body;
@@ -150,16 +152,35 @@ router.post('/', auth, async (req, res) => {
         // Calculate tax and total
         const tax_amount = Math.round(((subtotal - discount_amount) * tax_rate) / 100 * 100) / 100;
         const total_amount = Math.round((subtotal - discount_amount + tax_amount) * 100) / 100;
-        const change_amount = Math.round((amount_paid - total_amount) * 100) / 100;
 
-         console.log('Payment Calculation Debug:', {
-            subtotal,
-            discount_amount,
-            tax_amount,
-            total_amount,
-            amount_paid,
-            change_amount
-        });
+        // Handle payments breakdown (mixed payments)
+        const normalizeNum = (n) => {
+            const v = Number(n);
+            return isNaN(v) ? 0 : Math.max(0, v);
+        };
+        let payments_breakdown_obj = null;
+        let effective_payment_method = payment_method;
+        let effective_amount_paid = Number(amount_paid || 0);
+
+        if (payments && typeof payments === 'object') {
+            const bd = {
+                cash: normalizeNum(payments.cash),
+                card: normalizeNum(payments.card),
+                mobile_money: normalizeNum(payments.mobile_money)
+            };
+            // Remove zero entries
+            const entries = Object.entries(bd).filter(([k, v]) => v > 0);
+            if (entries.length > 0) {
+                payments_breakdown_obj = Object.fromEntries(entries);
+                const sum = entries.reduce((s, [, v]) => s + v, 0);
+                effective_amount_paid = Math.round(sum * 100) / 100;
+                effective_payment_method = entries.length > 1 ? 'mixed' : entries[0][0];
+            }
+        }
+
+        const change_amount = Math.round((effective_amount_paid - total_amount) * 100) / 100;
+
+
 
         if (change_amount < 0) {
             await t.rollback();
@@ -179,10 +200,11 @@ router.post('/', auth, async (req, res) => {
             tax_amount,
             total_amount,
             tax_rate,
-            payment_method,
-            amount_paid,
+            payment_method: effective_payment_method,
+            amount_paid: effective_amount_paid,
             change_amount,
-            notes,
+            notes: notes || null,
+            payments_breakdown: payments_breakdown_obj, 
             customer: customerData,
             discount: discountData,
         };
@@ -230,8 +252,23 @@ router.post('/', auth, async (req, res) => {
 
         console.log('Creating sale record...');
 
+        // Helper to safely limit string lengths to avoid DB truncation errors
+        const limitStr = (v, n) => (v == null ? null : String(v).slice(0, n));
+
         // Generate incremental receipt number per store
         const receiptNumber = await zraService.generateReceiptNumber(req.user.store_id);
+
+        // Extract potential ZRA values first
+        const zraInvNumberRaw = (salesData && salesData.cisInvcNo) || (saveSalesData ? (saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber) : null);
+        const zraReceiptNoRaw = saveSalesData ? (saveSalesData.rcptNo || null) : null;
+        const zraSdcIdRaw = saveSalesData ? (saveSalesData.sdcId || null) : null;
+        const zraRcptSignRaw = saveSalesData ? (saveSalesData.rcptSign || null) : null;
+        const zraIntrlDataRaw = saveSalesData ? (saveSalesData.intrlData || null) : null;
+        const zraQrUrlRaw = saveSalesData ? (saveSalesData.qrCodeUrl || null) : null;
+        const zraVsdcDateRaw = saveSalesData ? (saveSalesData.vsdcRcptPbctDate || null) : null;
+        const computedInvoiceNoRaw = (saveSalesData && saveSalesData.sdcId && saveSalesData.rcptNo)
+            ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
+            : null;
 
         // Create sale regardless of ZRA status
         const newSale = await sale.create({
@@ -243,22 +280,21 @@ router.post('/', auth, async (req, res) => {
             discount_amount,
             tax_amount,
             total_amount,
-            payment_method,
-            amount_paid,
+            payment_method: effective_payment_method,
+            amount_paid: effective_amount_paid,
             change_amount,
             notes: notes || null,
-            // ZRA fields - may be null if offline
-            invnumber: (salesData && salesData.cisInvcNo) || (saveSalesData ? (saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber) : null),
-            receipt_no: saveSalesData ? (saveSalesData.rcptNo || null) : null,
-            sdcid: saveSalesData ? (saveSalesData.sdcId || null) : null,
-            receiptsig: saveSalesData ? (saveSalesData.rcptSign || null) : null,
-            intrldata: saveSalesData ? (saveSalesData.intrlData || null) : null,
-            qrcode_url: saveSalesData ? (saveSalesData.qrCodeUrl || null) : null,
-            vsdcrcpdate: saveSalesData ? (saveSalesData.vsdcRcptPbctDate || null) : null,
-            invoice_no: (saveSalesData && saveSalesData.sdcId && saveSalesData.rcptNo)
-                ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
-                : null,
-            qrfilepath: qrFilePath,
+            payments_breakdown: payments_breakdown_obj,
+            // ZRA fields - may be null if offline (apply safe length limits to match model)
+            invnumber: limitStr(zraInvNumberRaw, 50),
+            receipt_no: limitStr(zraReceiptNoRaw, 50),
+            sdcid: limitStr(zraSdcIdRaw, 50),
+            receiptsig: limitStr(zraRcptSignRaw, 50),
+            intrldata: limitStr(zraIntrlDataRaw, 100),
+            qrcode_url: limitStr(zraQrUrlRaw, 255),
+            vsdcrcpdate: limitStr(zraVsdcDateRaw, 100),
+            invoice_no: limitStr(computedInvoiceNoRaw, 100),
+            qrfilepath: limitStr(qrFilePath, 255),
             // Retry/Offline flags
             zra_status: zraFailed ? 'pending' : 'sent',
             zra_error: zraFailed ? (typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error)) : null,
@@ -607,11 +643,18 @@ router.get('/report/date-range', auth, async (req, res) => {
             payment_methods: {}
         };
 
-        // Group by payment method
+        // Group by payment method (allocate by payments_breakdown when available)
         sales.forEach(s => {
-            const method = s.payment_method || 'unknown';
-            summary.payment_methods[method] =
-                (summary.payment_methods[method] || 0) + parseFloat(s.total_amount || 0);
+            const bd = s.payments_breakdown;
+            if (bd && typeof bd === 'object') {
+                Object.entries(bd).forEach(([method, amt]) => {
+                    const key = method || 'unknown';
+                    summary.payment_methods[key] = (summary.payment_methods[key] || 0) + Number(amt || 0);
+                });
+            } else {
+                const method = s.payment_method || 'unknown';
+                summary.payment_methods[method] = (summary.payment_methods[method] || 0) + parseFloat(s.total_amount || 0);
+            }
         });
 
         res.json({
@@ -659,17 +702,22 @@ router.get('/report/daily', auth, async (req, res) => {
             cash_sales: todaySales.filter(s => s.payment_method === 'cash').length,
             card_sales: todaySales.filter(s => s.payment_method === 'card').length,
             mobile_sales: todaySales.filter(s => s.payment_method === 'mobile_money').length,
-            payment_summary: {
-                cash: todaySales
-                    .filter(s => s.payment_method === 'cash')
-                    .reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
-                card: todaySales
-                    .filter(s => s.payment_method === 'card')
-                    .reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
-                mobile_money: todaySales
-                    .filter(s => s.payment_method === 'mobile_money')
-                    .reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0)
-            }
+            payment_summary: (() => {
+                const totals = { cash: 0, card: 0, mobile_money: 0 };
+                todaySales.forEach(s => {
+                    const bd = s.payments_breakdown;
+                    if (bd && typeof bd === 'object') {
+                        Object.entries(bd).forEach(([method, amt]) => {
+                            if (totals.hasOwnProperty(method)) {
+                                totals[method] += Number(amt || 0);
+                            }
+                        });
+                    } else if (totals.hasOwnProperty(s.payment_method)) {
+                        totals[s.payment_method] += Number(s.total_amount || 0);
+                    }
+                });
+                return totals;
+            })()
         };
 
         res.json({ summary });
@@ -766,9 +814,16 @@ router.get('/dashboard/stats/:period', auth, async (req, res) => {
             mobile_money: 0
         };
 
-        periodSales.forEach(sale => {
-            if (paymentMethods.hasOwnProperty(sale.payment_method)) {
-                paymentMethods[sale.payment_method] += parseFloat(sale.total_amount || 0);
+        periodSales.forEach(s => {
+            const bd = s.payments_breakdown;
+            if (bd && typeof bd === 'object') {
+                Object.entries(bd).forEach(([method, amt]) => {
+                    if (paymentMethods.hasOwnProperty(method)) {
+                        paymentMethods[method] += Number(amt || 0);
+                    }
+                });
+            } else if (paymentMethods.hasOwnProperty(s.payment_method)) {
+                paymentMethods[s.payment_method] += parseFloat(s.total_amount || 0);
             }
         });
 

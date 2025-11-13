@@ -3,6 +3,27 @@ const { sale, saleitem, product, user, customer, productinventory, category, cre
 
 // Compute unified dashboard stats for a given request/user context
 async function computeDashboardStats(req) {
+  // Helper: aggregate sales by payment method, honoring payments_breakdown when present
+  function aggregateByPayment(sales) {
+    const breakdown = {};
+    for (const s of sales) {
+      const totalAmount = parseFloat(s.total_amount || 0) || 0;
+      const bd = s.payments_breakdown;
+      if (bd && typeof bd === 'object') {
+        const sum = Object.values(bd).reduce((acc, v) => acc + Number(v || 0), 0);
+        if (sum > 0) {
+          for (const [method, amt] of Object.entries(bd)) {
+            const key = method || 'unknown';
+            breakdown[key] = (breakdown[key] || 0) + Number(amt || 0);
+          }
+          continue;
+        }
+      }
+      const method = s.payment_method || 'unknown';
+      breakdown[method] = (breakdown[method] || 0) + totalAmount;
+    }
+    return breakdown;
+  }
   const now = new Date();
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const endOfToday = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000 - 1);
@@ -47,6 +68,11 @@ async function computeDashboardStats(req) {
     include: salesInclude
   });
   const monthSalesTotal = monthSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+
+  // Sales by payment type
+  const todaysSalesByPayment = aggregateByPayment(todaysSales);
+  const weekSalesByPayment = aggregateByPayment(weekSales);
+  const monthSalesByPayment = aggregateByPayment(monthSales);
 
   // Inventory (per store)
   const totalProducts = await productinventory.count({
@@ -174,26 +200,29 @@ async function computeDashboardStats(req) {
   const totalReturnsToday = parseInt(returnsStats[0]?.count || 0);
   const totalReturnsAmount = parseFloat(returnsStats[0]?.total || 0);
 
-  const dashboardStats = {
-    todaysSales: todaysSalesTotal,
-    todaysTransactions: todaysTransactions,
-    weekSales: weekSalesTotal,
-    monthSales: monthSalesTotal,
-    totalProducts: totalProducts,
-    lowStockProducts: lowStockProducts,
-    outOfStockProducts: outOfStockProducts,
-    totalCustomers: totalCustomers,
-    activeUsers: activeUsers,
-    topProducts: topProducts,
-    recentSales: recentSales,
-    recentReturns: recentReturns,
-    recentCreditNotes: recentReturns,
-    recent_returns: recentReturns,
-    totalReturnsToday: totalReturnsToday,
-    totalReturnsAmount: totalReturnsAmount
+  return {
+      todaysSales: todaysSalesTotal,
+      todaysTransactions: todaysTransactions,
+      weekSales: weekSalesTotal,
+      monthSales: monthSalesTotal,
+      totalProducts: totalProducts,
+      lowStockProducts: lowStockProducts,
+      outOfStockProducts: outOfStockProducts,
+      totalCustomers: totalCustomers,
+      activeUsers: activeUsers,
+      topProducts: topProducts,
+      recentSales: recentSales,
+      recentReturns: recentReturns,
+      recentCreditNotes: recentReturns,
+      recent_returns: recentReturns,
+      totalReturnsToday: totalReturnsToday,
+      totalReturnsAmount: totalReturnsAmount,
+      salesByPaymentType: {
+        today: todaysSalesByPayment,
+        week: weekSalesByPayment,
+        month: monthSalesByPayment
+      }
   };
-
-  return dashboardStats;
 }
 
 module.exports = { computeDashboardStats };
