@@ -9,10 +9,11 @@ class SageOrdersService {
     this.timeout = 60000; // 60s default
   }
 
+  // Round a value to 4 decimal places and return a number
   _to2(n) {
     const x = Number(n);
     if (!Number.isFinite(x)) return 0;
-    return Number(x.toFixed(2));
+    return Number(x.toFixed(4));
   }
 
   _normalizeItem(item) {

@@ -4,72 +4,15 @@ const router = express.Router();
 const { sale, saleitem, product, user, customer, category, productinventory, sequelize, creditnote, creditnoteitem } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
-// Dashboard Statistics
+// Dashboard Statistics (unified)
 router.get('/dashboard', auth, async (req, res) => {
     try {
-        const today = new Date();
-        const startOfDay = new Date(today.setHours(0, 0, 0, 0));
-        const endOfDay = new Date(today.setHours(23, 59, 59, 999));
-
-        const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-        const startOfYesterday = new Date(yesterday.setHours(0, 0, 0, 0));
-        const endOfYesterday = new Date(yesterday.setHours(23, 59, 59, 999));
-
-        const filterStoreId = req.user.store_id;
-        const cashierInclude = [{ model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) }];
-
-        // Today's sales
-        const todaySales = await sale.findAll({
-            where: {
-                sale_date: { [Op.between]: [startOfDay, endOfDay] }
-            },
-            include: cashierInclude
-        });
-
-        // Yesterday's sales for comparison
-        const yesterdaySales = await sale.findAll({
-            where: {
-                sale_date: { [Op.between]: [startOfYesterday, endOfYesterday] }
-            },
-            include: cashierInclude
-        });
-
-        // Low stock count (by store inventory)
-        const lowStockCount = await productinventory.count({
-            where: {
-                store_id: filterStoreId,
-                stock_quantity: { [Op.lte]: sequelize.col('min_stock_level') }
-            }
-        });
-
-        // Total products
-        const totalProducts = await product.count({ where: { is_active: true } });
-
-        const todayRevenue = todaySales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-        const yesterdayRevenue = yesterdaySales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-
-        res.json({
-            today_sales: {
-                count: todaySales.length,
-                revenue: todayRevenue
-            },
-            yesterday_sales: {
-                count: yesterdaySales.length,
-                revenue: yesterdayRevenue
-            },
-            inventory: {
-                total_products: totalProducts,
-                low_stock_items: lowStockCount
-            },
-            revenue_change: yesterdayRevenue > 0 ?
-                ((todayRevenue - yesterdayRevenue) / yesterdayRevenue * 100) : 0,
-            sales_change: yesterdaySales.length > 0 ?
-                ((todaySales.length - yesterdaySales.length) / yesterdaySales.length * 100) : 0
-        });
-
+        const { computeDashboardStats } = require('../services/reports/dashboardStats');
+        const data = await computeDashboardStats(req);
+        res.json({ success: true, data, timestamp: new Date().toISOString() });
     } catch (error) {
         console.error('Dashboard stats error:', error);
-        res.status(500).json({ message: 'Server error' });
+        res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 

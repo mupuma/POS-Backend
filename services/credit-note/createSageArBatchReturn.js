@@ -11,11 +11,11 @@ class AccountsReceivableBatchReturn {
         this.timeout = 30000; // 30 seconds
     }
 
-    // Round a value to 2 decimal places and return a number
+    // Round a value to 4 decimal places and return a number
     _to2(n) {
         const x = Number(n);
         if (!Number.isFinite(x)) return 0;
-        return Number(x.toFixed(2));
+        return Number(x.toFixed(4));
     }
 
     // Helper method to normalize an item based on sales.js structure

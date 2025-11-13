@@ -148,9 +148,18 @@ router.post('/', auth, async (req, res) => {
         }
 
         // Calculate tax and total
-        const tax_amount = ((subtotal - discount_amount) * tax_rate) / 100;
-        const total_amount = subtotal - discount_amount + tax_amount;
-        const change_amount = amount_paid - total_amount;
+        const tax_amount = Math.round(((subtotal - discount_amount) * tax_rate) / 100 * 100) / 100;
+        const total_amount = Math.round((subtotal - discount_amount + tax_amount) * 100) / 100;
+        const change_amount = Math.round((amount_paid - total_amount) * 100) / 100;
+
+         console.log('Payment Calculation Debug:', {
+            subtotal,
+            discount_amount,
+            tax_amount,
+            total_amount,
+            amount_paid,
+            change_amount
+        });
 
         if (change_amount < 0) {
             await t.rollback();
@@ -675,291 +684,9 @@ router.get('/report/daily', auth, async (req, res) => {
 // Get dashboard statistics
 router.get('/dashboard/stats', auth, async (req, res) => {
     try {
-        const { creditnote, creditnoteitem } = require('../models');
-
-        // Get current date ranges
-        const now = new Date();
-        const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const endOfToday = new Date(startOfToday.getTime() + 24 * 60 * 60 * 1000 - 1);
-
-        const startOfWeek = new Date(startOfToday);
-        startOfWeek.setDate(startOfToday.getDate() - startOfToday.getDay());
-
-        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-        const filterStoreId = req.user.store_id;
-
-        // Base include for sales queries - filter by store
-        const salesInclude = [
-            {
-                model: user,
-                as: 'cashier',
-                attributes: ['id', 'full_name', 'store_id'],
-                where: { store_id: filterStoreId },
-                required: true
-            }
-        ];
-
-        // Today's sales statistics
-        const todaysSales = await sale.findAll({
-            where: {
-                sale_date: {
-                    [Op.between]: [startOfToday, endOfToday]
-                }
-            },
-            include: salesInclude,
-            order: [['sale_date', 'DESC']],
-            limit: 10 // For recent sales
-        });
-
-        const todaysSalesTotal = todaysSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-        const todaysTransactions = todaysSales.length;
-
-        // Week's sales statistics
-        const weekSales = await sale.findAll({
-            where: {
-                sale_date: {
-                    [Op.between]: [startOfWeek, endOfToday]
-                }
-            },
-            include: salesInclude
-        });
-
-        const weekSalesTotal = weekSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-
-        // Month's sales statistics
-        const monthSales = await sale.findAll({
-            where: {
-                sale_date: {
-                    [Op.between]: [startOfMonth, endOfToday]
-                }
-            },
-            include: salesInclude
-        });
-
-        const monthSalesTotal = monthSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-
-        // Product statistics - count products available in this store
-        const totalProducts = await productinventory.count({
-            where: {
-                store_id: filterStoreId
-            },
-            distinct: true,
-            col: 'product_id'
-        });
-
-        // Inventory stats per current user's store
-        const lowStockProducts = await productinventory.count({
-            where: {
-                store_id: filterStoreId,
-                stock_quantity: {
-                    [Op.between]: [1, 10]
-                }
-            }
-        });
-
-        const outOfStockProducts = await productinventory.count({
-            where: {
-                store_id: filterStoreId,
-                stock_quantity: {
-                    [Op.lte]: 0
-                }
-            }
-        });
-
-        // Customer statistics - count customers who have made purchases at this store
-        const totalCustomers = await customer.count({
-            include: [{
-                model: sale,
-                as: 'sales',
-                include: [{
-                    model: user,
-                    as: 'cashier',
-                    where: { store_id: filterStoreId },
-                    attributes: [],
-                    required: true
-                }],
-                attributes: [],
-                required: true
-            }],
-            distinct: true
-        });
-
-        // Active users - users from this store who made sales today
-        const activeUsers = await user.count({
-            where: {
-                store_id: filterStoreId
-            },
-            include: [{
-                model: sale,
-                as: 'sales',
-                where: {
-                    sale_date: {
-                        [Op.between]: [startOfToday, endOfToday]
-                    }
-                },
-                attributes: [],
-                required: true
-            }],
-            distinct: true
-        });
-
-        // Top products (by quantity sold this month) - filtered by store
-        const topProductsQuery = await saleitem.findAll({
-            attributes: [
-                'product_id',
-                [fn('SUM', col('quantity')), 'total_quantity'],
-                [fn('SUM', col('total_price')), 'total_revenue']
-            ],
-            include: [
-                {
-                    model: sale,
-                    where: {
-                        sale_date: {
-                            [Op.between]: [startOfMonth, endOfToday]
-                        }
-                    },
-                    include: [{
-                        model: user,
-                        as: 'cashier',
-                        where: { store_id: filterStoreId },
-                        attributes: [],
-                        required: true
-                    }],
-                    attributes: []
-                },
-                {
-                    model: product,
-                    as: 'product',
-                    attributes: ['name']
-                }
-            ],
-            group: ['product_id', 'product.id', 'product.name'],
-            order: [[fn('SUM', col('quantity')), 'DESC']],
-            limit: 3,
-            raw: false
-        });
-
-        // Format top products
-        const topProducts = topProductsQuery.map(item => ({
-            name: item.product.name,
-            quantity: parseInt(item.dataValues.total_quantity),
-            revenue: parseFloat(item.dataValues.total_revenue)
-        }));
-
-        // Recent sales (last 5 today's sales)
-        const recentSalesData = todaysSales.slice(0, 5);
-        const recentSales = await Promise.all(recentSalesData.map(async (s) => {
-            // Get item count for this sale
-            const itemCount = await saleitem.count({
-                where: { sale_id: s.id }
-            });
-
-            return {
-                time: new Date(s.sale_date).toLocaleTimeString('en-GB', {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    hour12: false
-                }),
-                amount: parseFloat(s.total_amount),
-                items: itemCount,
-                receipt_number: s.receipt_number,
-                payment_method: s.payment_method
-            };
-        }));
-
-        // Recent returns/credit notes (last 10) - filtered by store
-        const recentReturnsData = await creditnote.findAll({
-            limit: 10,
-            order: [['createdAt', 'DESC']],
-            include: [
-                {
-                    model: creditnoteitem,
-                    as: 'items',
-                    include: [{ model: product, as: 'product' }]
-                },
-                {
-                    model: user,
-                    as: 'cashier',
-                    attributes: ['id', 'full_name', 'store_id'],
-                    where: { store_id: filterStoreId },
-                    required: true
-                },
-                { model: customer, as: 'customer' }
-            ]
-        });
-
-        // Transform returns data to match expected format
-        const recentReturns = recentReturnsData.map(creditNote => ({
-            receipt_number: creditNote.receipt_number || creditNote.id?.toString() || '-',
-            credit_note_number: creditNote.receipt_number,
-            time: creditNote.createdAt?.toISOString() || '',
-            timestamp: creditNote.createdAt?.toISOString() || '',
-            created_at: creditNote.createdAt?.toISOString() || '',
-            createdAt: creditNote.createdAt?.toISOString() || '',
-            date: creditNote.createdAt?.toISOString() || '',
-            refund_amount: parseFloat(creditNote.total_amount || 0),
-            total_refund: parseFloat(creditNote.total_amount || 0),
-            refund: parseFloat(creditNote.total_amount || 0),
-            amount: parseFloat(creditNote.total_amount || 0),
-            total: parseFloat(creditNote.total_amount || 0),
-            grand_total: parseFloat(creditNote.total_amount || 0),
-            items_count: creditNote.items ? creditNote.items.length : 0,
-            itemsCount: creditNote.items ? creditNote.items.length : 0,
-            items: creditNote.items ? creditNote.items.length : 0,
-            quantity: creditNote.items ? creditNote.items.reduce((sum, item) => sum + (item.quantity || 0), 0) : 0
-        }));
-
-        // Calculate returns statistics - filtered by store
-        const returnsStats = await creditnote.findAll({
-            attributes: [
-                [fn('COUNT', col('creditnote.id')), 'count'],
-                [fn('SUM', col('creditnote.total_amount')), 'total']
-            ],
-            where: {
-                createdAt: {
-                    [Op.between]: [startOfToday, endOfToday]
-                }
-            },
-            include: [{
-                model: user,
-                as: 'cashier',
-                where: { store_id: filterStoreId },
-                attributes: [],
-                required: true
-            }],
-            raw: true
-        });
-
-        const totalReturnsToday = parseInt(returnsStats[0]?.count || 0);
-        const totalReturnsAmount = parseFloat(returnsStats[0]?.total || 0);
-
-        // Prepare response data
-        const dashboardStats = {
-            todaysSales: todaysSalesTotal,
-            todaysTransactions: todaysTransactions,
-            weekSales: weekSalesTotal,
-            monthSales: monthSalesTotal,
-            totalProducts: totalProducts,
-            lowStockProducts: lowStockProducts,
-            outOfStockProducts: outOfStockProducts,
-            totalCustomers: totalCustomers,
-            activeUsers: activeUsers,
-            topProducts: topProducts,
-            recentSales: recentSales,
-            recentReturns: recentReturns,
-            recentCreditNotes: recentReturns,
-            recent_returns: recentReturns,
-            totalReturnsToday: totalReturnsToday,
-            totalReturnsAmount: parseFloat(totalReturnsAmount)
-        };
-
-        res.json({
-            success: true,
-            data: dashboardStats,
-            timestamp: new Date().toISOString()
-        });
-
+        const { computeDashboardStats } = require('../services/reports/dashboardStats');
+        const data = await computeDashboardStats(req);
+        res.json({ success: true, data, timestamp: new Date().toISOString() });
     } catch (error) {
         console.error('Dashboard stats error:', error);
         res.status(500).json({
@@ -969,6 +696,7 @@ router.get('/dashboard/stats', auth, async (req, res) => {
         });
     }
 });
+
 // Get dashboard statistics with date filter (optional)
 router.get('/dashboard/stats/:period', auth, async (req, res) => {
     try {
