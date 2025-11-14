@@ -299,7 +299,7 @@ router.post('/', auth, async (req, res) => {
             zra_status: zraFailed ? 'pending' : 'sent',
             zra_error: zraFailed ? (typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error)) : null,
             retry_count: zraFailed ? 0 : 0,
-            next_retry_at: zraFailed ? new Date(Date.now() + 1 * 60 * 1000) : null,
+            next_retry_at: zraFailed ? new Date(Date.now() + 2 * 60 * 1000) : null,
             last_retry_at: null,
         }, { transaction: t });
 

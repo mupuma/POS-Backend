@@ -7,8 +7,8 @@ class ZraRetryJob {
     this.isRunning = false;
     this.cronJob = null;
     this.intervalCron = '*/1 * * * *'; // every minute
-    this.maxRetries = 3;
-    this.baseDelayMinutes = 1; // fixed retry every minute
+    this.maxRetries = 3; // limit total retries to 3
+    this.baseDelayMinutes = 2; // retry attempts scheduled 2 minutes after a failure
     this.zraService = new ZRAIntegrationService();
   }
 
@@ -37,7 +37,7 @@ class ZraRetryJob {
       const now = new Date();
       const pending = await this.models.sale.findAll({
         where: {
-          zra_status: ['pending', 'failed'],
+          zra_status: ['pending'], // only pick records still pending retries
           next_retry_at: { [this.models.sequelize.Op.lte]: now }
         },
         limit: 10,
@@ -118,8 +118,9 @@ class ZraRetryJob {
 
   async applyBackoff(saleInstance, errorMessage) {
     const retries = (saleInstance.retry_count || 0) + 1;
-    const nextRetry = new Date(Date.now() + 1 * 60 * 1000); // always retry every minute
-    const status = retries >= this.maxRetries ? 'failed' : 'pending';
+    const isTerminal = retries >= this.maxRetries;
+    const nextRetry = isTerminal ? null : new Date(Date.now() + this.baseDelayMinutes * 60 * 1000);
+    const status = isTerminal ? 'failed' : 'pending';
     await saleInstance.update({
       retry_count: retries,
       last_retry_at: new Date(),
