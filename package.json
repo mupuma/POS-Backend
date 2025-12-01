@@ -17,7 +17,7 @@
     "@capacitor/cli": "^7.4.4",
     "@capacitor/core": "^7.4.4",
     "@yao-pkg/pkg": "^6.10.1",
-    "axios": "^0.27.2",
+    "axios": "^1.13.2",
     "bcryptjs": "^3.0.2",
     "cookie-parser": "~1.4.4",
     "cors": "^2.8.5",
@@ -28,7 +28,7 @@
     "helmet": "^8.1.0",
     "http-errors": "~1.6.3",
     "jsonwebtoken": "^9.0.2",
-    "morgan": "~1.9.1",
+    "morgan": "^1.10.1",
     "mysql2": "^3.14.1",
     "nexe-natives": "^1.0.2",
     "node-cron": "^4.2.1",
@@ -37,6 +37,7 @@
     "qrcode": "^1.5.4",
     "sequelize": "^6.37.7",
     "tedious": "^18.6.1",
+    "validator": "^13.15.23",
     "ws": "^8.18.3"
   },
   "devDependencies": {
