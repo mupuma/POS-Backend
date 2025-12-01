@@ -53,7 +53,7 @@ module.exports = (sequelize) => {
             allowNull: false,
         },
         payment_method: {
-            type: DataTypes.ENUM('cash', 'card', 'mobile_money'),
+            type: DataTypes.ENUM('cash', 'card', 'mobile_money', 'mixed'),
             allowNull: false,
         },
         amount_paid: {
@@ -85,11 +85,11 @@ module.exports = (sequelize) => {
             allowNull: true,
         },
         receiptsig: {
-            type: DataTypes.STRING(50),
+            type: DataTypes.TEXT,
             allowNull: true,
         },
         intrldata: {
-            type: DataTypes.STRING(100),
+            type: DataTypes.TEXT,
             allowNull: true,
         },
         qrcode_url: {

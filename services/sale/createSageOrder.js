@@ -55,6 +55,14 @@ class SageOrdersService {
     });
 
     const totalIncl = this._to2((saleData.salesData?.total_amount) ?? items.reduce((s, l) => s + (l.OrderUnitPrice * l.QuantityOrdered), 0));
+    const orderOptionalFields ={
+              OrderUniquifier: 0,
+              OptionalField: "ISAUTOMATIC",
+              Value: "YES",
+              YesNoValue: true,
+
+              UpdateOperation: "Unspecified",
+            }
 
     const order = {
       OrderUniquifier: 0,
@@ -95,6 +103,7 @@ class SageOrdersService {
       TRRateDateMatching: 1,
       TRRateOperator: 1,
       OrderDetails: items,
+        OrderOptionalFields: [orderOptionalFields],
       OrderTotal: totalIncl,
       OrderInclTaxTotal: totalIncl,
       NumberOfLinesOnOrder: items.length,

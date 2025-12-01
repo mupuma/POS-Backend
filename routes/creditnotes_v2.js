@@ -9,6 +9,9 @@ const path = require("path");
 const QRCode = require("qrcode");
 
 const router = express.Router();
+// In-memory lock set to prevent duplicate credit note processing for the same sale in concurrent requests
+const activeCreditNoteReturns = new Set();
+
 async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
     try {
         // Ensure the save directory exists
@@ -38,8 +41,17 @@ async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
 router.post('/:saleId/return', auth, async (req, res) => {
     const t = await creditnote.sequelize.transaction();
 
+    const { saleId } = req.params;
+    const lockKey = `return:${saleId}`;
+
+    // Prevent concurrent processing of the same saleId in this process
+    if (activeCreditNoteReturns.has(lockKey)) {
+        await t.rollback();
+        return res.status(409).json({ message: 'A credit note for this sale is already being processed. Please wait and try again.' });
+    }
+    activeCreditNoteReturns.add(lockKey);
+
     try {
-        const { saleId } = req.params;
         const { items, reason, reason_code, reason_label, approver_user_id } = req.body;
 
         if (!items || items.length === 0) {
@@ -74,6 +86,21 @@ router.post('/:saleId/return', auth, async (req, res) => {
         if (originalSale.cashier && originalSale.cashier.store_id !== req.user.store_id) {
             await t.rollback();
             return res.status(403).json({ message: 'Access denied: Sale does not belong to your store' });
+        }
+
+        // Idempotency check: if a credit note for this sale already exists, return it without re-sending to ZRA
+        const existingCN = await creditnote.findOne({ where: { receipt_number: `CN-${originalSale.receipt_number}` }, transaction: t });
+        if (existingCN) {
+            await t.rollback();
+            const fullCN = await creditnote.findByPk(existingCN.id, {
+                include: [
+                    { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
+                    { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
+                    { model: user, as: 'approver', attributes: ['id', 'full_name'] },
+                    { model: customer, as: 'customer' }
+                ]
+            });
+            return res.status(200).json({ message: 'Credit note already exists for this sale. Returning existing record.', creditNote: fullCN });
         }
 
         // Prepare return items and totals
@@ -172,6 +199,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
                 // Don't fail the entire transaction for QR code generation
             }
         }
+
         // Persist Credit Note document (separate table)
         const cn = await creditnote.create({
             receipt_number: `CN-${originalSale.receipt_number}`,
@@ -185,6 +213,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
             payment_method: originalSale.payment_method,
             amount_paid: total_amount,
             change_amount: 0,
+             credit_note_date: new Date(),
             notes: `Credit Note for Sale #${originalSale.id} - ${reason || reason_label || 'Return'}`,
             invnumber: (salesData && salesData.cisInvcNo) || saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber || null,
             receipt_no: saveSalesData.rcptNo || null,
@@ -193,10 +222,10 @@ router.post('/:saleId/return', auth, async (req, res) => {
             intrldata: saveSalesData.intrlData || null,
             qrcode_url: saveSalesData.qrCodeUrl || null,
             vsdcrcpdate: saveSalesData.vsdcRcptPbctDate || null,
-            invoice_no: `CRN${saveSalesData.sdcId.substring(3)}/${saveSalesData.rcptNo}`,
-            qrfilepath:qrFilePath,
+            invoice_no: (saveSalesData.sdcId && saveSalesData.rcptNo) ? `CRN${saveSalesData.sdcId.substring(3)}/${saveSalesData.rcptNo}` : null,
+            qrfilepath: qrFilePath,
             original_sale_id: originalSale.id,
-            reason_label: reason || reason_label || 'Return',
+            reason: reason || reason_label || 'Return',
         }, { transaction: t });
 
         // Store items and update stock (add back)
@@ -216,6 +245,25 @@ router.post('/:saleId/return', auth, async (req, res) => {
         }
 
         await t.commit();
+
+        // Fire-and-forget: send ZRA stock items adjustment with SAR type for credit notes (sarTyCd = "03")
+        try {
+            const stockItemsData = zraService.transformToZRACreditNoteStockItemsData(creditNoteData, returnItems, req.user);
+            // Do not await; log outcome only
+            console.log(stockItemsData)
+            zraService.sendCreditNoteStockItemsData(stockItemsData)
+                .then(resp => {
+                    if (!resp.success) {
+                        console.error('ZRA Credit Note Stock Items failed:', resp.error);
+                    } else {
+
+                        console.log('ZRA Credit Note Stock Items sent successfully');
+                    }
+                })
+                .catch(err => console.error('ZRA Credit Note Stock Items error:', err?.message || err));
+        } catch (bgErr) {
+            console.error('Failed to initiate ZRA Credit Note stock items call:', bgErr?.message || bgErr);
+        }
 
         const fullCN = await creditnote.findByPk(cn.id, {
             include: [
@@ -240,8 +288,24 @@ router.post('/:saleId/return', auth, async (req, res) => {
         // Note: Sage integration will be handled separately at day-end (manual trigger)
 
     } catch (error) {
-        await t.rollback();
-        return res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Credit note transaction failed:', error);
+  if (t) {
+    try { await t.rollback(); } catch (rbErr) { console.error('Rollback failed:', rbErr); }
+  }
+  return res.status(500).json({
+    message: 'Server error',
+    error: error.message,
+    // remove the next lines in production — only for debugging
+    details: {
+      name: error.name,
+      errors: error.errors,
+      sql: error.sql,
+      parent: error.parent && { code: error.parent.code, message: error.parent.sqlMessage || error.parent.message }
+    }
+  });
+} finally {
+        // Release per-sale lock
+        activeCreditNoteReturns.delete(lockKey);
     }
 });
 

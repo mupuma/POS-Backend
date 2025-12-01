@@ -1,9 +1,11 @@
 // Add these routes to your backend router
 const express = require("express");
+
 const router = express.Router();
 const { sale, saleitem, product, user, customer, category, productinventory, sequelize, creditnote, creditnoteitem } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
+
 // Dashboard Statistics (unified)
 router.get('/dashboard', auth, async (req, res) => {
     try {

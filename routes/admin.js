@@ -2,7 +2,7 @@ const express = require('express');
 const { sale, saleitem, product, user, customer, discount, store, creditnote, creditnoteitem,productinventory } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
-
+const axios = require('axios');
 const router = express.Router();
 const authMiddleware = auth;
 
