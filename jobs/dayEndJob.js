@@ -1,9 +1,10 @@
 const cron = require('node-cron');
+const { createDayEndOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
 
 /**
  * DayEndJob
  * - At 20:00 local time (Africa/Lusaka by default), checks if day-end has been completed for each store
- * - If not, performs a day-end sync (placeholder) and updates last_day_end_date
+ * - If not, queues a day-end sync event and updates last_day_end_date
  */
 class DayEndJob {
   /**
@@ -21,16 +22,32 @@ class DayEndJob {
 
   /**
    * Core day-end routine for a single store
-   * Placeholder: integrate real business logic here (e.g., post daily AR batch, ZRA, reports, etc.)
+    * Queues a single idempotent outbox event for the store/day pair.
    * Should be idempotent for a given (store, date)
    * @param {object} storeInstance
    * @param {string} todayStr - YYYY-MM-DD
    */
   async performDayEndSync(storeInstance, todayStr) {
-    // TODO: Hook into your actual day-end pipeline here.
-    // Minimal implementation: just a no-op to represent successful completion.
-    // Example (future): await new AccountsReceivableBatch().createConsolidatedArBatchForDate(storeInstance, todayStr)
-    return { ok: true };
+    const result = await createDayEndOutboxEvent(this.models, {
+      storeId: storeInstance.id,
+      userId: null,
+      dateString: todayStr,
+    });
+
+    if (!result.success) {
+      return { ok: false, error: 'Failed to queue day-end event' };
+    }
+
+    if (!result.queued) {
+      return { ok: true, queued: false, reason: 'No sales for this store/day' };
+    }
+
+    return {
+      ok: true,
+      queued: true,
+      outboxId: result.outboxId,
+      events: result.events || [],
+    };
   }
 
   /**

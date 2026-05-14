@@ -4,9 +4,9 @@ const { Sequelize } = require('sequelize');
 const {
   MSSQL_HOST = 'localhost',
   MSSQL_PORT = 1433,
-  MSSQL_DATABASE = 'DAPTST',
+  MSSQL_DATABASE = 'DAPDAT',
   MSSQL_USERNAME = 'sa',
-  MSSQL_PASSWORD = 'Admin123',
+  MSSQL_PASSWORD = 'root',
   MSSQL_ENCRYPT = 'true',
   MSSQL_TRUST_SERVER_CERT = 'true',
   MSSQL_INSTANCE,

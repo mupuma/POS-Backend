@@ -1,7 +1,7 @@
 const express = require('express');
-const { sale, saleitem, product, user, customer, discount,store,productinventory } = require('../models');
+const { sale, saleitem, product, user, customer, discount, store, productinventory, sync_outbox } = require('../models');
 const auth = require('../middleware/auth');
-const { Op,sequelize, fn, col,literal} = require('sequelize');
+const { Op, sequelize, fn, col, literal } = require('sequelize');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
@@ -91,7 +91,7 @@ router.post('/', auth, async (req, res) => {
             }
 
             // Check stock from productinventory for the user's store
-          const inventory = await productinventory.findOne({
+            const inventory = await productinventory.findOne({
                 where: { product_id: item.product_id, store_id: req.user.store_id },
                 transaction: t
             });
@@ -204,7 +204,7 @@ router.post('/', auth, async (req, res) => {
             amount_paid: effective_amount_paid,
             change_amount,
             notes: notes || null,
-            payments_breakdown: payments_breakdown_obj, 
+            payments_breakdown: payments_breakdown_obj,
             customer: customerData,
             discount: discountData,
         };
@@ -316,7 +316,7 @@ router.post('/', auth, async (req, res) => {
             }, { transaction: t });
 
             // Update product stock
-           await productinventory.update(
+            await productinventory.update(
                 {
                     stock_quantity: literal(`stock_quantity - ${item.quantity}`)
                 },
@@ -327,6 +327,58 @@ router.post('/', auth, async (req, res) => {
             );
 
         }
+
+        // Create sync outbox entry
+        const outboxPayload = {
+            sale: {
+                id: newSale.id,
+                receipt_number: receiptNumber,
+                user_id: req.user.id,
+                store_id: req.user.store_id,
+                customer_id: customer_id || null,
+                discount_id: discount_id || null,
+                subtotal,
+                discount_amount,
+                tax_amount,
+                total_amount,
+                payment_method: effective_payment_method,
+                amount_paid: effective_amount_paid,
+                change_amount,
+                notes: notes || null,
+                payments_breakdown: payments_breakdown_obj,
+                sale_date: new Date().toISOString()
+            },
+            items: saleItems.map(item => ({
+                product_id: item.product_id,
+                quantity: Number(item.quantity),
+                unit_price: Number(item.unit_price),
+                total_price: Number(item.total_price),
+                tax_exclusive_total: Number(item.tax_exclusive_total),
+                product: {
+                    id: item.product.id,
+                    name: item.product.name,
+                    product_code: item.product.product_code,
+                    formatted_product_code: item.product.formatted_product_code || null,
+                    price: Number(item.product.price)
+                }
+            })),
+            customer: customerData,
+            discount: discountData
+        };
+
+        await sync_outbox.create({
+            event_type: 'sale.created',
+            aggregate_type: 'sale',
+            aggregate_id: newSale.id,
+            store_id: req.user.store_id,
+            user_id: req.user.id,
+            receipt_number: receiptNumber,
+            idempotency_key: `sale.created:store-${req.user.store_id}:sale-${newSale.id}:receipt-${receiptNumber}`,
+            payload: outboxPayload,
+            status: 'pending',
+            attempt_count: 0,
+            next_retry_at: new Date()
+        }, { transaction: t });
 
         await t.commit();
         console.log('Transaction committed successfully');
@@ -339,8 +391,9 @@ router.post('/', auth, async (req, res) => {
                     as: 'items',
                     include: [{ model: product, as: 'product' }]
                 },
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'],
-                    include:[{model:store,as:'store', attributes:['store_location','store_mobile_no']}]
+                {
+                    model: user, as: 'cashier', attributes: ['id', 'full_name'],
+                    include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }]
                 },
                 { model: customer, as: 'customer' },
                 { model: discount, as: 'discount' }
@@ -728,7 +781,6 @@ router.get('/report/daily', auth, async (req, res) => {
     }
 });
 
-// Get dashboard statistics
 // Get dashboard statistics
 router.get('/dashboard/stats', auth, async (req, res) => {
     try {

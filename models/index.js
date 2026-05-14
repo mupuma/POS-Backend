@@ -1,13 +1,21 @@
 const fs = require('fs');
 const path = require('path');
 const { Sequelize, DataTypes } = require('sequelize');
+const config = require('../config/config.json');
 
-// Properly configured Sequelize instance
-const sequelize = new Sequelize('pos_backend', 'sa', 'Admin123', {
-    host: 'localhost',
-    dialect: 'mysql',
-    // Add additional options like pool configuration if needed
-});
+const env = process.env.NODE_ENV || 'development';
+const dbConfig = config[env];
+
+const sequelize = new Sequelize(
+    process.env.DB_NAME || dbConfig.database,
+    process.env.DB_USER || dbConfig.username,
+    process.env.DB_PASSWORD || dbConfig.password,
+    {
+        host: process.env.DB_HOST || dbConfig.host,
+        dialect: dbConfig.dialect,
+        port: process.env.DB_PORT || dbConfig.port,
+    }
+);
 
 const db = {};
 
