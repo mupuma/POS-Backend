@@ -1,5 +1,5 @@
 const express = require('express');
-const { sale, saleitem, product, user, customer, discount, store, creditnote, creditnoteitem,productinventory } = require('../models');
+const { sale, saleitem, product, user, customer, discount, store, creditnote, creditnoteitem, productinventory, sync_outbox } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
 const axios = require('axios');
@@ -11,6 +11,69 @@ const ZraRetryJob = require('../jobs/zraRetryJob');
 const ZRAIntegrationServiceStockDisposal = require("../services/stock-disposal/zraEndPoints");
 const SageInternalUsage = require("../services/stock-disposal/sageInternalUsages");
 const { createDayEndOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
+
+function parseYmdDate(rawValue) {
+    const match = String(rawValue || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) {
+        return null;
+    }
+
+    const [, year, month, day] = match;
+    const parsed = new Date(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
+    if (Number.isNaN(parsed.getTime())) {
+        return null;
+    }
+
+    if (parsed.getFullYear() !== Number(year) || parsed.getMonth() !== Number(month) - 1 || parsed.getDate() !== Number(day)) {
+        return null;
+    }
+
+    return parsed;
+}
+
+function formatYmdDate(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function formatAggregateIdDate(aggregateId) {
+    const value = String(aggregateId || '').padStart(8, '0');
+    if (!/^\d{8}$/.test(value)) {
+        return null;
+    }
+
+    return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+}
+
+function buildDayEndHistoryMessage(outboxRow) {
+    if (!outboxRow) {
+        return 'Day-end not yet queued';
+    }
+
+    if (outboxRow.status === 'sent') {
+        return null;
+    }
+
+    if (outboxRow.status === 'pending') {
+        return 'Queued for sync';
+    }
+
+    if (outboxRow.status === 'sending') {
+        return 'Sync in progress';
+    }
+
+    if (outboxRow.status === 'dead_letter') {
+        return outboxRow.last_error || 'Sync failed after maximum retries';
+    }
+
+    if (outboxRow.status === 'failed') {
+        return outboxRow.last_error || 'Last sync attempt failed';
+    }
+
+    return `Current status: ${outboxRow.status}`;
+}
 
 /**
  * Creates internal usage for disposed stock
@@ -168,6 +231,92 @@ router.post('/day-end-sync', auth, async (req, res) => {
             message: 'Failed to queue day-end sync',
             error: err.message
         });
+    }
+});
+
+router.get('/day-end-history', auth, async (req, res) => {
+    try {
+        const startDate = parseYmdDate(req.query.start);
+        const endDate = parseYmdDate(req.query.end);
+
+        if (!startDate || !endDate) {
+            return res.status(400).json({ message: 'Invalid date range. Use start and end in YYYY-MM-DD format.' });
+        }
+
+        if (startDate > endDate) {
+            return res.status(400).json({ message: 'Start date cannot be after end date.' });
+        }
+
+        if (!req.user?.store_id) {
+            return res.status(400).json({ message: 'Authenticated user is not assigned to a store.' });
+        }
+
+        const startOfRange = new Date(startDate);
+        const endOfRange = new Date(endDate);
+        endOfRange.setHours(23, 59, 59, 999);
+
+        const salesRows = await sale.findAll({
+            attributes: ['id', 'createdAt'],
+            where: {
+                createdAt: { [Op.between]: [startOfRange, endOfRange] },
+            },
+            include: [{
+                model: user,
+                as: 'cashier',
+                attributes: ['id', 'store_id'],
+                where: { store_id: req.user.store_id },
+                required: true,
+            }],
+            order: [['createdAt', 'ASC']],
+        });
+
+        const outboxRows = await sync_outbox.findAll({
+            attributes: ['id', 'aggregate_id', 'payload', 'status', 'last_error', 'sent_at', 'updated_at'],
+            where: {
+                store_id: req.user.store_id,
+                event_type: 'day_end.ready',
+                aggregate_id: {
+                    [Op.between]: [
+                        Number(formatYmdDate(startDate).replace(/-/g, '')),
+                        Number(formatYmdDate(endDate).replace(/-/g, '')),
+                    ],
+                },
+            },
+            order: [['updated_at', 'DESC'], ['id', 'DESC']],
+        });
+
+        const datesWithSales = new Set(
+            salesRows.map((row) => formatYmdDate(new Date(row.createdAt)))
+        );
+        const outboxByDate = new Map();
+
+        for (const row of outboxRows) {
+            const rowDate = row.payload?.date || formatAggregateIdDate(row.aggregate_id);
+            if (!rowDate || outboxByDate.has(rowDate)) {
+                continue;
+            }
+
+            outboxByDate.set(rowDate, row);
+        }
+
+        const historyDates = Array.from(new Set([
+            ...datesWithSales,
+            ...outboxByDate.keys(),
+        ])).sort((left, right) => right.localeCompare(left));
+
+        const history = historyDates.map((dateString) => {
+            const outboxRow = outboxByDate.get(dateString) || null;
+            return {
+                date: dateString,
+                completed: outboxRow?.status === 'sent',
+                message: buildDayEndHistoryMessage(outboxRow),
+            };
+        });
+
+        return res.json(history);
+    } catch (error) {
+        console.error('Day-end history error:', error);
+        return res.status(500).json({ message: 'Failed to load day-end history', error: error.message });
     }
 });
 // Zero out all stock (admin only)

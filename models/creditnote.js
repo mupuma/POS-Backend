@@ -114,6 +114,29 @@ module.exports = (sequelize) => {
             type: DataTypes.STRING(255),
             allowNull: true,
         },
+        // ZRA retry/offline fields
+        zra_status: {
+            type: DataTypes.ENUM('pending', 'sent', 'failed'),
+            allowNull: false,
+            defaultValue: 'pending',
+        },
+        zra_error: {
+            type: DataTypes.TEXT,
+            allowNull: true,
+        },
+        retry_count: {
+            type: DataTypes.INTEGER,
+            allowNull: false,
+            defaultValue: 0,
+        },
+        next_retry_at: {
+            type: DataTypes.DATE,
+            allowNull: true,
+        },
+        last_retry_at: {
+            type: DataTypes.DATE,
+            allowNull: true,
+        },
         reason: {
             type: DataTypes.STRING(255),
             allowNull: true,

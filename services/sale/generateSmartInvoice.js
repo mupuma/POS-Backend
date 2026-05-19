@@ -150,6 +150,13 @@ class ZRAIntegrationService {
     async transformToZRASalesData(saleData, items, user) {
         const currentDateTime = this.formatZRADateTime();
         const currentDate = this.formatZRADate();
+        const customerTpin = String(saleData.customer?.tpin || '').trim();
+        const customerName = String(
+            saleData.customer?.legal_name
+            || saleData.customer?.name
+            || saleData.customer?.full_name
+            || ''
+        ).trim();
 
         // Generate invoice number
         const cisInvoiceNo = await this.generateCISInvoiceNumber(user.store_id);
@@ -212,8 +219,8 @@ class ZRAIntegrationService {
             bhfId: process.env.ZRA_BHF_ID || "000",
             orgInvcNo: 0,
             cisInvcNo: cisInvoiceNo,
-            custTpin: "1000000000",
-            custNm: "Walk-in Customer",
+            custTpin: customerTpin || "1000000000",
+            custNm: customerName || "Walk-in Customer",
             salesTyCd: "N",
             rcptTyCd: "S",
             pmtTyCd: this.mapPaymentMethod(saleData.payment_method),

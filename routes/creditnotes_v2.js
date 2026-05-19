@@ -3,39 +3,9 @@ const { sale, creditnote, creditnoteitem, product, user, customer, store, produc
 const auth = require('../middleware/auth');
 const { Op, literal } = require('sequelize');
 
-const ZRAIntegrationService = require('../services/credit-note/generateSmartInvoiceCreditNote');
-const fs = require("fs");
-const path = require("path");
-const QRCode = require("qrcode");
-
 const router = express.Router();
 // In-memory lock set to prevent duplicate credit note processing for the same sale in concurrent requests
 const activeCreditNoteReturns = new Set();
-
-async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
-    try {
-        // Ensure the save directory exists
-        if (!fs.existsSync(saveDirectory)) {
-            fs.mkdirSync(saveDirectory, { recursive: true });
-        }
-
-        // Sanitize receiptNo for filename
-        const fileName = `qrcode_${receiptNo}.png`;
-        const filePath = path.resolve(saveDirectory, fileName);
-
-        // Generate QR code and save to file
-        await QRCode.toFile(filePath, qrcode_url, {
-            width: 150,
-            margin: 2,
-        });
-
-        console.log(`QR code saved to ${filePath}`);
-        return filePath;
-    } catch (err) {
-        console.error('Error generating QR code:', err);
-        throw err;
-    }
-}
 
 // Create credit note (return) - positive amounts; CRN prefix identifies CN
 router.post('/:saleId/return', auth, async (req, res) => {
@@ -162,43 +132,11 @@ router.post('/:saleId/return', auth, async (req, res) => {
             discount: null
         };
 
-        // ZRA (immediate)
-        const zraService = new ZRAIntegrationService();
-        const salesData = await zraService.transformToZRACreditNoteSalesData(
-            creditNoteData,
-            returnItems,
-            req.user,
-            reason_code || '03',
-             originalSale.receipt_no
-        );
-        const salesResponse = await zraService.sendCreditNoteSalesData(salesData);
-
-        if (!salesResponse.success) {
-            await t.rollback();
-            return res.status(500).json({
-                message: 'Failed to process credit note with ZRA system',
-                zra_errors: [salesResponse.error]
-            });
-        }
-
-        const saveSalesData = salesResponse.data.data;
-        if (!saveSalesData) {
-            await t.rollback();
-            return res.status(500).json({ message: 'No data received from ZRA credit note endpoint' });
-        }
-        let qrFilePath = null;
-        if (saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
-            try {
-                qrFilePath = await generateQrCode(
-                    saveSalesData.qrCodeUrl,
-                    saveSalesData.rcptNo,
-                    "./qrcodes"
-                );
-            } catch (qrError) {
-                console.error('QR Code generation failed:', qrError);
-                // Don't fail the entire transaction for QR code generation
-            }
-        }
+        const originalInvoiceReference =
+            originalSale.invoice_no ||
+            originalSale.receipt_no ||
+            originalSale.receipt_number ||
+            String(originalSale.id);
 
         // Persist Credit Note document (separate table)
         const cn = await creditnote.create({
@@ -215,15 +153,20 @@ router.post('/:saleId/return', auth, async (req, res) => {
             change_amount: 0,
              credit_note_date: new Date(),
             notes: `Credit Note for Sale #${originalSale.id} - ${reason || reason_label || 'Return'}`,
-            invnumber: (salesData && salesData.cisInvcNo) || saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber || null,
-            receipt_no: saveSalesData.rcptNo || null,
-            sdcid: saveSalesData.sdcId || null,
-            receiptsig: saveSalesData.rcptSign || null,
-            intrldata: saveSalesData.intrlData || null,
-            qrcode_url: saveSalesData.qrCodeUrl || null,
-            vsdcrcpdate: saveSalesData.vsdcRcptPbctDate || null,
-            invoice_no: (saveSalesData.sdcId && saveSalesData.rcptNo) ? `CRN${saveSalesData.sdcId.substring(3)}/${saveSalesData.rcptNo}` : null,
-            qrfilepath: qrFilePath,
+            invnumber: null,
+            receipt_no: null,
+            sdcid: null,
+            receiptsig: null,
+            intrldata: null,
+            qrcode_url: null,
+            vsdcrcpdate: null,
+            invoice_no: null,
+            qrfilepath: null,
+            zra_status: 'pending',
+            zra_error: null,
+            retry_count: 0,
+            next_retry_at: new Date(),
+            last_retry_at: null,
             original_sale_id: originalSale.id,
             reason: reason || reason_label || 'Return',
         }, { transaction: t });
@@ -246,25 +189,6 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
         await t.commit();
 
-        // Fire-and-forget: send ZRA stock items adjustment with SAR type for credit notes (sarTyCd = "03")
-        try {
-            const stockItemsData = zraService.transformToZRACreditNoteStockItemsData(creditNoteData, returnItems, req.user);
-            // Do not await; log outcome only
-            console.log(stockItemsData)
-            zraService.sendCreditNoteStockItemsData(stockItemsData)
-                .then(resp => {
-                    if (!resp.success) {
-                        console.error('ZRA Credit Note Stock Items failed:', resp.error);
-                    } else {
-
-                        console.log('ZRA Credit Note Stock Items sent successfully');
-                    }
-                })
-                .catch(err => console.error('ZRA Credit Note Stock Items error:', err?.message || err));
-        } catch (bgErr) {
-            console.error('Failed to initiate ZRA Credit Note stock items call:', bgErr?.message || bgErr);
-        }
-
         const fullCN = await creditnote.findByPk(cn.id, {
             include: [
                 { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
@@ -275,14 +199,14 @@ router.post('/:saleId/return', auth, async (req, res) => {
         });
 
         return res.status(201).json({
-            message: 'Credit note created successfully',
+            message: 'Credit note created and queued for ZRA processing',
             creditNote: fullCN,
             originalSale: {
                 id: originalSale.id,
                 receipt_number: originalSale.receipt_number,
                 total_amount: originalSale.total_amount
             },
-            zra_integration: { success: true }
+            zra_integration: { success: false, queued: true, status: 'pending' }
         });
 
         // Note: Sage integration will be handled separately at day-end (manual trigger)

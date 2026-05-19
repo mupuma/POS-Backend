@@ -72,18 +72,14 @@ class ZRACreditNoteIntegrationService {
                 throw new Error('Store not found');
             }
 
-            // Get the current credit note number, e.g., "CRN-1001-1"
-            const currentCreditNote = storeObj.credit_note_number || 'CRN-1001-0';
+            // Tolerate legacy or malformed store credit note numbers by falling back
+            // to a predictable prefix instead of failing the whole return flow.
+            const currentCreditNote = String(storeObj.credit_note_number || '').trim();
+            const fallbackPrefix = `CRN-${String(storeObj.store_number || store_id).replace(/\D/g, '') || store_id}-`;
+            const match = currentCreditNote.match(/^(CRN-?\d+-)(\d+)$/) || currentCreditNote.match(/^(.*?)(\d+)$/);
 
-            // Use regex to extract the prefix and the numeric part
-            const match = currentCreditNote.match(/^(CRN-?\d+-)(\d+)$/);
-
-            if (!match) {
-                throw new Error('Invalid credit note number format');
-            }
-
-            const prefix = match[1]; // "CRN-1001-"
-            const number = parseInt(match[2], 10); // 1
+            const prefix = match ? match[1] : fallbackPrefix;
+            const number = match ? parseInt(match[2], 10) : 0;
 
             // Increment the number
             const newNumber = number + 1;

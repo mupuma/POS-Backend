@@ -5,6 +5,7 @@ const { Op, sequelize, fn, col, literal } = require('sequelize');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
+const { annotateSalesWithReturnState } = require('../services/sales/returnState');
 
 const router = express.Router();
 
@@ -330,11 +331,15 @@ router.post('/', auth, async (req, res) => {
 
         // Create sync outbox entry
         const outboxPayload = {
+            branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
+            terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
             sale: {
                 id: newSale.id,
                 receipt_number: receiptNumber,
                 user_id: req.user.id,
                 store_id: req.user.store_id,
+                branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
+                terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
                 customer_id: customer_id || null,
                 discount_id: discount_id || null,
                 subtotal,
@@ -568,8 +573,10 @@ router.get('/', auth, async (req, res) => {
             include
         });
 
+        const sales = await annotateSalesWithReturnState(rows);
+
         res.json({
-            sales: rows,
+            sales,
             pagination: {
                 current_page: page,
                 total_pages: Math.ceil(count / limit),
@@ -688,16 +695,18 @@ router.get('/report/date-range', auth, async (req, res) => {
             order: [['sale_date', 'DESC']]
         });
 
+        const activeSales = (await annotateSalesWithReturnState(sales)).filter(s => !s.is_fully_returned);
+
         // Calculate summary
         const summary = {
-            total_sales: sales.length,
-            total_revenue: sales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
-            total_discounts: sales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
+            total_sales: activeSales.length,
+            total_revenue: activeSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            total_discounts: activeSales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
             payment_methods: {}
         };
 
         // Group by payment method (allocate by payments_breakdown when available)
-        sales.forEach(s => {
+        activeSales.forEach(s => {
             const bd = s.payments_breakdown;
             if (bd && typeof bd === 'object') {
                 Object.entries(bd).forEach(([method, amt]) => {
@@ -711,7 +720,7 @@ router.get('/report/date-range', auth, async (req, res) => {
         });
 
         res.json({
-            sales,
+            sales: activeSales,
             summary,
             date_range: {
                 start_date: start_date,
@@ -747,17 +756,19 @@ router.get('/report/daily', auth, async (req, res) => {
             include
         });
 
+        const activeTodaySales = (await annotateSalesWithReturnState(todaySales)).filter(s => !s.is_fully_returned);
+
         const summary = {
             date: startOfDay.toDateString(),
-            total_sales: todaySales.length,
-            total_revenue: todaySales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
-            total_discounts: todaySales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
-            cash_sales: todaySales.filter(s => s.payment_method === 'cash').length,
-            card_sales: todaySales.filter(s => s.payment_method === 'card').length,
-            mobile_sales: todaySales.filter(s => s.payment_method === 'mobile_money').length,
+            total_sales: activeTodaySales.length,
+            total_revenue: activeTodaySales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            total_discounts: activeTodaySales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
+            cash_sales: activeTodaySales.filter(s => s.payment_method === 'cash').length,
+            card_sales: activeTodaySales.filter(s => s.payment_method === 'card').length,
+            mobile_sales: activeTodaySales.filter(s => s.payment_method === 'mobile_money').length,
             payment_summary: (() => {
                 const totals = { cash: 0, card: 0, mobile_money: 0 };
-                todaySales.forEach(s => {
+                activeTodaySales.forEach(s => {
                     const bd = s.payments_breakdown;
                     if (bd && typeof bd === 'object') {
                         Object.entries(bd).forEach(([method, amt]) => {
@@ -854,9 +865,11 @@ router.get('/dashboard/stats/:period', auth, async (req, res) => {
             include
         });
 
+        const activePeriodSales = (await annotateSalesWithReturnState(periodSales)).filter(s => !s.is_fully_returned);
+
         // Calculate statistics for the period
-        const totalSales = periodSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-        const totalTransactions = periodSales.length;
+        const totalSales = activePeriodSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+        const totalTransactions = activePeriodSales.length;
         const averageTransaction = totalTransactions > 0 ? totalSales / totalTransactions : 0;
 
         // Payment method breakdown
@@ -866,7 +879,7 @@ router.get('/dashboard/stats/:period', auth, async (req, res) => {
             mobile_money: 0
         };
 
-        periodSales.forEach(s => {
+        activePeriodSales.forEach(s => {
             const bd = s.payments_breakdown;
             if (bd && typeof bd === 'object') {
                 Object.entries(bd).forEach(([method, amt]) => {

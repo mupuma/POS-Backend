@@ -2,6 +2,14 @@ const cron = require('node-cron');
 const axios = require('axios');
 const { Op } = require('sequelize');
 
+function resolveBranchId() {
+  return String(process.env.ZRA_BHF_ID || '000').trim() || '000';
+}
+
+function resolveTerminalId() {
+  return String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000';
+}
+
 class SyncOutboxJob {
   constructor(models) {
     this.models = models;
@@ -78,7 +86,26 @@ class SyncOutboxJob {
           user_id: row.user_id,
           receipt_number: row.receipt_number,
           idempotency_key: row.idempotency_key,
-          payload: row.payload
+          payload: {
+            ...row.payload,
+            branch_id: row.payload?.branch_id || resolveBranchId(),
+            terminal_id: row.payload?.terminal_id || resolveTerminalId(),
+            sale: {
+              ...(row.payload?.sale || {}),
+              branch_id: row.payload?.sale?.branch_id || row.payload?.branch_id || resolveBranchId(),
+              terminal_id: row.payload?.sale?.terminal_id || row.payload?.terminal_id || resolveTerminalId(),
+              zra_status: row.payload?.sale?.zra_status || null,
+              zra_error: row.payload?.sale?.zra_error || null,
+              receipt_printed: row.payload?.sale?.receipt_printed ?? null,
+              qrcode_url: row.payload?.sale?.qrcode_url || null,
+              qrfilepath: row.payload?.sale?.qrfilepath || null,
+              receipt_no: row.payload?.sale?.receipt_no || null,
+              sdcid: row.payload?.sale?.sdcid || null,
+              receiptsig: row.payload?.sale?.receiptsig || null,
+              intrldata: row.payload?.sale?.intrldata || null,
+              vsdcrcpdate: row.payload?.sale?.vsdcrcpdate || null,
+            },
+          }
         },
         {
           headers: {

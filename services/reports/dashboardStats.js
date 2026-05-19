@@ -1,5 +1,6 @@
 const { Op } = require('sequelize');
 const { sale, saleitem, product, user, customer, productinventory, category, creditnote, creditnoteitem, sequelize } = require('../../models');
+const { annotateSalesWithReturnState } = require('../sales/returnState');
 
 // Compute unified dashboard stats for a given request/user context
 async function computeDashboardStats(req) {
@@ -67,12 +68,44 @@ async function computeDashboardStats(req) {
     where: { sale_date: { [Op.between]: [startOfMonth, endOfToday] } },
     include: salesInclude
   });
-  const monthSalesTotal = monthSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+
+  const [todayAnnotated, weekAnnotated, monthAnnotated] = await Promise.all([
+    annotateSalesWithReturnState(todaysSales),
+    annotateSalesWithReturnState(weekSales),
+    annotateSalesWithReturnState(monthSales),
+  ]);
+
+  const activeTodaysSales = todayAnnotated.filter(s => !s.is_fully_returned);
+  const activeWeekSales = weekAnnotated.filter(s => !s.is_fully_returned);
+  const activeMonthSales = monthAnnotated.filter(s => !s.is_fully_returned);
+
+  const monthSalesWithItems = await sale.findAll({
+    where: { sale_date: { [Op.between]: [startOfMonth, endOfToday] } },
+    include: [
+      ...salesInclude,
+      {
+        model: saleitem,
+        as: 'items',
+        include: [{
+          model: product,
+          as: 'product',
+          attributes: ['id', 'name']
+        }]
+      }
+    ]
+  });
+  const monthItemsAnnotated = await annotateSalesWithReturnState(monthSalesWithItems);
+  const activeMonthSalesWithItems = monthItemsAnnotated.filter(s => !s.is_fully_returned);
+
+  const todaysSalesTotal = activeTodaysSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+  const todaysTransactions = activeTodaysSales.length;
+  const weekSalesTotal = activeWeekSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
+  const monthSalesTotal = activeMonthSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
 
   // Sales by payment type
-  const todaysSalesByPayment = aggregateByPayment(todaysSales);
-  const weekSalesByPayment = aggregateByPayment(weekSales);
-  const monthSalesByPayment = aggregateByPayment(monthSales);
+  const todaysSalesByPayment = aggregateByPayment(activeTodaysSales);
+  const weekSalesByPayment = aggregateByPayment(activeWeekSales);
+  const monthSalesByPayment = aggregateByPayment(activeMonthSales);
 
   // Inventory (per store)
   const totalProducts = await productinventory.count({
@@ -96,30 +129,27 @@ async function computeDashboardStats(req) {
   const totalCustomers = await customer.count();
   const activeUsers = await user.count({ where: { is_active: true, store_id: filterStoreId } });
 
-  // Top products
-  const topProductsRaw = await saleitem.findAll({
-    attributes: [
-      'product_id',
-      [sequelize.fn('SUM', sequelize.col('quantity')), 'total_quantity'],
-      [sequelize.fn('SUM', sequelize.col('total_price')), 'total_sales']
-    ],
-    include: [{ model: product, as: 'product', attributes: ['id', 'name'] }],
-    where: {
-      createdAt: { [Op.between]: [startOfMonth, endOfToday] }
-    },
-    group: ['product_id', 'product.id'],
-    order: [[sequelize.literal('total_quantity'), 'DESC']],
-    limit: 5,
-    raw: true,
-    nest: true
-  });
-
-  const topProducts = topProductsRaw.map(tp => ({
-    product_id: tp.product_id,
-    product_name: tp.product?.name || '',
-    total_quantity: parseFloat(tp.total_quantity || 0),
-    total_sales: parseFloat(tp.total_sales || 0)
-  }));
+  // Top products from active month sales only
+  const topProductMap = new Map();
+  for (const saleRow of activeMonthSalesWithItems) {
+    for (const item of saleRow.items || []) {
+      const productId = item.product_id;
+      const productName = item.product?.name || '';
+      const current = topProductMap.get(productId) || {
+        product_id: productId,
+        product_name: productName,
+        total_quantity: 0,
+        total_sales: 0,
+      };
+      current.product_name = current.product_name || productName;
+      current.total_quantity += Number(item.quantity || 0);
+      current.total_sales += Number(item.total_price || 0);
+      topProductMap.set(productId, current);
+    }
+  }
+  const topProducts = [...topProductMap.values()]
+    .sort((a, b) => b.total_quantity - a.total_quantity)
+    .slice(0, 5);
 
   // Recent sales (last 10)
   const recentSalesData = await sale.findAll({
@@ -132,7 +162,7 @@ async function computeDashboardStats(req) {
     limit: 10
   });
 
-  const recentSales = recentSalesData.map(s => ({
+  const recentSales = activeTodaysSales.slice(0, 10).map(s => ({
     receipt_number: s.receipt_number || s.id?.toString() || '-',
     time: s.sale_date?.toISOString() || '',
     timestamp: s.sale_date?.toISOString() || '',

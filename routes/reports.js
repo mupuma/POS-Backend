@@ -5,6 +5,28 @@ const router = express.Router();
 const { sale, saleitem, product, user, customer, category, productinventory, sequelize, creditnote, creditnoteitem } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
+const { annotateSalesWithReturnState, getReturnStateMap } = require('../services/sales/returnState');
+
+async function getActiveSalesRows(rows) {
+    const annotated = await annotateSalesWithReturnState(rows);
+    return {
+        annotated,
+        active: annotated.filter(row => !row.is_fully_returned)
+    };
+}
+
+async function getActiveSaleItemRows(rows) {
+    const saleRows = rows
+        .map(row => row.sale)
+        .filter(Boolean);
+    const returnStateMap = await getReturnStateMap(saleRows);
+    const activeSaleIds = new Set(
+        [...returnStateMap.entries()]
+            .filter(([, state]) => !state.is_fully_returned)
+            .map(([saleId]) => saleId)
+    );
+    return rows.filter(row => activeSaleIds.has(row.sale?.id));
+}
 
 // Dashboard Statistics (unified)
 router.get('/dashboard', auth, async (req, res) => {
@@ -68,19 +90,21 @@ router.get('/sales', auth, async (req, res) => {
             order: [['sale_date', 'DESC']]
         });
 
+        const activeSales = (await getActiveSalesRows(sales)).active;
+
         const summary = {
-            total_sales: sales.length,
-            total_revenue: sales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
-            total_discounts: sales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
-            total_tax: sales.reduce((sum, s) => sum + parseFloat(s.tax_amount || 0), 0),
-            items_count: sales.reduce((sum, s) => sum + (s.items ? s.items.length : 0), 0),
-            items_quantity: sales.reduce((sum, s) => sum + (s.items ? s.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0),
+            total_sales: activeSales.length,
+            total_revenue: activeSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            total_discounts: activeSales.reduce((sum, s) => sum + parseFloat(s.discount_amount || 0), 0),
+            total_tax: activeSales.reduce((sum, s) => sum + parseFloat(s.tax_amount || 0), 0),
+            items_count: activeSales.reduce((sum, s) => sum + (s.items ? s.items.length : 0), 0),
+            items_quantity: activeSales.reduce((sum, s) => sum + (s.items ? s.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0),
             payment_methods: {},
             daily_breakdown: {}
         };
 
         // Group by payment method (allocating mixed payments) and daily breakdown
-        sales.forEach(s => {
+        activeSales.forEach(s => {
             const date = s.sale_date.toDateString();
 
             // Allocate by payment breakdown if present
@@ -131,10 +155,10 @@ router.get('/sales', auth, async (req, res) => {
                 include: returnsInclude
             });
 
-            const grossSales = sales.reduce((sum, s) => sum + Number(s.subtotal || 0), 0);
-            const discounts = sales.reduce((sum, s) => sum + Number(s.discount_amount || 0), 0);
-            const tax = sales.reduce((sum, s) => sum + Number(s.tax_amount || 0), 0);
-            const salesTotalAmount = sales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+            const grossSales = activeSales.reduce((sum, s) => sum + Number(s.subtotal || 0), 0);
+            const discounts = activeSales.reduce((sum, s) => sum + Number(s.discount_amount || 0), 0);
+            const tax = activeSales.reduce((sum, s) => sum + Number(s.tax_amount || 0), 0);
+            const salesTotalAmount = activeSales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
             const returnsTotalAmount = returnsList.reduce((sum, r) => sum + Number(r.total_amount || 0), 0);
             const returnsTax = returnsList.reduce((sum, r) => sum + Number(r.tax_amount || 0), 0);
             const returnsDiscount = returnsList.reduce((sum, r) => sum + Number(r.discount_amount || 0), 0);
@@ -149,7 +173,7 @@ router.get('/sales', auth, async (req, res) => {
             };
 
             const paymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
-            sales.forEach(s => {
+            activeSales.forEach(s => {
                 const bd = s.payments_breakdown;
                 if (bd && typeof bd === 'object') {
                     Object.entries(bd).forEach(([method, amt]) => {
@@ -166,7 +190,7 @@ router.get('/sales', auth, async (req, res) => {
                 paymentBreakdown[key] = (paymentBreakdown[key] || 0) - Number(r.total_amount || 0);
             });
 
-            const itemsSold = sales.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
+            const itemsSold = activeSales.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
             const itemsReturned = returnsList.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
 
             // Category summary (net of returns)
@@ -179,7 +203,7 @@ router.get('/sales', auth, async (req, res) => {
                 categoryMap[key].items_quantity += qty;
                 categoryMap[key].revenue += amount;
             };
-            sales.forEach(saleRow => {
+            activeSales.forEach(saleRow => {
                 (saleRow.items || []).forEach(i => {
                     const cat = i.product && i.product.category;
                     addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), Number(i.total_price || 0));
@@ -198,7 +222,7 @@ router.get('/sales', auth, async (req, res) => {
                 store_id: req.user && req.user.store_id ? req.user.store_id : null,
                 cashier: req.user && req.user.full_name ? { id: req.user.id, name: req.user.full_name } : undefined,
                 counts: {
-                    transactions: sales.length,
+                    transactions: activeSales.length,
                     returns: returnsList.length,
                     items_sold: itemsSold,
                     items_returned: itemsReturned
@@ -223,7 +247,7 @@ router.get('/sales', auth, async (req, res) => {
         res.json({
             report_type,
             date_range: { start_date, end_date },
-            sales,
+            sales: activeSales,
             summary
         });
 
@@ -273,10 +297,12 @@ router.get('/transaction-list', auth, async (req, res) => {
             order: [['sale_date', 'DESC']]
         });
 
+        const activeSales = (await getActiveSalesRows(sales)).active;
+
         // Group items across all sales
         const itemMap = {};
 
-        sales.forEach(s => {
+        activeSales.forEach(s => {
             (s.items || []).forEach(item => {
                 const productId = item.product_id;
                 const productName = item.product?.name || 'Unknown Product';
@@ -304,7 +330,7 @@ router.get('/transaction-list', auth, async (req, res) => {
 
         const summary = {
             period,
-            total_transactions: sales.length,
+            total_transactions: activeSales.length,
             total_items_sold: itemsSummary.reduce((sum, item) => sum + item.total_quantity, 0),
             total_revenue: itemsSummary.reduce((sum, item) => sum + item.total_amount, 0),
             unique_products: itemsSummary.length
@@ -342,7 +368,7 @@ router.get('/products', auth, async (req, res) => {
             includeWhere['$product.category_id$'] = category_id;
         }
 
-        const productSales = await saleitem.findAll({
+        const productSalesRows = await saleitem.findAll({
             where: includeWhere,
             include: [
                 {
@@ -351,17 +377,28 @@ router.get('/products', auth, async (req, res) => {
                     include: [{ model: category, as: 'category' }]
                 },
                 { model: sale, as: 'sale' }
-            ],
-            attributes: [
-                'product_id',
-                [sequelize.fn('SUM', sequelize.col('quantity')), 'total_quantity'],
-                [sequelize.fn('SUM', sequelize.col('total_price')), 'total_revenue'],
-                [sequelize.fn('COUNT', sequelize.col('id')), 'transaction_count']
-            ],
-            group: ['product_id', 'product.id'],
-            order: [[sequelize.fn('SUM', sequelize.col('total_price')), 'DESC']],
-            limit: parseInt(limit)
+            ]
         });
+
+        const activeProductSalesRows = await getActiveSaleItemRows(productSalesRows);
+        const productMap = new Map();
+
+        activeProductSalesRows.forEach(row => {
+            const current = productMap.get(row.product_id) || {
+                product_id: row.product_id,
+                product_name: row.product?.name || 'Unknown Product',
+                product_class_code: row.product?.product_class_code || '',
+                total_quantity: 0,
+                total_revenue: 0,
+                transaction_count: 0,
+            };
+            current.total_quantity += Number(row.quantity || 0);
+            current.total_revenue += Number(row.total_price || 0);
+            current.transaction_count += 1;
+            productMap.set(row.product_id, current);
+        });
+
+        const productSales = [...productMap.values()].sort((a, b) => b.total_revenue - a.total_revenue).slice(0, parseInt(limit));
 
         res.json({
             date_range: { start_date, end_date },
@@ -446,19 +483,28 @@ router.get('/user-activity', auth, async (req, res) => {
 
         const userSales = await sale.findAll({
             where: whereClause,
-            include: [{ model: user, as: 'cashier', attributes: ['id', 'full_name', 'role'] }],
-            attributes: [
-                'user_id',
-                [sequelize.fn('COUNT', sequelize.col('id')), 'total_sales'],
-                [sequelize.fn('SUM', sequelize.col('total_amount')), 'total_revenue']
-            ],
-            group: ['user_id', 'cashier.id'],
-            order: [[sequelize.fn('COUNT', sequelize.col('id')), 'DESC']]
+            include: [{ model: user, as: 'cashier', attributes: ['id', 'full_name', 'role'] }]
+        });
+
+        const activeUserSales = (await getActiveSalesRows(userSales)).active;
+        const userActivityMap = new Map();
+
+        activeUserSales.forEach(s => {
+            const key = s.user_id;
+            const current = userActivityMap.get(key) || {
+                user_id: key,
+                cashier: s.cashier || null,
+                total_sales: 0,
+                total_revenue: 0,
+            };
+            current.total_sales += 1;
+            current.total_revenue += Number(s.total_amount || 0);
+            userActivityMap.set(key, current);
         });
 
         res.json({
             date_range: { start_date, end_date },
-            user_activity: userSales
+            user_activity: [...userActivityMap.values()].sort((a, b) => b.total_sales - a.total_sales)
         });
 
     } catch (error) {
@@ -479,7 +525,7 @@ router.get('/categories', auth, async (req, res) => {
         const startDate = new Date(start_date);
         const endDate = new Date(end_date);
 
-        const categorySales = await saleitem.findAll({
+        const categorySalesRows = await saleitem.findAll({
             where: {
                 '$sale.sale_date$': { [Op.between]: [startDate, endDate] }
             },
@@ -490,17 +536,29 @@ router.get('/categories', auth, async (req, res) => {
                     include: [{ model: category, as: 'category' }]
                 },
                 { model: sale, as: 'sale' }
-            ],
-            attributes: [
-                [sequelize.col('product.category.id'), 'category_id'],
-                [sequelize.col('product.category.name'), 'category_name'],
-                [sequelize.fn('SUM', sequelize.col('quantity')), 'total_quantity'],
-                [sequelize.fn('SUM', sequelize.col('total_price')), 'total_revenue'],
-                [sequelize.fn('COUNT', sequelize.col('saleitem.id')), 'transaction_count']
-            ],
-            group: ['product.category.id'],
-            order: [[sequelize.fn('SUM', sequelize.col('total_price')), 'DESC']]
+            ]
         });
+
+        const activeCategorySalesRows = await getActiveSaleItemRows(categorySalesRows);
+        const categoryMap = new Map();
+
+        activeCategorySalesRows.forEach(row => {
+            const cat = row.product && row.product.category;
+            const key = cat ? cat.id : 'uncategorized';
+            const current = categoryMap.get(key) || {
+                category_id: cat ? cat.id : null,
+                category_name: cat ? cat.name : 'Uncategorized',
+                total_quantity: 0,
+                total_revenue: 0,
+                transaction_count: 0,
+            };
+            current.total_quantity += Number(row.quantity || 0);
+            current.total_revenue += Number(row.total_price || 0);
+            current.transaction_count += 1;
+            categoryMap.set(key, current);
+        });
+
+        const categorySales = [...categoryMap.values()].sort((a, b) => b.total_revenue - a.total_revenue);
 
         res.json({
             date_range: { start_date, end_date },
@@ -525,35 +583,43 @@ router.get('/tax', auth, async (req, res) => {
         const startDate = new Date(start_date);
         const endDate = new Date(end_date);
 
-        const taxData = await sale.findAll({
+        const taxSales = await sale.findAll({
             where: {
                 sale_date: { [Op.between]: [startDate, endDate] }
-            },
-            attributes: [
-                [sequelize.fn('SUM', sequelize.col('subtotal')), 'total_subtotal'],
-                [sequelize.fn('SUM', sequelize.col('tax_amount')), 'total_tax'],
-                [sequelize.fn('SUM', sequelize.col('total_amount')), 'total_with_tax'],
-                [sequelize.fn('COUNT', sequelize.col('id')), 'total_transactions']
-            ]
+            }
+        });
+        const activeTaxSales = (await getActiveSalesRows(taxSales)).active;
+
+        const taxSummary = activeTaxSales.reduce((acc, saleRow) => {
+            acc.total_subtotal += Number(saleRow.subtotal || 0);
+            acc.total_tax += Number(saleRow.tax_amount || 0);
+            acc.total_with_tax += Number(saleRow.total_amount || 0);
+            acc.total_transactions += 1;
+            return acc;
+        }, {
+            total_subtotal: 0,
+            total_tax: 0,
+            total_with_tax: 0,
+            total_transactions: 0,
         });
 
-        const dailyTax = await sale.findAll({
-            where: {
-                sale_date: { [Op.between]: [startDate, endDate] }
-            },
-            attributes: [
-                [sequelize.fn('DATE', sequelize.col('sale_date')), 'date'],
-                [sequelize.fn('SUM', sequelize.col('tax_amount')), 'daily_tax'],
-                [sequelize.fn('COUNT', sequelize.col('id')), 'daily_transactions']
-            ],
-            group: [sequelize.fn('DATE', sequelize.col('sale_date'))],
-            order: [[sequelize.fn('DATE', sequelize.col('sale_date')), 'ASC']]
+        const dailyMap = new Map();
+        activeTaxSales.forEach(saleRow => {
+            const key = saleRow.sale_date ? new Date(saleRow.sale_date).toISOString().slice(0, 10) : 'unknown';
+            const current = dailyMap.get(key) || {
+                date: key,
+                daily_tax: 0,
+                daily_transactions: 0,
+            };
+            current.daily_tax += Number(saleRow.tax_amount || 0);
+            current.daily_transactions += 1;
+            dailyMap.set(key, current);
         });
 
         res.json({
             date_range: { start_date, end_date },
-            summary: taxData[0],
-            daily_breakdown: dailyTax
+            summary: taxSummary,
+            daily_breakdown: [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date))
         });
 
     } catch (error) {

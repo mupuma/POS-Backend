@@ -3,8 +3,13 @@ const bcrypt = require('bcryptjs');
 const { user, sale } = require('../models');
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
+const { buildActorFromUser, buildTargetFromUser, logRequestAudit } = require('../services/auditLogService');
 
 const router = express.Router();
+
+function getModels(req) {
+  return req.app.locals.models || require('../models');
+}
 
 // Get all users (admin only)
 router.get('/', auth, async (req, res) => {
@@ -92,16 +97,33 @@ router.get('/:id', auth, async (req, res) => {
 // Update user (admin only or own profile for limited fields)
 router.put('/:id', auth, async (req, res) => {
   try {
+    const models = getModels(req);
     const requestedUserId = parseInt(req.params.id);
     const isAdmin = req.user.role === 'admin';
     const isOwnProfile = req.user.id === requestedUserId;
 
     if (!isAdmin && !isOwnProfile) {
+      await logRequestAudit(models, req, {
+        action: 'user.update',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: requestedUserId,
+        details: { reason: 'Access denied' },
+      });
       return res.status(403).json({ message: 'Access denied' });
     }
 
     const userData = await user.findByPk(requestedUserId);
     if (!userData) {
+      await logRequestAudit(models, req, {
+        action: 'user.update',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: requestedUserId,
+        details: { reason: 'User not found' },
+      });
       return res.status(404).json({ message: 'User not found' });
     }
 
@@ -116,6 +138,14 @@ router.put('/:id', auth, async (req, res) => {
         }
       });
       if (existingUser) {
+        await logRequestAudit(models, req, {
+          action: 'user.update',
+          outcome: 'failure',
+          entityType: 'user',
+          ...buildActorFromUser(req.user),
+          ...buildTargetFromUser(userData),
+          details: { reason: 'Username already exists', requestedUsername: username },
+        });
         return res.status(400).json({ message: 'Username already exists' });
       }
     }
@@ -142,6 +172,15 @@ router.put('/:id', auth, async (req, res) => {
       attributes: { exclude: ['password_hash'] }
     });
 
+    await logRequestAudit(models, req, {
+      action: isOwnProfile && !isAdmin ? 'user.update_profile' : 'user.update',
+      outcome: 'success',
+      entityType: 'user',
+      ...buildActorFromUser(req.user),
+      ...buildTargetFromUser(updatedUser),
+      details: { updatedFields: Object.keys(updateData) },
+    });
+
     res.json({
       message: 'User updated successfully',
       user: updatedUser
@@ -156,23 +195,56 @@ router.put('/:id', auth, async (req, res) => {
 // Reset user password (admin only)
 router.patch('/:id/reset-password', auth, async (req, res) => {
   try {
+    const models = getModels(req);
     // Check if user is admin
     if (req.user.role !== 'admin') {
+      await logRequestAudit(models, req, {
+        action: 'user.reset_password',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'Only admins can reset passwords' },
+      });
       return res.status(403).json({ message: 'Only admins can reset passwords' });
     }
 
     const { new_password } = req.body;
 
     if (!new_password) {
+      await logRequestAudit(models, req, {
+        action: 'user.reset_password',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'New password is required' },
+      });
       return res.status(400).json({ message: 'New password is required' });
     }
 
     if (new_password.length < 6) {
+      await logRequestAudit(models, req, {
+        action: 'user.reset_password',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'Password must be at least 6 characters long' },
+      });
       return res.status(400).json({ message: 'Password must be at least 6 characters long' });
     }
 
     const userData = await user.findByPk(req.params.id);
     if (!userData) {
+      await logRequestAudit(models, req, {
+        action: 'user.reset_password',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'User not found' },
+      });
       return res.status(404).json({ message: 'User not found' });
     }
 
@@ -185,6 +257,14 @@ router.patch('/:id/reset-password', auth, async (req, res) => {
         { where: { id: req.params.id } }
     );
 
+    await logRequestAudit(models, req, {
+      action: 'user.reset_password',
+      outcome: 'success',
+      entityType: 'user',
+      ...buildActorFromUser(req.user),
+      ...buildTargetFromUser(userData),
+    });
+
     res.json({ message: 'Password reset successfully' });
 
   } catch (error) {
@@ -196,18 +276,43 @@ router.patch('/:id/reset-password', auth, async (req, res) => {
 // Toggle user active status (admin only)
 router.patch('/:id/toggle-status', auth, async (req, res) => {
   try {
+    const models = getModels(req);
     // Check if user is admin
     if (req.user.role !== 'admin') {
+      await logRequestAudit(models, req, {
+        action: 'user.toggle_status',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'Only admins can change user status' },
+      });
       return res.status(403).json({ message: 'Only admins can change user status' });
     }
 
     const userData = await user.findByPk(req.params.id);
     if (!userData) {
+      await logRequestAudit(models, req, {
+        action: 'user.toggle_status',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'User not found' },
+      });
       return res.status(404).json({ message: 'User not found' });
     }
 
     // Don't allow admin to deactivate themselves
     if (req.user.id === parseInt(req.params.id)) {
+      await logRequestAudit(models, req, {
+        action: 'user.toggle_status',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        ...buildTargetFromUser(userData),
+        details: { reason: 'You cannot deactivate your own account' },
+      });
       return res.status(400).json({ message: 'You cannot deactivate your own account' });
     }
 
@@ -217,6 +322,15 @@ router.patch('/:id/toggle-status', auth, async (req, res) => {
         { is_active: newStatus },
         { where: { id: req.params.id } }
     );
+
+    await logRequestAudit(models, req, {
+      action: 'user.toggle_status',
+      outcome: 'success',
+      entityType: 'user',
+      ...buildActorFromUser(req.user),
+      ...buildTargetFromUser(userData),
+      details: { is_active: newStatus },
+    });
 
     res.json({
       message: `User ${newStatus ? 'activated' : 'deactivated'} successfully`,
@@ -368,18 +482,43 @@ router.get('/reports/all-performance', auth, async (req, res) => {
 // Delete user (admin only - soft delete)
 router.delete('/:id', auth, async (req, res) => {
   try {
+    const models = getModels(req);
     // Check if user is admin
     if (req.user.role !== 'admin') {
+      await logRequestAudit(models, req, {
+        action: 'user.delete',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'Only admins can delete users' },
+      });
       return res.status(403).json({ message: 'Only admins can delete users' });
     }
 
     const userData = await user.findByPk(req.params.id);
     if (!userData) {
+      await logRequestAudit(models, req, {
+        action: 'user.delete',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        target_user_id: parseInt(req.params.id),
+        details: { reason: 'User not found' },
+      });
       return res.status(404).json({ message: 'User not found' });
     }
 
     // Don't allow admin to delete themselves
     if (req.user.id === parseInt(req.params.id)) {
+      await logRequestAudit(models, req, {
+        action: 'user.delete',
+        outcome: 'failure',
+        entityType: 'user',
+        ...buildActorFromUser(req.user),
+        ...buildTargetFromUser(userData),
+        details: { reason: 'You cannot delete your own account' },
+      });
       return res.status(400).json({ message: 'You cannot delete your own account' });
     }
 
@@ -387,6 +526,15 @@ router.delete('/:id', auth, async (req, res) => {
         { is_active: false },
         { where: { id: req.params.id } }
     );
+
+    await logRequestAudit(models, req, {
+      action: 'user.delete',
+      outcome: 'success',
+      entityType: 'user',
+      ...buildActorFromUser(req.user),
+      ...buildTargetFromUser(userData),
+      details: { softDeleted: true },
+    });
 
     res.json({ message: 'User deleted successfully' });
 
