@@ -137,6 +137,28 @@ module.exports = (sequelize) => {
             type: DataTypes.DATE,
             allowNull: true,
         },
+        // Sage return fields
+        sage_status: {
+            type: DataTypes.ENUM('pending', 'sent', 'failed'),
+            allowNull: false,
+            defaultValue: 'pending',
+        },
+        sage_error: {
+            type: DataTypes.TEXT,
+            allowNull: true,
+        },
+        sage_document_number: {
+            type: DataTypes.STRING(100),
+            allowNull: true,
+        },
+        sage_document_uniquifier: {
+            type: DataTypes.STRING(100),
+            allowNull: true,
+        },
+        sage_reference: {
+            type: DataTypes.STRING(255),
+            allowNull: true,
+        },
         reason: {
             type: DataTypes.STRING(255),
             allowNull: true,

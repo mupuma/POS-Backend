@@ -6,8 +6,8 @@ class CustomerDirectoryService {
     this.customerModel = models.customer;
     this.syncServerUrl = String(process.env.SYNC_SERVER_URL || '').replace(/\/$/, '');
     this.syncServerToken = process.env.SYNC_SERVER_TOKEN || '';
-    this.zraBaseUrl = String(process.env.ZRA_BASE_URL || '').replace(/\/$/, '');
-    this.zraLookupPath = String(process.env.ZRA_CUSTOMER_LOOKUP_PATH || '').trim();
+    this.zraBaseUrl = String(process.env.ZRA_BASE_URL || 'http://localhost:8082/sandboxvsdc').replace(/\/$/, '');
+    this.zraLookupPath = String(process.env.ZRA_CUSTOMER_LOOKUP_PATH || 'https://portal.zra.org.zm/retrieveTaxpayersSearch').trim();
     this.zraLookupMethod = String(process.env.ZRA_CUSTOMER_LOOKUP_METHOD || 'POST').toUpperCase();
   }
 
@@ -170,7 +170,11 @@ class CustomerDirectoryService {
         return null;
       }
 
-      throw error;
+      console.warn(
+        'Central customer lookup unavailable, falling back to ZRA:',
+        error.response?.data?.message || error.message,
+      );
+      return null;
     }
   }
 
@@ -245,7 +249,8 @@ class CustomerDirectoryService {
       throw new Error('A valid TPIN is required');
     }
 
-    if (!this.zraBaseUrl || !this.zraLookupPath) {
+    const requestUrl = this.buildZraLookupUrl();
+    if (!requestUrl) {
       await customerRecord.update({
         lookup_status: 'failed',
         lookup_error: 'ZRA customer lookup is not configured',
@@ -256,15 +261,24 @@ class CustomerDirectoryService {
     }
 
     try {
-      const requestUrl = this.buildZraLookupUrl();
       const payload = this.buildZraLookupForm(normalizedTpin);
-      const response = await axios.post(requestUrl, payload.toString(), {
+      const requestConfig = {
+        url: requestUrl,
+        method: this.zraLookupMethod,
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           Accept: 'application/json, text/plain, */*',
         },
         timeout: 20000,
-      });
+      };
+
+      if (this.zraLookupMethod === 'GET') {
+        requestConfig.params = Object.fromEntries(payload.entries());
+      } else {
+        requestConfig.data = payload.toString();
+      }
+
+      const response = await axios(requestConfig);
 
       const customerData = this.extractZraCustomer(response.data, normalizedTpin);
       if (!customerData) {

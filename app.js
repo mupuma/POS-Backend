@@ -5,6 +5,11 @@ const {join} = require("node:path");
 
 
 const app = express();
+app.locals.startupState = {
+    ready: false,
+    stage: 'booting',
+    error: null,
+};
 
 // Middleware
 app.use(helmet());
@@ -13,6 +18,24 @@ app.use(express.json());
 
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
+});
+
+app.get('/api/startup-ready', (req, res) => {
+    const startupState = req.app.locals.startupState || { ready: false, stage: 'booting', error: null };
+    if (startupState.ready) {
+        return res.status(200).json({
+            success: true,
+            ready: true,
+            stage: startupState.stage,
+        });
+    }
+
+    return res.status(503).json({
+        success: false,
+        ready: false,
+        stage: startupState.stage,
+        error: startupState.error,
+    });
 });
 
 // Routes

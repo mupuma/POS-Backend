@@ -53,15 +53,12 @@ async function computeDashboardStats(req) {
     order: [['sale_date', 'DESC']],
     limit: 10
   });
-  const todaysSalesTotal = todaysSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
-  const todaysTransactions = todaysSales.length;
 
   // Week
   const weekSales = await sale.findAll({
     where: { sale_date: { [Op.between]: [startOfWeek, endOfToday] } },
     include: salesInclude
   });
-  const weekSalesTotal = weekSales.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0);
 
   // Month
   const monthSales = await sale.findAll({

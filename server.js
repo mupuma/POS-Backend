@@ -16,6 +16,14 @@ const SyncOutboxJob = require("./jobs/syncOutboxJob");
 const syncOutboxJob = new SyncOutboxJob(models);
 const customerKycJob = new CustomerKycJob(models);
 
+function setStartupState(stage, { ready = false, error = null } = {}) {
+  app.locals.startupState = {
+    ready,
+    stage,
+    error,
+  };
+}
+
 async function ensureCustomerSchema() {
   const queryInterface = models.sequelize.getQueryInterface();
   let table;
@@ -63,6 +71,11 @@ async function ensureCreditNoteSchema() {
     ['retry_count', { type: models.Sequelize.INTEGER, allowNull: false, defaultValue: 0 }],
     ['next_retry_at', { type: models.Sequelize.DATE, allowNull: true }],
     ['last_retry_at', { type: models.Sequelize.DATE, allowNull: true }],
+    ['sage_status', { type: models.Sequelize.ENUM('pending', 'sent', 'failed'), allowNull: false, defaultValue: 'pending' }],
+    ['sage_error', { type: models.Sequelize.TEXT, allowNull: true }],
+    ['sage_document_number', { type: models.Sequelize.STRING(100), allowNull: true }],
+    ['sage_document_uniquifier', { type: models.Sequelize.STRING(100), allowNull: true }],
+    ['sage_reference', { type: models.Sequelize.STRING(255), allowNull: true }],
   ];
 
   for (const [columnName, definition] of missingColumns) {
@@ -120,20 +133,28 @@ if (process.versions.nexe) {
   });
 }
 // Sync database and start server
+setStartupState('database_connecting');
 db.sequelize.authenticate()
   .then(() => {
+    setStartupState('ensuring_schema');
     return ensureCustomerSchema()
       .then(() => ensureCreditNoteSchema());
   })
-  .then(() => db.sequelize.sync())
   .then(() => {
+    setStartupState('database_syncing');
+    return db.sequelize.sync();
+  })
+  .then(() => {
+    setStartupState('starting_server');
     console.log('Database connected');
     server.listen(PORT, "127.0.0.1", () => {
   //  server.listen(PORT,  () => {
+      setStartupState('ready', { ready: true });
       console.log(`Server running on port ${PORT}`);
       console.log(`WebSocket server available at ws://localhost:${PORT}/ws/notifications`);
     });
   })
   .catch(err => {
+    setStartupState('failed', { error: err?.message || String(err) });
     console.error('Database connection failed:', err);
   });

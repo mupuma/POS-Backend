@@ -1,11 +1,16 @@
 const express = require('express');
-const { sale, creditnote, creditnoteitem, product, user, customer, store, productinventory } = require('../models');
+const { sale, creditnote, creditnoteitem, product, user, customer, store, productinventory, sync_outbox } = require('../models');
 const auth = require('../middleware/auth');
 const { Op, literal } = require('sequelize');
+const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
 
 const router = express.Router();
 // In-memory lock set to prevent duplicate credit note processing for the same sale in concurrent requests
 const activeCreditNoteReturns = new Set();
+
+function getModels(req) {
+    return req.app.locals.models || require('../models');
+}
 
 // Create credit note (return) - positive amounts; CRN prefix identifies CN
 router.post('/:saleId/return', auth, async (req, res) => {
@@ -187,7 +192,84 @@ router.post('/:saleId/return', auth, async (req, res) => {
             );
         }
 
+        const storeRecord = await store.findByPk(req.user.store_id, { transaction: t });
+        const creditNoteReference = cn.receipt_number;
+        const outboxPayload = {
+            branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
+            terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
+            store: storeRecord ? {
+                id: storeRecord.id,
+                store_number: storeRecord.store_number,
+                store_location: storeRecord.store_location,
+                store_customer_number: storeRecord.store_customer_number,
+                store_rev_account: storeRecord.store_rev_account,
+                store_tax_group: storeRecord.store_tax_group,
+                currency: storeRecord.currency,
+                price_list_code: storeRecord.price_list_code,
+                terms_code: storeRecord.terms_code,
+            } : null,
+            original_sale: {
+                id: originalSale.id,
+                receipt_number: originalSale.receipt_number,
+                invoice_no: originalSale.invoice_no || null,
+                receipt_no: originalSale.receipt_no || null,
+                total_amount: Number(originalSale.total_amount || 0),
+                customer: originalSale.customer || null,
+            },
+            credit_note: {
+                id: cn.id,
+                receipt_number: cn.receipt_number,
+                original_sale_id: originalSale.id,
+                subtotal: Number(subtotal),
+                discount_amount: Number(discount_amount),
+                tax_amount: Number(tax_amount),
+                total_amount: Number(total_amount),
+                payment_method: originalSale.payment_method,
+                amount_paid: Number(total_amount),
+                change_amount: 0,
+                credit_note_date: new Date().toISOString(),
+                notes: cn.notes,
+                reason: reason || reason_label || 'Return',
+                currency: storeRecord?.currency || 'ZMW',
+                reference: creditNoteReference,
+            },
+            items: returnItems.map((item) => ({
+                product_id: item.product_id,
+                quantity: Number(item.quantity),
+                unit_price: Number(item.unit_price),
+                total_price: Number(item.total_price),
+                tax_exclusive_total: Number(item.tax_exclusive_total),
+                product: {
+                    id: item.product?.id,
+                    name: item.product?.name,
+                    product_code: item.product?.product_code,
+                    formatted_product_code: item.product?.formatted_product_code || null,
+                    price: Number(item.product?.price || 0),
+                }
+            })),
+        };
+
+        const outboxEntry = await sync_outbox.create({
+            event_type: 'credit_note.created',
+            aggregate_type: 'credit_note',
+            aggregate_id: cn.id,
+            store_id: req.user.store_id,
+            user_id: req.user.id,
+            receipt_number: cn.receipt_number,
+            idempotency_key: `credit_note.created:store-${req.user.store_id}:credit-note-${cn.id}:sale-${originalSale.id}`,
+            payload: outboxPayload,
+            status: 'pending',
+            attempt_count: 0,
+            next_retry_at: new Date()
+        }, { transaction: t });
+
         await t.commit();
+
+        if (req.app.locals.syncOutboxJob && typeof req.app.locals.syncOutboxJob.run === 'function') {
+            req.app.locals.syncOutboxJob.run().catch((error) => {
+                console.error('Failed to trigger sync outbox job after credit-note queue:', error.message);
+            });
+        }
 
         const fullCN = await creditnote.findByPk(cn.id, {
             include: [
@@ -198,21 +280,52 @@ router.post('/:saleId/return', auth, async (req, res) => {
             ]
         });
 
+        await logRequestAudit(getModels(req), req, {
+            action: 'credit_note.create',
+            outcome: 'success',
+            entityType: 'credit_note',
+            ...buildActorFromUser(req.user),
+            target_identifier: fullCN.receipt_number,
+            target_name: fullCN.receipt_number,
+            details: {
+                creditNoteId: fullCN.id,
+                originalSaleId: originalSale.id,
+                itemCount: returnItems.length,
+                totalAmount: Number(total_amount),
+                outboxId: outboxEntry.id,
+            },
+        });
+
         return res.status(201).json({
-            message: 'Credit note created and queued for ZRA processing',
+            message: 'Credit note created and queued for ZRA processing and Sage persistence',
             creditNote: fullCN,
             originalSale: {
                 id: originalSale.id,
                 receipt_number: originalSale.receipt_number,
                 total_amount: originalSale.total_amount
             },
-            zra_integration: { success: false, queued: true, status: 'pending' }
+            zra_integration: { success: false, queued: true, status: 'pending' },
+            sage_integration: {
+                queued: true,
+                status: 'pending',
+                outboxId: outboxEntry.id,
+                reference: creditNoteReference,
+            },
         });
-
-        // Note: Sage integration will be handled separately at day-end (manual trigger)
 
     } catch (error) {
         console.error('Credit note transaction failed:', error);
+    await logRequestAudit(getModels(req), req, {
+        action: 'credit_note.create',
+        outcome: 'failure',
+        entityType: 'credit_note',
+        ...buildActorFromUser(req.user),
+        target_identifier: req.params.saleId,
+        details: {
+            saleId: Number(req.params.saleId),
+            message: error.message,
+        },
+    });
   if (t) {
     try { await t.rollback(); } catch (rbErr) { console.error('Rollback failed:', rbErr); }
   }

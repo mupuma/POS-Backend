@@ -2,15 +2,23 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 
-const router = require("./auth");
+const router = express.Router();
+
+function resolveQrCodePath(filename) {
+  const candidates = [
+    path.join(process.cwd(), 'qrcodes', filename),
+    path.join(path.dirname(process.execPath), 'qrcodes', filename),
+    path.join(__dirname, '..', 'qrcodes', filename),
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
 
 // Route to serve QR code files
 router.get('/:filename', (req, res) => {
-  console.log(req.params);
-    const filename = req.params.filename;
-   const qrCodePath = path.join(__dirname, '..', 'qrcodes', filename);
+  const filename = req.params.filename;
+  const qrCodePath = resolveQrCodePath(filename);
 
-  console.log(qrCodePath)
   // Check if file exists
   if (fs.existsSync(qrCodePath)) {
     // Set appropriate headers

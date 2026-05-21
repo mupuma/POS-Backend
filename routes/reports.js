@@ -6,6 +6,80 @@ const { sale, saleitem, product, user, customer, category, productinventory, seq
 const auth = require('../middleware/auth');
 const { Op } = require('sequelize');
 const { annotateSalesWithReturnState, getReturnStateMap } = require('../services/sales/returnState');
+const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
+
+function getModels(req) {
+    return req.app.locals.models || require('../models');
+}
+
+function getReportAuditContext(req) {
+    const exportMatch = req.path.match(/^\/([^/]+)\/export$/);
+    if (req.method === 'GET' && exportMatch) {
+        return { action: 'report.export', operation: 'export', reportType: exportMatch[1] };
+    }
+
+    const emailMatch = req.path.match(/^\/([^/]+)\/email$/);
+    if (req.method === 'POST' && emailMatch) {
+        return { action: 'report.email', operation: 'email', reportType: emailMatch[1] };
+    }
+
+    const reportTypeByPath = {
+        '/sales': 'sales',
+        '/transaction-list': 'transaction-list',
+        '/products': 'products',
+        '/inventory': 'inventory',
+        '/user-activity': 'user-activity',
+        '/categories': 'categories',
+        '/tax': 'tax',
+        '/returns': 'returns',
+        '/transactions': 'transactions',
+    };
+
+    const reportType = reportTypeByPath[req.path];
+    if (!reportType) {
+        return null;
+    }
+
+    return { action: 'report.generate', operation: 'generate', reportType };
+}
+
+router.use((req, res, next) => {
+    const auditContext = getReportAuditContext(req);
+
+    if (!auditContext) {
+        next();
+        return;
+    }
+
+    res.on('finish', () => {
+        if (!req.user) {
+            return;
+        }
+
+        const params = req.method === 'POST' ? req.body || {} : req.query || {};
+
+        void logRequestAudit(getModels(req), req, {
+            action: auditContext.action,
+            outcome: res.statusCode < 400 ? 'success' : 'failure',
+            entityType: 'report',
+            ...buildActorFromUser(req.user),
+            target_identifier: auditContext.reportType,
+            target_name: auditContext.reportType,
+            details: {
+                operation: auditContext.operation,
+                route: req.originalUrl,
+                statusCode: res.statusCode,
+                start_date: params.start_date || null,
+                end_date: params.end_date || null,
+                report_type: params.report_type || null,
+                format: params.format || null,
+                email: auditContext.operation === 'email' ? params.email || null : null,
+            },
+        });
+    });
+
+    next();
+});
 
 async function getActiveSalesRows(rows) {
     const annotated = await annotateSalesWithReturnState(rows);
