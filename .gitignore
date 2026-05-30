@@ -1,0 +1,26 @@
+# Git ignore file
+.env
+node_modules/
+dist/
+logs/
+coverage/
+*.log
+*.env
+.DS_Store
+.idea/
+.vscode/
+*.pem
+*.key
+*.crt
+*.pfx
+*.cer
+*.csr
+*.jks
+*.keystore
+*.bak
+*.tmp
+*.swp
+*.swo
+*.zip
+*.tar.gz
+*.tgz

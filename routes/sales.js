@@ -49,8 +49,114 @@ async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
     }
 }
 
+function buildSaleSyncPayload(saleRecord) {
+    return {
+        branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
+        terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
+        sale: {
+            id: saleRecord.id,
+            receipt_number: saleRecord.receipt_number,
+            user_id: saleRecord.user_id,
+            store_id: saleRecord.store_id,
+            branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
+            terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
+            customer_id: saleRecord.customer_id || null,
+            discount_id: saleRecord.discount_id || null,
+            subtotal: Number(saleRecord.subtotal || 0),
+            discount_amount: Number(saleRecord.discount_amount || 0),
+            tax_amount: Number(saleRecord.tax_amount || 0),
+            total_amount: Number(saleRecord.total_amount || 0),
+            payment_method: saleRecord.payment_method,
+            amount_paid: Number(saleRecord.amount_paid || 0),
+            change_amount: Number(saleRecord.change_amount || 0),
+            notes: saleRecord.notes || null,
+            payments_breakdown: saleRecord.payments_breakdown || null,
+            sale_date: saleRecord.sale_date || new Date().toISOString(),
+            invoice_no: saleRecord.invoice_no || null,
+            invnumber: saleRecord.invnumber || null,
+            receipt_no: saleRecord.receipt_no || null,
+            sdcid: saleRecord.sdcid || null,
+            receiptsig: saleRecord.receiptsig || null,
+            intrldata: saleRecord.intrldata || null,
+            qrcode_url: saleRecord.qrcode_url || null,
+            vsdcrcpdate: saleRecord.vsdcrcpdate || null,
+            zra_status: saleRecord.zra_status || null,
+            zra_error: saleRecord.zra_error || null,
+            receipt_printed: saleRecord.receipt_printed ?? null,
+        },
+        items: (saleRecord.items || []).map(item => ({
+            product_id: item.product_id,
+            quantity: Number(item.quantity),
+            unit_price: Number(item.unit_price),
+            total_price: Number(item.total_price),
+            tax_exclusive_total: Number(item.tax_exclusive_total || 0),
+            product: {
+                id: item.product?.id || null,
+                name: item.product?.name || null,
+                product_code: item.product?.product_code || null,
+                formatted_product_code: item.product?.formatted_product_code || null,
+                price: Number(item.product?.price || 0),
+            }
+        })),
+        customer: saleRecord.customer || null,
+        discount: saleRecord.discount || null,
+    };
+}
+
+async function requeueSaleSyncEvent(saleRecord, models) {
+    console.log('[sales] requeueSaleSyncEvent start', {
+      saleId: saleRecord.id,
+      storeId: saleRecord.store_id,
+      receiptNumber: saleRecord.receipt_number,
+    });
+
+    const payload = buildSaleSyncPayload(saleRecord);
+    const existingOutbox = await models.sync_outbox.findOne({
+        where: {
+            event_type: 'sale.created',
+            aggregate_type: 'sale',
+            aggregate_id: String(saleRecord.id),
+            store_id: saleRecord.store_id,
+            status: { [Op.in]: ['pending', 'failed', 'dead_letter'] }
+        }
+    });
+
+    if (existingOutbox) {
+        console.log('[sales] requeueSaleSyncEvent updating existing outbox', {
+            outboxId: existingOutbox.id,
+            currentStatus: existingOutbox.status,
+        });
+
+        return await existingOutbox.update({
+            payload,
+            status: 'pending',
+            attempt_count: 0,
+            next_retry_at: new Date(),
+            last_error: null,
+            response_payload: null,
+        });
+    }
+
+    console.log('[sales] requeueSaleSyncEvent creating new outbox entry');
+    return await models.sync_outbox.create({
+        event_type: 'sale.created',
+        aggregate_type: 'sale',
+        aggregate_id: String(saleRecord.id),
+        store_id: saleRecord.store_id,
+        user_id: saleRecord.user_id,
+        receipt_number: saleRecord.receipt_number,
+        idempotency_key: `sale.created:store-${saleRecord.store_id}:sale-${saleRecord.id}:reprocess:${Date.now()}`,
+        payload,
+        status: 'pending',
+        attempt_count: 0,
+        next_retry_at: new Date(),
+    });
+}
 
 // Create new sale
+
+
+
 router.post('/', auth, async (req, res) => {
     const t = await sale.sequelize.transaction();
 
@@ -222,6 +328,14 @@ router.post('/', auth, async (req, res) => {
         const salesData = await zraService.transformToZRASalesData(saleDataForZRA, saleItems, req.user);
         const salesResponse = await zraService.sendSalesData(salesData);
 
+        console.log('ZRA Sales Response for sale request:', JSON.stringify({
+            success: salesResponse.success,
+            endpoint: salesResponse.endpoint,
+            shouldRetry: salesResponse.shouldRetry,
+            data: salesResponse.data,
+            error: salesResponse.error
+        }, null, 2));
+
         if (!salesResponse.success) {
             // Do NOT rollback the sale — mark for retry and continue saving locally
             zraFailed = true;
@@ -229,7 +343,7 @@ router.post('/', auth, async (req, res) => {
             zraError = typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error);
         } else {
             console.log('ZRA sales integration successful:', salesResponse.data);
-            saveSalesData = salesResponse.data.data || null;
+            saveSalesData = salesResponse.data || null;
         }
 
         if (saveSalesData) {
@@ -351,7 +465,17 @@ router.post('/', auth, async (req, res) => {
                 change_amount,
                 notes: notes || null,
                 payments_breakdown: payments_breakdown_obj,
-                sale_date: new Date().toISOString()
+                sale_date: new Date().toISOString(),
+                invoice_no: saveSalesData?.invoiceNo || saveSalesData?.invNumber || saveSalesData?.invnumber || computedInvoiceNoRaw || null,
+                invnumber: saveSalesData?.invoiceNo || saveSalesData?.invNumber || saveSalesData?.invnumber || salesData?.cisInvcNo || null,
+                receipt_no: saveSalesData?.rcptNo || null,
+                sdcid: saveSalesData?.sdcId || null,
+                receiptsig: saveSalesData?.rcptSign || null,
+                intrldata: saveSalesData?.intrlData || null,
+                qrcode_url: saveSalesData?.qrCodeUrl || null,
+                vsdcrcpdate: saveSalesData?.vsdcRcptPbctDate || null,
+                zra_status: zraFailed ? 'pending' : 'sent',
+                zra_error: zraFailed ? zraError : null
             },
             items: saleItems.map(item => ({
                 product_id: item.product_id,
@@ -914,6 +1038,83 @@ router.get('/dashboard/stats/:period', auth, async (req, res) => {
             message: 'Failed to load period statistics',
             error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
         });
+    }
+});
+
+router.patch('/:saleId/reprocess', auth, async (req, res) => {
+    const saleId = Number(req.params.saleId);
+    if (Number.isNaN(saleId)) {
+        return res.status(400).json({ message: 'Invalid sale ID' });
+    }
+
+    console.log('[sales] reprocess request', {
+        saleId,
+        body: req.body,
+        userId: req.user?.id,
+        storeId: req.user?.store_id,
+    });
+
+    const allowedFields = [
+        'invnumber', 'receipt_no', 'sdcid', 'receiptsig', 'intrldata', 'qrcode_url', 'vsdcrcpdate',
+        'invoice_no', 'zra_status', 'zra_error', 'receipt_printed'
+    ];
+
+    const updates = {};
+    for (const field of allowedFields) {
+        if (Object.prototype.hasOwnProperty.call(req.body, field)) {
+            updates[field] = req.body[field];
+        }
+    }
+
+    if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ message: 'No sale fields provided to update' });
+    }
+
+    if (updates.zra_status && !['pending', 'sent', 'failed'].includes(updates.zra_status)) {
+        return res.status(400).json({ message: 'Invalid zra_status value' });
+    }
+
+    try {
+        const saleRecord = await sale.findByPk(saleId, {
+            include: [
+                { model: saleitem, as: 'items', include: [{ model: product, as: 'product' }] },
+                { model: user, as: 'cashier', attributes: ['id', 'store_id'] },
+                { model: customer, as: 'customer' },
+                { model: discount, as: 'discount' }
+            ]
+        });
+
+        if (!saleRecord) {
+            return res.status(404).json({ message: 'Sale not found' });
+        }
+
+        if (saleRecord.cashier.store_id !== req.user.store_id) {
+            return res.status(403).json({ message: 'Access denied: sale does not belong to your store' });
+        }
+
+        await saleRecord.update(updates);
+        const syncOutboxRow = await requeueSaleSyncEvent(saleRecord, req.app.locals.models || require('../models'));
+
+        console.log('[sales] sale reprocess completed', {
+            saleId,
+            syncOutboxId: syncOutboxRow?.id,
+            updatedFields: updates,
+        });
+
+        if (req.app.locals.syncOutboxJob && typeof req.app.locals.syncOutboxJob.run === 'function') {
+            req.app.locals.syncOutboxJob.run().catch(error => {
+                console.error('Failed to trigger sync outbox job after sale reprocess:', error.message);
+            });
+        }
+
+        return res.status(200).json({
+            message: 'Sale updated and requeued for central sync',
+            sale: saleRecord,
+            sync_outbox_id: syncOutboxRow.id,
+        });
+    } catch (error) {
+        console.error('Sale reprocess update failed:', error.message);
+        return res.status(500).json({ message: 'Failed to reprocess sale', error: error.message });
     }
 });
 
