@@ -690,14 +690,16 @@ router.get('/', auth, async (req, res) => {
             { model: saleitem, as: 'items', include: [{ model: product, as: 'product' }] }
         ];
 
+        console.log('[sales] list request', { page, limit, offset, store: filterStoreId });
         const { count, rows } = await sale.findAndCountAll({
             limit,
             offset,
             order: [['sale_date', 'DESC']],
             include
         });
-
+        console.log('[sales] db returned', { count, rowsReturned: rows.length, sampleFirst: rows[0] ? rows[0].sale_date : null });
         const sales = await annotateSalesWithReturnState(rows);
+        console.log('[sales] after annotation, active count:', sales.filter(s => !s.is_fully_returned).length);
 
         res.json({
             sales,

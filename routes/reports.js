@@ -704,27 +704,99 @@ router.get('/tax', auth, async (req, res) => {
 
 // Export Report Route
 router.get('/:reportType/export', auth, async (req, res) => {
+    // ensure reportType is available to error handlers
+    const reportType = (req.params && req.params.reportType) ? req.params.reportType : 'report';
     try {
-        const { reportType } = req.params;
         const { format, start_date, end_date, ...additionalParams } = req.query;
 
-        // This is a placeholder - you'll need to implement actual export logic
-        // using libraries like csv-writer, jspdf, or xlsx
-
-        if (!['csv', 'pdf', 'xlsx'].includes(format)) {
-            return res.status(400).json({ message: 'Invalid format. Use csv, pdf, or xlsx' });
+        // Only XLSX export is supported currently (frontend requests XLSX)
+        if (!format || format.toLowerCase() !== 'xlsx') {
+            return res.status(400).json({ message: 'Invalid or unsupported format. Use xlsx' });
         }
 
-        // For now, return mock data
-        const mockData = Buffer.from(`Report: ${reportType}\nFormat: ${format}\nDate Range: ${start_date} to ${end_date}`);
+        if (!start_date || !end_date) {
+            return res.status(400).json({ message: 'start_date and end_date are required' });
+        }
 
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Disposition', `attachment; filename=report_${reportType}_${format}`);
-        res.send(mockData);
+        const startDate = new Date(start_date);
+        const endDate = new Date(end_date);
+        if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+            return res.status(400).json({ message: 'Invalid date format. Use ISO 8601' });
+        }
+
+        const storeId = req.user?.store_id;
+
+        // Generate report data using the corresponding generator
+        let reportData = [];
+        switch (reportType) {
+            case 'sales':
+                reportData = await generateSalesReport(startDate, endDate, storeId, additionalParams);
+                break;
+            case 'products':
+                reportData = await generateProductsReport(startDate, endDate, storeId, additionalParams);
+                break;
+            case 'inventory':
+                reportData = await generateInventoryReport(startDate, endDate, storeId, additionalParams);
+                break;
+            case 'user-activity':
+                reportData = await generateUserActivityReport(startDate, endDate, storeId, additionalParams);
+                break;
+            case 'categories':
+                reportData = await generateCategoriesReport(startDate, endDate, storeId, additionalParams);
+                break;
+            case 'tax':
+                reportData = await generateTaxReport(startDate, endDate, storeId, additionalParams);
+                break;
+            default:
+                return res.status(400).json({ message: 'Invalid report type' });
+        }
+
+        if (!reportData || reportData.length === 0) {
+            // Return an Excel file with headers and a single row indicating no data
+            const emptyWorkbook = await createExcelReport(reportType, [], startDate, endDate);
+            // Add a note row
+            const ws = emptyWorkbook.worksheets[0];
+            const noteRow = ws.addRow(['No data found for the specified date range']);
+            noteRow.font = { italic: true };
+            const buffer = await emptyWorkbook.xlsx.writeBuffer();
+            const fileName = `${reportType}_report_${startDate.toISOString().slice(0,10)}_${endDate.toISOString().slice(0,10)}.xlsx`;
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
+            return res.status(200).send(Buffer.from(buffer));
+        }
+
+        const workbook = await createExcelReport(reportType, reportData, startDate, endDate);
+        const buffer = await workbook.xlsx.writeBuffer();
+
+        const fileName = `${reportType}_report_${startDate.toISOString().slice(0,10)}_${endDate.toISOString().slice(0,10)}.xlsx`;
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
+        res.send(Buffer.from(buffer));
 
     } catch (error) {
         console.error('Export report error:', error);
-        res.status(500).json({ message: 'Server error' });
+        try {
+            // Create an error workbook so the client always receives an .xlsx file
+            const errWb = new ExcelJS.Workbook();
+            const errWs = errWb.addWorksheet('ERROR');
+            errWs.addRow([`Error generating ${reportType} report`]);
+            const msg = error && error.message ? error.message : String(error);
+            errWs.addRow([msg]);
+            // Truncate stack if present
+            if (error && error.stack) {
+                errWs.addRow(['Stack:']);
+                const stackLines = error.stack.split('\n').slice(0, 8).join(' | ');
+                errWs.addRow([stackLines]);
+            }
+            const buffer = await errWb.xlsx.writeBuffer();
+            const fileName = `${reportType}_report_error_${new Date().toISOString().slice(0,10)}.xlsx`;
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
+            return res.status(500).send(Buffer.from(buffer));
+        } catch (sendErr) {
+            console.error('Failed to send error workbook:', sendErr);
+            return res.status(500).json({ message: 'Server error' });
+        }
     }
 });
 
@@ -733,7 +805,7 @@ const ExcelJS = require('exceljs');
 const nodemailer = require('nodemailer');
 const fs = require('fs').promises;
 const path = require('path');
-const pool = require('../config/database'); // Adjust path as needed
+const { pool } = require('../config/database'); // Adjust path as needed
 
 // Configure email transporter (use environment variables)
 const createEmailTransporter = () => {
@@ -750,143 +822,151 @@ const createEmailTransporter = () => {
 
 // Report generation functions
 const generateSalesReport = async (startDate, endDate, storeId, additionalParams) => {
-    const query = `
-        SELECT 
-            s.sale_id,
-            s.invoice_no,
-            s.receipt_no,
-            s.total_amount,
-            s.payment_method,
-            s.created_at,
-            u.full_name as cashier_name,
-            st.store_name,
-            COUNT(si.item_id) as items_count
-        FROM sales s
-        LEFT JOIN users u ON s.user_id = u.user_id
-        LEFT JOIN stores st ON s.store_id = st.store_id
-        LEFT JOIN sale_items si ON s.sale_id = si.sale_id
-        WHERE s.created_at BETWEEN ? AND ?
-        ${storeId ? 'AND s.store_id = ?' : ''}
-        GROUP BY s.sale_id
-        ORDER BY s.created_at DESC
-    `;
+    // Use Sequelize models to fetch sales so we match the ORM behavior used elsewhere
+    const whereClause = {
+        sale_date: { [Op.between]: [startDate, endDate] }
+    };
 
-    const params = storeId ? [startDate, endDate, storeId] : [startDate, endDate];
-    const [rows] = await pool.query(query, params);
-    return rows;
+    const filterStoreId = storeId;
+
+    const includeClause = [
+        { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
+        { model: customer, as: 'customer' },
+        {
+            model: saleitem,
+            as: 'items',
+            include: [{ model: product, as: 'product', include: [{ model: category, as: 'category' }] }]
+        }
+    ];
+
+    const sales = await sale.findAll({ where: whereClause, include: includeClause, order: [['sale_date', 'DESC']] });
+
+    // Map to a simplified row structure expected by the Excel generator
+    return sales.map(s => ({
+        sale_id: s.id,
+        invoice_no: s.invoice_no,
+        receipt_no: s.receipt_no,
+        total_amount: s.total_amount,
+        payment_method: s.payment_method,
+        created_at: s.sale_date,
+        cashier_name: s.cashier ? s.cashier.full_name : null,
+        store_name: s.store_id || null,
+        items_count: (s.items || []).length
+    }));
 };
 
 const generateProductsReport = async (startDate, endDate, storeId, additionalParams) => {
     const query = `
         SELECT 
-            p.product_id,
-            p.product_name,
+            p.id as product_id,
+            p.name as product_name,
             p.product_class_code,
-            c.category_name,
-            p.unit_price,
-            p.stock_quantity,
+            c.name as category_name,
+            p.price as unit_price,
+            COALESCE(pi.stock_quantity, p.stock_quantity) as stock_quantity,
             COALESCE(SUM(si.quantity), 0) as total_sold,
             COALESCE(SUM(si.quantity * si.unit_price), 0) as total_revenue
         FROM products p
-        LEFT JOIN categories c ON p.category_id = c.category_id
-        LEFT JOIN sale_items si ON p.product_id = si.product_id
-        LEFT JOIN sales s ON si.sale_id = s.sale_id AND s.created_at BETWEEN ? AND ?
-        WHERE p.store_id = ?
-        GROUP BY p.product_id
+        LEFT JOIN categories c ON p.category_id = c.id
+        LEFT JOIN productinventories pi ON p.id = pi.product_id AND pi.store_id = ?
+        LEFT JOIN saleitems si ON p.id = si.product_id
+        LEFT JOIN sales s ON si.sale_id = s.id AND s.sale_date BETWEEN ? AND ?
+        WHERE (pi.store_id = ? OR ? IS NULL)
+        GROUP BY p.id
         ORDER BY total_revenue DESC
     `;
 
-    const [rows] = await pool.query(query, [startDate, endDate, storeId]);
+    const rows = await sequelize.query(query, { replacements: [storeId, startDate, endDate, storeId, storeId], type: sequelize.QueryTypes.SELECT });
     return rows;
 };
 
 const generateInventoryReport = async (startDate, endDate, storeId, additionalParams) => {
     const query = `
         SELECT 
-            p.product_id,
-            p.product_name,
+            p.id as product_id,
+            p.name as product_name,
             p.product_class_code,
-            c.category_name,
-            p.unit_price,
-            p.stock_quantity,
-            p.reorder_level,
+            c.name as category_name,
+            COALESCE(pi.price_override, p.price) as unit_price,
+            COALESCE(pi.stock_quantity, p.stock_quantity) as stock_quantity,
+            COALESCE(pi.min_stock_level, p.min_stock_level) as reorder_level,
             CASE 
-                WHEN p.stock_quantity <= p.reorder_level THEN 'Low Stock'
-                WHEN p.stock_quantity = 0 THEN 'Out of Stock'
+                WHEN COALESCE(pi.stock_quantity, p.stock_quantity) <= COALESCE(pi.min_stock_level, p.min_stock_level) THEN 'Low Stock'
+                WHEN COALESCE(pi.stock_quantity, p.stock_quantity) = 0 THEN 'Out of Stock'
                 ELSE 'In Stock'
             END as stock_status,
-            p.updated_at as last_updated
+            COALESCE(pi.updated_at, p.updated_at) as last_updated
         FROM products p
-        LEFT JOIN categories c ON p.category_id = c.category_id
-        WHERE p.store_id = ?
-        ORDER BY p.stock_quantity ASC, p.product_name ASC
+        LEFT JOIN categories c ON p.category_id = c.id
+        LEFT JOIN productinventories pi ON p.id = pi.product_id AND pi.store_id = ?
+        WHERE (pi.store_id = ? OR ? IS NULL)
+        ORDER BY COALESCE(pi.stock_quantity, p.stock_quantity) ASC, p.name ASC
     `;
 
-    const [rows] = await pool.query(query, [storeId]);
+    const rows = await sequelize.query(query, { replacements: [storeId, storeId, storeId], type: sequelize.QueryTypes.SELECT });
     return rows;
 };
 
 const generateUserActivityReport = async (startDate, endDate, storeId, additionalParams) => {
     const query = `
         SELECT 
-            u.user_id,
+            u.id as user_id,
             u.full_name,
-            u.email,
+            u.username,
             u.role,
-            COUNT(DISTINCT s.sale_id) as total_sales,
+            COUNT(DISTINCT s.id) as total_sales,
             COALESCE(SUM(s.total_amount), 0) as total_revenue,
-            MIN(s.created_at) as first_sale,
-            MAX(s.created_at) as last_sale
+            MIN(s.sale_date) as first_sale,
+            MAX(s.sale_date) as last_sale
         FROM users u
-        LEFT JOIN sales s ON u.user_id = s.user_id AND s.created_at BETWEEN ? AND ?
-        WHERE u.store_id = ?
-        GROUP BY u.user_id
+        LEFT JOIN sales s ON u.id = s.user_id AND s.sale_date BETWEEN ? AND ?
+        WHERE (u.store_id = ? OR ? IS NULL)
+        GROUP BY u.id
         ORDER BY total_revenue DESC
     `;
 
-    const [rows] = await pool.query(query, [startDate, endDate, storeId]);
+    const rows = await sequelize.query(query, { replacements: [startDate, endDate, storeId, storeId], type: sequelize.QueryTypes.SELECT });
     return rows;
 };
 
 const generateCategoriesReport = async (startDate, endDate, storeId, additionalParams) => {
     const query = `
         SELECT 
-            c.category_id,
-            c.category_name,
-            COUNT(DISTINCT p.product_id) as products_count,
+            c.id as category_id,
+            c.name as category_name,
+            COUNT(DISTINCT p.id) as products_count,
             COALESCE(SUM(si.quantity), 0) as total_items_sold,
             COALESCE(SUM(si.quantity * si.unit_price), 0) as total_revenue
         FROM categories c
-        LEFT JOIN products p ON c.category_id = p.category_id
-        LEFT JOIN sale_items si ON p.product_id = si.product_id
-        LEFT JOIN sales s ON si.sale_id = s.sale_id AND s.created_at BETWEEN ? AND ?
-        WHERE c.store_id = ?
-        GROUP BY c.category_id
+        LEFT JOIN products p ON c.id = p.category_id
+        LEFT JOIN productinventories pi ON p.id = pi.product_id AND pi.store_id = ?
+        LEFT JOIN saleitems si ON p.id = si.product_id
+        LEFT JOIN sales s ON si.sale_id = s.id AND s.sale_date BETWEEN ? AND ?
+        WHERE (pi.store_id = ? OR ? IS NULL)
+        GROUP BY c.id
         ORDER BY total_revenue DESC
     `;
-
-    const [rows] = await pool.query(query, [startDate, endDate, storeId]);
+    const rows = await sequelize.query(query, { replacements: [storeId, startDate, endDate, storeId, storeId], type: sequelize.QueryTypes.SELECT });
     return rows;
 };
 
 const generateTaxReport = async (startDate, endDate, storeId, additionalParams) => {
     const query = `
         SELECT 
-            DATE(s.created_at) as sale_date,
-            COUNT(s.sale_id) as transactions_count,
+            DATE(s.sale_date) as sale_date,
+            COUNT(s.id) as transactions_count,
             SUM(s.total_amount) as gross_sales,
             SUM(s.total_amount * 0.16) as vat_collected,
             SUM(s.total_amount * 0.84) as net_sales,
             s.payment_method
         FROM sales s
-        WHERE s.created_at BETWEEN ? AND ?
-        ${storeId ? 'AND s.store_id = ?' : ''}
-        GROUP BY DATE(s.created_at), s.payment_method
+        WHERE s.sale_date BETWEEN ? AND ?
+        ${storeId ? 'AND EXISTS (SELECT 1 FROM users u WHERE u.id = s.user_id AND u.store_id = ?)' : ''}
+        GROUP BY DATE(s.sale_date), s.payment_method
         ORDER BY sale_date DESC, payment_method
     `;
-
     const params = storeId ? [startDate, endDate, storeId] : [startDate, endDate];
-    const [rows] = await pool.query(query, params);
+    const rows = await sequelize.query(query, { replacements: params, type: sequelize.QueryTypes.SELECT });
     return rows;
 };
 
@@ -908,20 +988,10 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
         }
     };
 
-    // Add title
-    worksheet.mergeCells('A1:F1');
-    const titleCell = worksheet.getCell('A1');
-    titleCell.value = `${reportType.toUpperCase()} REPORT`;
-    titleCell.font = { bold: true, size: 16 };
-    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
-
-    // Add date range
-    worksheet.mergeCells('A2:F2');
-    const dateCell = worksheet.getCell('A2');
-    dateCell.value = `Period: ${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()}`;
-    dateCell.alignment = { horizontal: 'center' };
-
-    worksheet.addRow([]); // Empty row
+    // Add title and date placeholders — actual merge will be done after columns are set
+    worksheet.addRow([]); // reserve row 1 for title
+    worksheet.addRow([]); // reserve row 2 for date
+    worksheet.addRow([]); // empty row 3 before headers
 
     // Define columns based on report type
     let columns = [];
@@ -934,7 +1004,7 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
                 { header: 'Receipt No', key: 'receipt_no', width: 20 },
                 { header: 'Total Amount', key: 'total_amount', width: 15 },
                 { header: 'Payment Method', key: 'payment_method', width: 15 },
-                { header: 'Cashier', key: 'cashier_name', width: 20 },
+                // Cashier removed per request
                 { header: 'Store', key: 'store_name', width: 20 },
                 { header: 'Items Count', key: 'items_count', width: 12 },
                 { header: 'Date', key: 'created_at', width: 20 }
@@ -969,7 +1039,7 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
             columns = [
                 { header: 'User ID', key: 'user_id', width: 12 },
                 { header: 'Full Name', key: 'full_name', width: 25 },
-                { header: 'Email', key: 'email', width: 30 },
+                { header: 'Username', key: 'username', width: 30 },
                 { header: 'Role', key: 'role', width: 15 },
                 { header: 'Total Sales', key: 'total_sales', width: 15 },
                 { header: 'Total Revenue', key: 'total_revenue', width: 15 },
@@ -1000,12 +1070,45 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
 
     worksheet.columns = columns;
 
-    // Apply header style
+    // Now merge title/date across actual columns and set values
+    const getColLetter = (col) => {
+        let letter = '';
+        while (col > 0) {
+            const mod = (col - 1) % 26;
+            letter = String.fromCharCode(65 + mod) + letter;
+            col = Math.floor((col - 1) / 26);
+        }
+        return letter;
+    };
+    const lastColLetter = getColLetter(columns.length || 1);
+    worksheet.mergeCells(`A1:${lastColLetter}1`);
+    const titleCell = worksheet.getCell('A1');
+    titleCell.value = reportType === 'sales' ? 'SALES REPORT' : `${reportType.toUpperCase()} REPORT`;
+    titleCell.font = { bold: true, size: 16 };
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // Add date range
+    worksheet.mergeCells(`A2:${lastColLetter}2`);
+    const dateCell = worksheet.getCell('A2');
+    dateCell.value = `Period: ${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()}`;
+    dateCell.alignment = { horizontal: 'center' };
+
+    // Ensure header row is a dedicated row (row 4) and contains the column headers
     const headerRow = worksheet.getRow(4);
-    headerRow.eachCell((cell) => {
+    for (let i = 0; i < columns.length; i++) {
+        const cell = headerRow.getCell(i + 1);
+        cell.value = columns[i].header;
         cell.style = headerStyle;
-    });
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    }
     headerRow.height = 25;
+
+    // Freeze panes so headers remain visible and enable autofilter
+    worksheet.views = [{ state: 'frozen', ySplit: 4 }];
+    worksheet.autoFilter = {
+        from: { row: 4, column: 1 },
+        to: { row: 4, column: columns.length }
+    };
 
     // Add data rows
     data.forEach((item) => {
@@ -1015,7 +1118,7 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
         row.eachCell((cell, colNumber) => {
             const column = columns[colNumber - 1];
             if (column && (column.key.includes('amount') || column.key.includes('price') || column.key.includes('revenue'))) {
-                cell.numFmt = 'K#,##0.00';
+                cell.numFmt = '#,##0.00';
                 cell.alignment = { horizontal: 'right' };
             }
 
@@ -1037,16 +1140,39 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
         });
     });
 
-    // Add summary row for financial reports
+    // Add summary row for financial reports: sum known revenue keys
     if (['sales', 'products', 'categories', 'tax'].includes(reportType)) {
         worksheet.addRow([]);
-        const summaryRow = worksheet.addRow(['TOTAL', '', '', '', '', '', '', '']);
+        const revenueKeys = ['total_amount', 'total_revenue', 'gross_sales'];
+        let revenueColIndex = -1;
+        for (const key of revenueKeys) {
+            const idx = columns.findIndex(c => c.key === key);
+            if (idx >= 0) {
+                revenueColIndex = idx;
+                break;
+            }
+        }
+
+        const rowValues = new Array(columns.length).fill('');
+        rowValues[0] = 'TOTAL';
+        if (revenueColIndex >= 0) {
+            const key = columns[revenueColIndex].key;
+            const total = data.reduce((sum, it) => sum + Number(it[key] || 0), 0);
+            rowValues[revenueColIndex] = total;
+        }
+
+        const summaryRow = worksheet.addRow(rowValues);
         summaryRow.font = { bold: true };
         summaryRow.fill = {
             type: 'pattern',
             pattern: 'solid',
             fgColor: { argb: 'FFF2F2F2' }
         };
+        if (revenueColIndex >= 0) {
+            const cell = summaryRow.getCell(revenueColIndex + 1);
+            cell.numFmt = '#,##0.00';
+            cell.alignment = { horizontal: 'right' };
+        }
     }
 
     return workbook;
@@ -1477,5 +1603,14 @@ router.get('/transactions', auth, async (req, res) => {
         res.status(500).json({ message: 'Server error' });
     }
 });
+
+// Expose generator helpers for scripts/tests without changing router export shape
+router.generateSalesReport = generateSalesReport;
+router.generateProductsReport = generateProductsReport;
+router.generateInventoryReport = generateInventoryReport;
+router.generateUserActivityReport = generateUserActivityReport;
+router.generateCategoriesReport = generateCategoriesReport;
+router.generateTaxReport = generateTaxReport;
+router.createExcelReport = createExcelReport;
 
 module.exports = router;

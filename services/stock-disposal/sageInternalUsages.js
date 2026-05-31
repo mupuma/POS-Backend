@@ -12,7 +12,7 @@ class SageInternalUsage {
         const quantity = item.quantity ?? 0;
         const unit_cost = item.unit_cost ?? 0;
         const code = item.product?.product_code || item.product_code || (item.product_id ? String(item.product_id) : '');
-        const description = item.product?.product_name || item.product_name || '';
+        const description = item.product?.name || item.product_name || '';
         const category = item.product?.category || item.category || '';
         return { quantity, unit_cost, code, description, category };
     }
