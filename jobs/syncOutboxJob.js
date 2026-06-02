@@ -16,10 +16,14 @@ class SyncOutboxJob {
     this.isRunning = false;
     this.cronJob = null;
     this.intervalCron = '*/1 * * * *';
-    this.maxRetries = 10;
+    this.maxRetries = 100;
     this.baseDelayMinutes = 2;
     this.syncServerUrl = process.env.SYNC_SERVER_URL;
     this.syncServerToken = process.env.SYNC_SERVER_TOKEN;
+  }
+
+  shouldRetryForever(row) {
+    return row.event_type === 'sale.created' || row.event_type === 'credit_note.created';
   }
 
   start() {
@@ -126,14 +130,21 @@ class SyncOutboxJob {
       });
     } catch (error) {
       const attemptCount = (row.attempt_count || 0) + 1;
-      const terminal = attemptCount >= this.maxRetries;
+      const infiniteRetry = this.shouldRetryForever(row);
+      const terminal = !infiniteRetry && attemptCount >= this.maxRetries;
+      const nextRetry = terminal ? null : new Date(Date.now() + this.baseDelayMinutes * 60 * 1000);
+      const status = terminal ? 'dead_letter' : 'failed';
+
+      if (infiniteRetry && attemptCount > this.maxRetries) {
+        console.warn(`SyncOutboxJob: still retrying high-priority event ${row.event_type} id=${row.id} after ${attemptCount} attempts`);
+      }
 
       await row.update({
-        status: terminal ? 'dead_letter' : 'failed',
+        status,
         attempt_count: attemptCount,
         last_error: error.message,
         response_payload: error.response?.data || null,
-        next_retry_at: terminal ? null : new Date(Date.now() + this.baseDelayMinutes * 60 * 1000),
+        next_retry_at: nextRetry,
         locked_at: null
       });
     }

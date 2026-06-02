@@ -103,6 +103,23 @@ function buildSaleSyncPayload(saleRecord) {
     };
 }
 
+function normalizeZraSalesData(salesResponse) {
+    const outer = salesResponse?.data || null;
+    const inner = outer?.data || null;
+
+    return {
+        rcptNo: inner?.rcptNo ?? outer?.rcptNo ?? null,
+        sdcId: inner?.sdcId ?? outer?.sdcId ?? null,
+        rcptSign: inner?.rcptSign ?? outer?.rcptSign ?? null,
+        intrlData: inner?.intrlData ?? outer?.intrlData ?? null,
+        qrCodeUrl: inner?.qrCodeUrl ?? outer?.qrCodeUrl ?? null,
+        vsdcRcptPbctDate: inner?.vsdcRcptPbctDate ?? outer?.vsdcRcptPbctDate ?? null,
+        resultCd: outer?.resultCd ?? null,
+        resultMsg: outer?.resultMsg ?? null,
+        raw: salesResponse?.data || null,
+    };
+}
+
 async function requeueSaleSyncEvent(saleRecord, models) {
     console.log('[sales] requeueSaleSyncEvent start', {
       saleId: saleRecord.id,
@@ -343,7 +360,7 @@ router.post('/', auth, async (req, res) => {
             zraError = typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error);
         } else {
             console.log('ZRA sales integration successful:', salesResponse.data);
-            saveSalesData = salesResponse.data || null;
+            saveSalesData = normalizeZraSalesData(salesResponse);
         }
 
         if (saveSalesData) {
@@ -530,9 +547,20 @@ router.post('/', auth, async (req, res) => {
         });
 
         // Send response immediately
+        // Normalize the sale object for the response and include `vsdc` helper
+        const salePlain = completeSale && completeSale.get ? completeSale.get({ plain: true }) : (completeSale || {});
+        salePlain.vsdc = {
+            sdcId: salePlain.sdcid || salePlain.sdc_id || null,
+            rcptNo: salePlain.receipt_no || salePlain.rcptNo || null,
+            receiptSig: salePlain.receiptsig || salePlain.receipt_sig || null,
+            intrlData: salePlain.intrldata || salePlain.intrlData || null,
+            qrCodeUrl: salePlain.qrcode_url || salePlain.qrCodeUrl || null,
+            vsdcRcpDate: salePlain.vsdcrcpdate || salePlain.vsdc_rcp_date || null
+        };
+
         res.status(201).json({
             message: zraFailed ? 'Sale saved (ZRA pending due to network). Will retry automatically.' : 'Sale completed successfully',
-            sale: completeSale,
+            sale: salePlain,
             zra_integration: {
                 success: !zraFailed,
                 sales_endpoint: {
@@ -698,8 +726,22 @@ router.get('/', auth, async (req, res) => {
             include
         });
         console.log('[sales] db returned', { count, rowsReturned: rows.length, sampleFirst: rows[0] ? rows[0].sale_date : null });
-        const sales = await annotateSalesWithReturnState(rows);
+        let sales = await annotateSalesWithReturnState(rows);
         console.log('[sales] after annotation, active count:', sales.filter(s => !s.is_fully_returned).length);
+
+        // Normalize/augment each sale with a convenience `vsdc` object so clients
+        // have the VSDC-related fields in one place (sdc id, rcpt no, sig, intrl, qr url, date)
+        sales = sales.map(s => ({
+            ...s,
+            vsdc: {
+                sdcId: s.sdcid || s.sdc_id || null,
+                rcptNo: s.receipt_no || s.rcptNo || null,
+                receiptSig: s.receiptsig || s.receipt_sig || null,
+                intrlData: s.intrldata || s.intrlData || null,
+                qrCodeUrl: s.qrcode_url || s.qrCodeUrl || null,
+                vsdcRcpDate: s.vsdcrcpdate || s.vsdc_rcp_date || null
+            }
+        }));
 
         res.json({
             sales,
@@ -743,7 +785,18 @@ router.get('/:id', auth, async (req, res) => {
             }
         }
 
-        res.json({ sale: saleData });
+        // Include convenience `vsdc` object on the returned sale
+        const saleResponse = saleData && saleData.get ? saleData.get({ plain: true }) : (saleData || {});
+        saleResponse.vsdc = {
+            sdcId: saleResponse.sdcid || saleResponse.sdc_id || null,
+            rcptNo: saleResponse.receipt_no || saleResponse.rcptNo || null,
+            receiptSig: saleResponse.receiptsig || saleResponse.receipt_sig || null,
+            intrlData: saleResponse.intrldata || saleResponse.intrlData || null,
+            qrCodeUrl: saleResponse.qrcode_url || saleResponse.qrCodeUrl || null,
+            vsdcRcpDate: saleResponse.vsdcrcpdate || saleResponse.vsdc_rcp_date || null
+        };
+
+        res.json({ sale: saleResponse });
 
     } catch (error) {
         console.error('Get sale by ID error:', error);

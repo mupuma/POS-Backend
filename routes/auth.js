@@ -73,7 +73,10 @@ router.post('/register', auth, async (req, res) => {
                 id: newUser.id,
                 username: newUser.username,
                 full_name: newUser.full_name,
-                role: newUser.role
+                role: newUser.role,
+                is_active: newUser.is_active,
+                created_at: newUser.created_at,
+                store_id: newUser.store_id
             }
         });
 
