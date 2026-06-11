@@ -107,7 +107,7 @@ class ZRACreditNoteIntegrationService {
      * @param originalInvoiceNo
      * @returns {Promise<object>}
      */
-    async transformToZRACreditNoteSalesData(saleData, items, user,reasonCode,originalInvoiceNo) {
+    async transformToZRACreditNoteSalesData(saleData, items, user, reasonCode, originalInvoiceNo, orgSdcId) {
         const currentDateTime = this.formatZRADateTime();
         const currentDate = this.formatZRADate();
 
@@ -172,7 +172,7 @@ class ZRACreditNoteIntegrationService {
             bhfId: process.env.ZRA_BHF_ID || "000",
             orgInvcNo: originalInvoiceNo,
             cisInvcNo: cisCreditNoteNo,
-            orgSdcId:"SDC0010002061",
+            orgSdcId: orgSdcId || "SDC0010002061",
             custTpin: "1000000000",
             custNm: saleData.customer?.name || "Walk-in Customer",
             salesTyCd: "N",
