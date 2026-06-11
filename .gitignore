@@ -2,7 +2,8 @@
 .env
 node_modules/
 dist/
-logs/
+logs/*
+!logs/.gitkeep
 coverage/
 *.log
 *.env

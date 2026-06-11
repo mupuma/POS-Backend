@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice');
+const { buildSaleUpdatesFromZraResponse } = require('../services/sale/zraSaleResponse');
 const CreditNoteZRAIntegrationService = require('../services/credit-note/generateSmartInvoiceCreditNote');
 const fs = require('fs');
 const path = require('path');
@@ -43,6 +44,122 @@ class ZraRetryJob {
     if (this.cronJob) {
       this.cronJob.stop();
       this.cronJob = null;
+    }
+  }
+
+  resolveSaleStoreId(saleInstance) {
+    return saleInstance.store_id || saleInstance.cashier?.store_id || null;
+  }
+
+  buildSaleSyncPayload(saleInstance) {
+    const branchId = String(process.env.ZRA_BHF_ID || '000').trim() || '000';
+    const terminalId = String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000';
+    const storeId = this.resolveSaleStoreId(saleInstance);
+
+    return {
+      branch_id: branchId,
+      terminal_id: terminalId,
+      sale: {
+        id: saleInstance.id,
+        receipt_number: saleInstance.receipt_number,
+        user_id: saleInstance.user_id,
+        store_id: storeId,
+        branch_id: branchId,
+        terminal_id: terminalId,
+        customer_id: saleInstance.customer_id || null,
+        discount_id: saleInstance.discount_id || null,
+        subtotal: Number(saleInstance.subtotal || 0),
+        discount_amount: Number(saleInstance.discount_amount || 0),
+        tax_amount: Number(saleInstance.tax_amount || 0),
+        total_amount: Number(saleInstance.total_amount || 0),
+        payment_method: saleInstance.payment_method,
+        amount_paid: Number(saleInstance.amount_paid || 0),
+        change_amount: Number(saleInstance.change_amount || 0),
+        notes: saleInstance.notes || null,
+        payments_breakdown: saleInstance.payments_breakdown || null,
+        sale_date: saleInstance.sale_date || new Date().toISOString(),
+        invoice_no: saleInstance.invoice_no || null,
+        invnumber: saleInstance.invnumber || null,
+        receipt_no: saleInstance.receipt_no || null,
+        sdcid: saleInstance.sdcid || null,
+        receiptsig: saleInstance.receiptsig || null,
+        intrldata: saleInstance.intrldata || null,
+        qrcode_url: saleInstance.qrcode_url || null,
+        qrfilepath: saleInstance.qrfilepath || null,
+        vsdcrcpdate: saleInstance.vsdcrcpdate || null,
+        zra_status: saleInstance.zra_status || null,
+        zra_error: saleInstance.zra_error || null,
+        receipt_printed: saleInstance.receipt_printed ?? null,
+      },
+      items: (saleInstance.items || []).map((item) => ({
+        product_id: item.product_id,
+        quantity: Number(item.quantity),
+        unit_price: Number(item.unit_price),
+        total_price: Number(item.total_price),
+        tax_exclusive_total: Number(item.tax_exclusive_total || 0),
+        product: {
+          id: item.product?.id || null,
+          name: item.product?.name || null,
+          product_code: item.product?.product_code || null,
+          formatted_product_code: item.product?.formatted_product_code || null,
+          price: Number(item.product?.price || 0),
+        },
+      })),
+      customer: saleInstance.customer || null,
+      discount: saleInstance.discount || null,
+    };
+  }
+
+  async publishSaleStatusSync(saleInstance) {
+    if (!this.models.sync_outbox) {
+      return null;
+    }
+
+    const storeId = this.resolveSaleStoreId(saleInstance);
+    if (!storeId) {
+      console.warn(`ZraRetryJob: cannot queue central sync for sale ${saleInstance.id} without store id`);
+      return null;
+    }
+
+    try {
+      const payload = this.buildSaleSyncPayload(saleInstance);
+      const existingOutbox = await this.models.sync_outbox.findOne({
+        where: {
+          event_type: 'sale.created',
+          aggregate_type: 'sale',
+          aggregate_id: String(saleInstance.id),
+          store_id: storeId,
+          status: { [this.models.Sequelize.Op.in]: ['pending', 'failed', 'dead_letter'] },
+        },
+      });
+
+      if (existingOutbox) {
+        return await existingOutbox.update({
+          payload,
+          status: 'pending',
+          attempt_count: 0,
+          next_retry_at: new Date(),
+          last_error: null,
+          response_payload: null,
+        });
+      }
+
+      return await this.models.sync_outbox.create({
+        event_type: 'sale.created',
+        aggregate_type: 'sale',
+        aggregate_id: String(saleInstance.id),
+        store_id: storeId,
+        user_id: saleInstance.user_id,
+        receipt_number: saleInstance.receipt_number,
+        idempotency_key: `sale.created:store-${storeId}:sale-${saleInstance.id}:zra-status:${Date.now()}`,
+        payload,
+        status: 'pending',
+        attempt_count: 0,
+        next_retry_at: new Date(),
+      });
+    } catch (error) {
+      console.error('ZraRetryJob: failed to queue sale status sync:', error.message);
+      return null;
     }
   }
 
@@ -119,27 +236,24 @@ class ZraRetryJob {
 
       const user = saleInstance.cashier || { store_id: null, id: saleInstance.user_id };
 
-      const salesData = await this.zraService.transformToZRASalesData(saleDataForZRA, items, user);
+      const salesData = await this.zraService.transformToZRASalesData(
+        saleDataForZRA,
+        items,
+        user,
+        saleInstance.invnumber || null
+      );
       const response = await this.zraService.sendSalesData(salesData);
 
-      if (response.success && response.data && response.data.data) {
-        const d = response.data.data;
-        const updates = {
-          invnumber: salesData?.cisInvcNo || d.invoiceNo || d.invNumber || d.invnumber || null,
-          receipt_no: d.rcptNo || null,
-          sdcid: d.sdcId || null,
-          receiptsig: d.rcptSign || null,
-          intrldata: d.intrlData || null,
-          qrcode_url: d.qrCodeUrl || null,
-          vsdcrcpdate: d.vsdcRcptPbctDate || null,
-          invoice_no: (d.sdcId && d.rcptNo) ? ("INV" + String(d.sdcId).substring(3) + "/" + d.rcptNo) : saleInstance.invoice_no,
-          zra_status: 'sent',
-          zra_error: null,
-          last_retry_at: new Date(),
-          next_retry_at: null
-        };
-        await saleInstance.update(updates);
-        return { success: true };
+      if (response.success) {
+        const zraResult = await buildSaleUpdatesFromZraResponse(saleInstance.invnumber, response);
+        if (zraResult.success) {
+          await saleInstance.update(zraResult.updates);
+          await this.publishSaleStatusSync(saleInstance);
+          return { success: true };
+        }
+
+        await this.applyBackoff(saleInstance, zraResult.error || 'Failed to apply ZRA response');
+        return { success: false };
       } else {
         await this.applyBackoff(saleInstance, response.error || 'Unknown ZRA error');
         return { success: false };
@@ -162,6 +276,7 @@ class ZraRetryJob {
       zra_status: status,
       zra_error: errorMessage?.toString().slice(0, 1000)
     });
+    await this.publishSaleStatusSync(saleInstance);
   }
 
   async retryCreditNote(creditNoteInstance) {

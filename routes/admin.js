@@ -270,6 +270,11 @@ router.get('/day-end-history', auth, async (req, res) => {
             order: [['createdAt', 'ASC']],
         });
 
+        // NOTE: We intentionally do NOT sort in SQL here. The `payload` column is a
+        // large JSON/TEXT blob, and an ORDER BY forces MySQL's filesort to buffer the
+        // full row (including payload) which can overflow sort_buffer_size and throw
+        // ER_OUT_OF_SORTMEMORY (errno 1038). The result set is at most one row per day,
+        // so we sort in JS below instead.
         const outboxRows = await sync_outbox.findAll({
             attributes: ['id', 'aggregate_id', 'payload', 'status', 'last_error', 'sent_at', 'updated_at'],
             where: {
@@ -282,7 +287,15 @@ router.get('/day-end-history', auth, async (req, res) => {
                     ],
                 },
             },
-            order: [['updated_at', 'DESC'], ['id', 'DESC']],
+        });
+
+        outboxRows.sort((left, right) => {
+            const leftUpdated = new Date(left.updated_at).getTime();
+            const rightUpdated = new Date(right.updated_at).getTime();
+            if (rightUpdated !== leftUpdated) {
+                return rightUpdated - leftUpdated;
+            }
+            return right.id - left.id;
         });
 
         const datesWithSales = new Set(

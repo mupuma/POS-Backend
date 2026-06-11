@@ -51,14 +51,28 @@ class SyncOutboxJob {
 
     try {
       const now = new Date();
-      const rows = await this.models.sync_outbox.findAll({
+      // Two-step fetch to avoid MySQL filesort over the large `payload`/`response_payload`
+      // JSON blobs (ER_OUT_OF_SORTMEMORY). First select only the light `id` column for the
+      // ordered+limited scan, then load the full rows by PK.
+      const candidates = await this.models.sync_outbox.findAll({
+        attributes: ['id'],
         where: {
           status: ['pending', 'failed'],
           next_retry_at: { [Op.lte]: now }
         },
         order: [['id', 'ASC']],
-        limit: 20
+        limit: 20,
+        raw: true
       });
+
+      const candidateIds = candidates.map((row) => row.id);
+      let rows = [];
+      if (candidateIds.length > 0) {
+        rows = await this.models.sync_outbox.findAll({
+          where: { id: { [Op.in]: candidateIds } }
+        });
+        rows.sort((left, right) => left.id - right.id);
+      }
 
       for (const row of rows) {
         await this.sendOne(row);

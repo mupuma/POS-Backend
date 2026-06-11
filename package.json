@@ -10,6 +10,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "stress:seed": "node scripts/stressSeed.js",
+    "stress:load": "node scripts/stressLoad.js",
     "build:exe": "pkg . --targets node22-win-x64  --output dist/pos-backend.exe"
   },
   "dependencies": {

@@ -371,9 +371,12 @@ router.get('/:id/performance', auth, async (req, res) => {
       };
     }
 
+    // Aggregation only needs scalar fields; restrict attributes so we never load the
+    // large sale TEXT/JSON columns, and drop the ORDER BY (order is irrelevant for the
+    // grouped metrics) -> avoids filesort over blobs on an unbounded scan.
     const userSales = await sale.findAll({
-      where: whereClause,
-      order: [['sale_date', 'DESC']]
+      attributes: ['id', 'sale_date', 'total_amount', 'discount_amount', 'payment_method'],
+      where: whereClause
     });
 
     // Calculate performance metrics
@@ -434,7 +437,10 @@ router.get('/reports/all-performance', auth, async (req, res) => {
       };
     }
 
+    // Restrict attributes so an admin "all users" scan over the entire sales table never
+    // loads the large sale TEXT/JSON columns into memory.
     const allSales = await sale.findAll({
+      attributes: ['id', 'user_id', 'total_amount', 'discount_amount'],
       where: whereClause,
       include: [
         {

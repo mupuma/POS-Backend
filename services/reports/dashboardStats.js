@@ -9,19 +9,33 @@ async function computeDashboardStats(req) {
     const breakdown = {};
     for (const s of sales) {
       const totalAmount = parseFloat(s.total_amount || 0) || 0;
+      const receiptNumber = s.receipt_number || (s.id != null ? String(s.id) : '-');
+      const time = s.sale_date?.toISOString?.() || '';
+
+      const addReceipt = (method, amt) => {
+        const key = method || 'unknown';
+        if (!breakdown[key]) {
+          breakdown[key] = { total: 0, receipts: [] };
+        }
+        breakdown[key].total += Number(amt || 0);
+        breakdown[key].receipts.push({
+          receipt_number: receiptNumber,
+          time,
+          amount: Number(amt || 0),
+        });
+      };
+
       const bd = s.payments_breakdown;
       if (bd && typeof bd === 'object') {
         const sum = Object.values(bd).reduce((acc, v) => acc + Number(v || 0), 0);
         if (sum > 0) {
           for (const [method, amt] of Object.entries(bd)) {
-            const key = method || 'unknown';
-            breakdown[key] = (breakdown[key] || 0) + Number(amt || 0);
+            addReceipt(method, amt);
           }
           continue;
         }
       }
-      const method = s.payment_method || 'unknown';
-      breakdown[method] = (breakdown[method] || 0) + totalAmount;
+      addReceipt(s.payment_method || 'unknown', totalAmount);
     }
     return breakdown;
   }

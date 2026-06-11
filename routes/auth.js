@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Op } = require('sequelize');
+const { Op, ValidationError, UniqueConstraintError, ForeignKeyConstraintError } = require('sequelize');
 const { user, store } = require('../models');
 const auth = require('../middleware/auth');
 const { buildActorFromUser, buildTargetFromUser, logRequestAudit } = require('../services/auditLogService');
@@ -15,8 +15,23 @@ function getModels(req) {
 // Register new user (admin only)
 router.post('/register', auth, async (req, res) => {
     try {
+        console.log('[auth/register] endpoint:', req.originalUrl);
+        console.log('[auth/register] payload:', JSON.stringify(req.body));
         const models = getModels(req);
-        const { username, password, full_name, role } = req.body;
+        const { username, password, full_name, role, store_id } = req.body;
+
+        if (!req.user) {
+            return res.status(401).json({ message: 'Unauthorized' });
+        }
+
+        if (!username || !password || !full_name) {
+            return res.status(400).json({ message: 'username, password, and full_name are required' });
+        }
+
+        const normalizedRole = String(role || 'cashier').toLowerCase();
+        if (!['admin', 'cashier'].includes(normalizedRole)) {
+            return res.status(400).json({ message: 'Invalid role. Allowed values: admin, cashier' });
+        }
 
         // Check if user is admin
         if (req.user.role !== 'admin') {
@@ -50,12 +65,32 @@ router.post('/register', auth, async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const password_hash = await bcrypt.hash(password, salt);
 
+        const effectiveStoreId = store_id || req.user.store_id;
+        if (!effectiveStoreId) {
+            await logRequestAudit(models, req, {
+                action: 'user.create',
+                outcome: 'failure',
+                entityType: 'user',
+                ...buildActorFromUser(req.user),
+                target_identifier: username || null,
+                target_name: full_name || null,
+                details: { reason: 'Admin user must belong to a store to create users' },
+            });
+            return res.status(400).json({ message: 'Admin user must belong to a store to create users' });
+        }
+
+        const targetStore = await store.findByPk(effectiveStoreId);
+        if (!targetStore) {
+            return res.status(400).json({ message: 'Specified store_id does not exist' });
+        }
+
         // Create user
         const newUser = await user.create({
             username,
             password_hash,
             full_name,
-            role: role || 'cashier'
+            role: normalizedRole,
+            store_id: effectiveStoreId
         });
 
         await logRequestAudit(models, req, {
@@ -81,8 +116,24 @@ router.post('/register', auth, async (req, res) => {
         });
 
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error' });
+        console.error('[auth/register] error:', error.stack || error);
+
+        if (error instanceof UniqueConstraintError) {
+            return res.status(400).json({ message: 'Username already exists' });
+        }
+
+        if (error instanceof ForeignKeyConstraintError) {
+            return res.status(400).json({ message: 'Invalid store_id for new user' });
+        }
+
+        if (error instanceof ValidationError) {
+            return res.status(400).json({
+                message: 'Validation error while creating user',
+                errors: error.errors.map((e) => e.message),
+            });
+        }
+
+        res.status(500).json({ message: 'Server error', error: process.env.NODE_ENV === 'development' ? error.message : undefined });
     }
 });
 

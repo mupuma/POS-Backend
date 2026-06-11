@@ -38,7 +38,15 @@ function buildTargetFromUser(targetUser) {
     };
 }
 
+const { writeFileAuditLog } = require('./fileAuditLogger');
+
 async function writeAuditLog(models, entry) {
+    try {
+        writeFileAuditLog(entry);
+    } catch (fileError) {
+        console.error('Failed to write file audit log:', fileError.message);
+    }
+
     if (!models?.auditLog) {
         return null;
     }

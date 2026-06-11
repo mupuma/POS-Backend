@@ -1,5 +1,7 @@
 require('dotenv').config();
 
+const { initLogDirectory } = require('./services/fileAuditLogger');
+
 const { app } = require('./app');
 const db = require('./models');
 const { createServer } = require('node:http');
@@ -7,11 +9,13 @@ const { initializeNotificationSystem, setGlobalNotificationService } = require('
 const InventorySyncJob = require("./jobs/inventorySyncJob");
 const ZraRetryJob = require("./jobs/zraRetryJob");
 const DayEndJob = require("./jobs/dayEndJob");
+const SalesReportEmailJob = require("./jobs/salesReportEmailJob");
 const CustomerKycJob = require("./jobs/customerKycJob");
 const models = require("./models");
 const inventorySyncJob = new InventorySyncJob(models);
 const zraRetryJob = new ZraRetryJob(models);
 const dayEndJob = new DayEndJob(models);
+const salesReportEmailJob = new SalesReportEmailJob(models);
 const SyncOutboxJob = require("./jobs/syncOutboxJob");
 const syncOutboxJob = new SyncOutboxJob(models);
 const customerKycJob = new CustomerKycJob(models);
@@ -85,15 +89,59 @@ async function ensureCreditNoteSchema() {
   }
 }
 
+// Ensure indexes exist on frequently-sorted columns. Without an index on the
+// ORDER BY column, MySQL must filesort the matching rows, and because tables like
+// `sales`/`credit_notes` carry large TEXT/JSON columns (notes, zra_error,
+// payments_breakdown, etc.) the sort buffer overflows once there are thousands of
+// rows -> ER_OUT_OF_SORTMEMORY. An index lets the optimizer order via the index and
+// skip the filesort entirely. Idempotent: only adds an index when it is missing.
+async function ensureIndexes() {
+  const queryInterface = models.sequelize.getQueryInterface();
+
+  const indexPlan = [
+    ['sales', ['sale_date'], 'idx_sales_sale_date'],
+    ['sales', ['created_at'], 'idx_sales_created_at'],
+    ['sales', ['user_id'], 'idx_sales_user_id'],
+    ['credit_notes', ['credit_note_date'], 'idx_credit_notes_credit_note_date'],
+    ['credit_notes', ['created_at'], 'idx_credit_notes_created_at'],
+    ['credit_notes', ['user_id'], 'idx_credit_notes_user_id'],
+    ['credit_notes', ['original_sale_id'], 'idx_credit_notes_original_sale_id'],
+    ['notifications', ['created_at'], 'idx_notifications_created_at'],
+    ['notifications', ['user_id'], 'idx_notifications_user_id'],
+    ['audit_logs', ['occurred_at'], 'idx_audit_logs_occurred_at'],
+    ['products', ['name'], 'idx_products_name'],
+    ['customers', ['zra_lookup_requested_at'], 'idx_customers_zra_lookup_requested_at'],
+  ];
+
+  for (const [table, fields, name] of indexPlan) {
+    try {
+      const existing = await queryInterface.showIndex(table);
+      if (existing.some((index) => index.name === name)) {
+        continue;
+      }
+      await queryInterface.addIndex(table, fields, { name });
+      console.log(`Created index ${name} on ${table}(${fields.join(', ')})`);
+    } catch (error) {
+      console.warn(`Skipped index ${name} on ${table}: ${error.message}`);
+    }
+  }
+}
+
 // Expose the job for routes to allow manual triggering
 app.locals.inventorySyncJob = inventorySyncJob;
 app.locals.zraRetryJob = zraRetryJob;
 app.locals.dayEndJob = dayEndJob;
+app.locals.salesReportEmailJob = salesReportEmailJob;
 app.locals.syncOutboxJob = syncOutboxJob;
 app.locals.customerKycJob = customerKycJob;
 app.locals.models = models;
 
 const PORT = process.env.PORT || 3000;
+
+const logPaths = initLogDirectory();
+console.log(`POS audit log directory: ${logPaths.root}`);
+console.log(`Sales log (readable): ${logPaths.salesReadable}`);
+console.log(`Sales log (JSON):     ${logPaths.salesJson}`);
 
 // Create HTTP server and initialize notifications
 const server = createServer(app);
@@ -102,6 +150,7 @@ setGlobalNotificationService(notificationService);
 inventorySyncJob.start();
 zraRetryJob.start();
 dayEndJob.start();
+salesReportEmailJob.start();
 syncOutboxJob.start();
 customerKycJob.start();
 // Graceful shutdown
@@ -110,6 +159,7 @@ process.on('SIGTERM', () => {
   inventorySyncJob.stop();
   zraRetryJob.stop();
   dayEndJob.stop();
+  salesReportEmailJob.stop();
   syncOutboxJob.stop();
   customerKycJob.stop();
   process.exit(0);
@@ -120,6 +170,7 @@ process.on('SIGINT', () => {
   inventorySyncJob.stop();
   zraRetryJob.stop();
   dayEndJob.stop();
+  salesReportEmailJob.stop();
   syncOutboxJob.stop();
   customerKycJob.stop();
   process.exit(0);
@@ -138,7 +189,8 @@ db.sequelize.authenticate()
   .then(() => {
     setStartupState('ensuring_schema');
     return ensureCustomerSchema()
-      .then(() => ensureCreditNoteSchema());
+      .then(() => ensureCreditNoteSchema())
+      .then(() => ensureIndexes());
   })
   .then(() => {
     setStartupState('database_syncing');

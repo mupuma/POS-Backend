@@ -3,6 +3,7 @@ const { sale, creditnote, creditnoteitem, product, user, customer, store, produc
 const auth = require('../middleware/auth');
 const { Op, literal } = require('sequelize');
 const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
+const { buildListQueryFilters } = require('../services/query/listFilters');
 
 const router = express.Router();
 // In-memory lock set to prevent duplicate credit note processing for the same sale in concurrent requests
@@ -390,6 +391,12 @@ router.get('/', auth, async (req, res) => {
         const offset = (page - 1) * limit;
         const filterStoreId = req.user.store_id;
 
+        const whereClause = buildListQueryFilters(req, {
+            dateField: 'credit_note_date',
+            amountField: 'total_amount',
+            searchFields: ['receipt_number', 'receipt_no', 'invoice_no', 'invnumber'],
+        });
+
         // Build the user include object properly
         const userInclude = {
             model: user,
@@ -406,18 +413,33 @@ router.get('/', auth, async (req, res) => {
         const include = [
             userInclude,
             { model: customer, as: 'customer' },
+            {
+                model: sale,
+                as: 'originalSale',
+                attributes: ['id', 'receipt_number', 'receipt_no', 'invoice_no', 'total_amount', 'sale_date'],
+            },
             { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] }
         ];
 
         const { count, rows } = await creditnote.findAndCountAll({
+            where: whereClause,
             limit,
             offset,
             order: [['credit_note_date', 'DESC']],
             include
         });
 
+        const creditNotes = rows.map((row) => {
+            const plain = row.get ? row.get({ plain: true }) : row;
+            return {
+                ...plain,
+                original_receipt_no: plain.originalSale?.receipt_number || null,
+                original_receipt_number: plain.originalSale?.receipt_number || null,
+            };
+        });
+
         res.json({
-            creditNotes: rows,
+            creditNotes,
             pagination: {
                 current_page: page,
                 total_pages: Math.ceil(count / limit),

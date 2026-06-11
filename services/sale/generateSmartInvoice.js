@@ -63,36 +63,35 @@ class ZRAIntegrationService {
      * @param {number} store_id
      * @returns {Promise<string>}
      */
-    async generateCISInvoiceNumber(store_id) {
+    async generateCISInvoiceNumber(store_id, transaction = null) {
         try {
-            // Retrieve the store record
-            let storeObj = await store.findByPk(store_id);
+            const findOptions = { transaction };
+            if (transaction) {
+                findOptions.lock = transaction.LOCK.UPDATE;
+            }
+
+            let storeObj = await store.findByPk(store_id, findOptions);
 
             if (!storeObj) {
                 throw new Error('Store not found');
             }
 
-            // Get the current invoice number, e.g., "INV1001-1"
             const currentInvoice = storeObj.invoice_number;
-
-            // Use regex to extract the prefix and the numeric part
-            const match = currentInvoice.match(/^(INV\d+-)(\d+)$/);
+            const match = currentInvoice && currentInvoice.match(/^(INV\d+-)(\d+)$/);
 
             if (!match) {
-                throw new Error('Invalid invoice number format');
+                const storeNumDigits = (storeObj.store_number || '').match(/(\d+)/)?.[1] || '1001';
+                const fallback = `INV${storeNumDigits}-1`;
+                await storeObj.update({ invoice_number: fallback }, { transaction });
+                return fallback;
             }
 
-            const prefix = match[1]; // "INV1001-"
-            const number = parseInt(match[2], 10); // 1
-
-            // Increment the number
+            const prefix = match[1];
+            const number = parseInt(match[2], 10);
             const newNumber = number + 1;
-
-            // Construct the new invoice number
             const newInvoiceNumber = `${prefix}${newNumber}`;
 
-            // Update the store with the new invoice number
-            await storeObj.update({ invoice_number: newInvoiceNumber });
+            await storeObj.update({ invoice_number: newInvoiceNumber }, { transaction });
 
             return newInvoiceNumber;
 
@@ -108,9 +107,14 @@ class ZRAIntegrationService {
      * @param {number} store_id
      * @returns {Promise<string>}
      */
-    async generateReceiptNumber(store_id) {
+    async generateReceiptNumber(store_id, transaction = null) {
         try {
-            let storeObj = await store.findByPk(store_id);
+            const findOptions = { transaction };
+            if (transaction) {
+                findOptions.lock = transaction.LOCK.UPDATE;
+            }
+
+            let storeObj = await store.findByPk(store_id, findOptions);
             if (!storeObj) {
                 throw new Error('Store not found');
             }
@@ -123,7 +127,7 @@ class ZRAIntegrationService {
                 // If format is invalid or empty, derive from store_number if possible
                 const storeNumDigits = (storeObj.store_number || '').match(/(\d+)/)?.[1] || '1001';
                 const fallback = `RCP${storeNumDigits}-1`;
-                await storeObj.update({ receipt_number: fallback });
+                await storeObj.update({ receipt_number: fallback }, { transaction });
                 return fallback;
             }
 
@@ -132,7 +136,7 @@ class ZRAIntegrationService {
             const newNumber = number + 1;
             const newReceiptNumber = `${prefix}${newNumber}`;
 
-            await storeObj.update({ receipt_number: newReceiptNumber });
+            await storeObj.update({ receipt_number: newReceiptNumber }, { transaction });
             return newReceiptNumber;
         } catch (error) {
             console.error('Error generating receipt number:', error);
@@ -147,7 +151,7 @@ class ZRAIntegrationService {
      * @param {object} user
      * @returns {Promise<object>}
      */
-    async transformToZRASalesData(saleData, items, user) {
+    async transformToZRASalesData(saleData, items, user, cisInvcNo = null) {
         const currentDateTime = this.formatZRADateTime();
         const currentDate = this.formatZRADate();
         const customerTpin = String(saleData.customer?.tpin || '').trim();
@@ -158,8 +162,8 @@ class ZRAIntegrationService {
             || ''
         ).trim();
 
-        // Generate invoice number
-        const cisInvoiceNo = await this.generateCISInvoiceNumber(user.store_id);
+        // Use the pre-assigned CIS invoice number when retrying or after local sale save
+        const cisInvoiceNo = cisInvcNo || await this.generateCISInvoiceNumber(user.store_id);
 
         // Calculate totals
         let totalTaxableAmountA = 0;

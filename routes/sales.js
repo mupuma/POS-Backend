@@ -6,11 +6,19 @@ const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
 const { annotateSalesWithReturnState } = require('../services/sales/returnState');
+const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
 
 const router = express.Router();
 
+function getModels(req) {
+    return req.app.locals.models || require('../models');
+}
+
 // Import the correct ZRA Integration Service
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice'); // Adjust path as needed
+const { buildSaleUpdatesFromZraResponse } = require('../services/sale/zraSaleResponse');
+const { buildListQueryFilters } = require('../services/query/listFilters');
+const { sortRows } = require('../services/query/inMemorySort');
 // Deprecated random receipt generator (kept for reference)
 // const generateReceiptNumber = () => {
 //     const now = new Date();
@@ -50,6 +58,8 @@ async function generateQrCode(qrcode_url, receiptNo, saveDirectory) {
 }
 
 function buildSaleSyncPayload(saleRecord) {
+    const storeId = saleRecord.store_id || saleRecord.cashier?.store_id || null;
+
     return {
         branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
         terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
@@ -57,7 +67,7 @@ function buildSaleSyncPayload(saleRecord) {
             id: saleRecord.id,
             receipt_number: saleRecord.receipt_number,
             user_id: saleRecord.user_id,
-            store_id: saleRecord.store_id,
+            store_id: storeId,
             branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
             terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
             customer_id: saleRecord.customer_id || null,
@@ -104,28 +114,21 @@ function buildSaleSyncPayload(saleRecord) {
 }
 
 function normalizeZraSalesData(salesResponse) {
-    const outer = salesResponse?.data || null;
-    const inner = outer?.data || null;
-
-    return {
-        rcptNo: inner?.rcptNo ?? outer?.rcptNo ?? null,
-        sdcId: inner?.sdcId ?? outer?.sdcId ?? null,
-        rcptSign: inner?.rcptSign ?? outer?.rcptSign ?? null,
-        intrlData: inner?.intrlData ?? outer?.intrlData ?? null,
-        qrCodeUrl: inner?.qrCodeUrl ?? outer?.qrCodeUrl ?? null,
-        vsdcRcptPbctDate: inner?.vsdcRcptPbctDate ?? outer?.vsdcRcptPbctDate ?? null,
-        resultCd: outer?.resultCd ?? null,
-        resultMsg: outer?.resultMsg ?? null,
-        raw: salesResponse?.data || null,
-    };
+    const { normalizeZraSalesData: normalize } = require('../services/sale/zraSaleResponse');
+    return normalize(salesResponse);
 }
 
 async function requeueSaleSyncEvent(saleRecord, models) {
+    const storeId = saleRecord.store_id || saleRecord.cashier?.store_id || null;
     console.log('[sales] requeueSaleSyncEvent start', {
       saleId: saleRecord.id,
-      storeId: saleRecord.store_id,
+      storeId,
       receiptNumber: saleRecord.receipt_number,
     });
+
+    if (!storeId) {
+        throw new Error('Cannot requeue sale sync event without a store id');
+    }
 
     const payload = buildSaleSyncPayload(saleRecord);
     const existingOutbox = await models.sync_outbox.findOne({
@@ -133,7 +136,7 @@ async function requeueSaleSyncEvent(saleRecord, models) {
             event_type: 'sale.created',
             aggregate_type: 'sale',
             aggregate_id: String(saleRecord.id),
-            store_id: saleRecord.store_id,
+            store_id: storeId,
             status: { [Op.in]: ['pending', 'failed', 'dead_letter'] }
         }
     });
@@ -159,10 +162,10 @@ async function requeueSaleSyncEvent(saleRecord, models) {
         event_type: 'sale.created',
         aggregate_type: 'sale',
         aggregate_id: String(saleRecord.id),
-        store_id: saleRecord.store_id,
+        store_id: storeId,
         user_id: saleRecord.user_id,
         receipt_number: saleRecord.receipt_number,
-        idempotency_key: `sale.created:store-${saleRecord.store_id}:sale-${saleRecord.id}:reprocess:${Date.now()}`,
+        idempotency_key: `sale.created:store-${storeId}:sale-${saleRecord.id}:reprocess:${Date.now()}`,
         payload,
         status: 'pending',
         attempt_count: 0,
@@ -176,6 +179,7 @@ async function requeueSaleSyncEvent(saleRecord, models) {
 
 router.post('/', auth, async (req, res) => {
     const t = await sale.sequelize.transaction();
+    let committed = false;
 
     try {
         console.log(req.body)
@@ -190,14 +194,30 @@ router.post('/', auth, async (req, res) => {
             notes
         } = req.body;
 
+        const models = getModels(req);
+
         // Validate items
         if (!items || items.length === 0) {
+            await logRequestAudit(models, req, {
+                action: 'sale.create',
+                outcome: 'failure',
+                entityType: 'sale',
+                ...buildActorFromUser(req.user),
+                details: { reason: 'Sale must have at least one item' },
+            });
             return res.status(400).json({ message: 'Sale must have at least one item' });
         }
 
         // Validate user has store_id
         if (!req.user.store_id) {
             await t.rollback();
+            await logRequestAudit(models, req, {
+                action: 'sale.create',
+                outcome: 'failure',
+                entityType: 'sale',
+                ...buildActorFromUser(req.user),
+                details: { reason: 'User must be associated with a store' },
+            });
             return res.status(400).json({ message: 'User must be associated with a store' });
         }
 
@@ -211,6 +231,13 @@ router.post('/', auth, async (req, res) => {
 
             if (!productData) {
                 await t.rollback();
+                await logRequestAudit(models, req, {
+                    action: 'sale.create',
+                    outcome: 'failure',
+                    entityType: 'sale',
+                    ...buildActorFromUser(req.user),
+                    details: { reason: `Product with ID ${item.product_id} not found` },
+                });
                 return res.status(400).json({ message: `Product with ID ${item.product_id} not found` });
             }
 
@@ -224,6 +251,18 @@ router.post('/', auth, async (req, res) => {
 
             if (availableQty < item.quantity) {
                 await t.rollback();
+                await logRequestAudit(models, req, {
+                    action: 'sale.create',
+                    outcome: 'failure',
+                    entityType: 'sale',
+                    ...buildActorFromUser(req.user),
+                    details: {
+                        reason: `Insufficient stock for ${productData.name}`,
+                        product_id: item.product_id,
+                        requested_quantity: item.quantity,
+                        available_quantity: availableQty,
+                    },
+                });
                 return res.status(400).json({
                     message: `Insufficient stock for ${productData.name}. Available: ${availableQty}`
                 });
@@ -308,6 +347,17 @@ router.post('/', auth, async (req, res) => {
 
         if (change_amount < 0) {
             await t.rollback();
+            await logRequestAudit(models, req, {
+                action: 'sale.create',
+                outcome: 'failure',
+                entityType: 'sale',
+                ...buildActorFromUser(req.user),
+                details: {
+                    reason: 'Insufficient payment amount',
+                    total_amount,
+                    amount_paid: effective_amount_paid,
+                },
+            });
             return res.status(400).json({ message: 'Insufficient payment amount' });
         }
 
@@ -333,76 +383,19 @@ router.post('/', auth, async (req, res) => {
             discount: discountData,
         };
 
-        // Initialize ZRA Integration Service
+        // Initialize ZRA Integration Service (submission happens after local save)
         const zraService = new ZRAIntegrationService();
 
-        console.log('Processing ZRA sale endpoint...');
-        let zraFailed = false;
-        let zraError = null;
-        let saveSalesData = null;
-
-        // Process only the ZRA Sales endpoint first
-        const salesData = await zraService.transformToZRASalesData(saleDataForZRA, saleItems, req.user);
-        const salesResponse = await zraService.sendSalesData(salesData);
-
-        console.log('ZRA Sales Response for sale request:', JSON.stringify({
-            success: salesResponse.success,
-            endpoint: salesResponse.endpoint,
-            shouldRetry: salesResponse.shouldRetry,
-            data: salesResponse.data,
-            error: salesResponse.error
-        }, null, 2));
-
-        if (!salesResponse.success) {
-            // Do NOT rollback the sale — mark for retry and continue saving locally
-            zraFailed = true;
-            console.error('ZRA Sales Integration failed:', salesResponse.error);
-            zraError = typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error);
-        } else {
-            console.log('ZRA sales integration successful:', salesResponse.data);
-            saveSalesData = normalizeZraSalesData(salesResponse);
-        }
-
-        if (saveSalesData) {
-            console.log('ZRA Sales Data:', saveSalesData);
-        }
-
-        // Generate QR code file path (but don't await it here to avoid blocking)
-        let qrFilePath = null;
-        if (saveSalesData && saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
-            try {
-                qrFilePath = await generateQrCode(
-                    saveSalesData.qrCodeUrl,
-                    saveSalesData.rcptNo,
-                    "./qrcodes"
-                );
-            } catch (qrError) {
-                console.error('QR Code generation failed:', qrError);
-                // Don't fail the entire transaction for QR code generation
-            }
-        }
-
-        console.log('Creating sale record...');
+        console.log('Saving sale locally before ZRA submission...');
 
         // Helper to safely limit string lengths to avoid DB truncation errors
         const limitStr = (v, n) => (v == null ? null : String(v).slice(0, n));
 
-        // Generate incremental receipt number per store
-        const receiptNumber = await zraService.generateReceiptNumber(req.user.store_id);
+        // Reserve receipt + CIS invoice numbers inside the transaction
+        const receiptNumber = await zraService.generateReceiptNumber(req.user.store_id, t);
+        const cisInvoiceNo = await zraService.generateCISInvoiceNumber(req.user.store_id, t);
 
-        // Extract potential ZRA values first
-        const zraInvNumberRaw = (salesData && salesData.cisInvcNo) || (saveSalesData ? (saveSalesData.invoiceNo || saveSalesData.invNumber || saveSalesData.invnumber) : null);
-        const zraReceiptNoRaw = saveSalesData ? (saveSalesData.rcptNo || null) : null;
-        const zraSdcIdRaw = saveSalesData ? (saveSalesData.sdcId || null) : null;
-        const zraRcptSignRaw = saveSalesData ? (saveSalesData.rcptSign || null) : null;
-        const zraIntrlDataRaw = saveSalesData ? (saveSalesData.intrlData || null) : null;
-        const zraQrUrlRaw = saveSalesData ? (saveSalesData.qrCodeUrl || null) : null;
-        const zraVsdcDateRaw = saveSalesData ? (saveSalesData.vsdcRcptPbctDate || null) : null;
-        const computedInvoiceNoRaw = (saveSalesData && saveSalesData.sdcId && saveSalesData.rcptNo)
-            ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
-            : null;
-
-        // Create sale regardless of ZRA status
+        // Create sale locally first so ZRA success can never be orphaned from our DB
         const newSale = await sale.create({
             receipt_number: receiptNumber,
             user_id: req.user.id,
@@ -417,21 +410,19 @@ router.post('/', auth, async (req, res) => {
             change_amount,
             notes: notes || null,
             payments_breakdown: payments_breakdown_obj,
-            // ZRA fields - may be null if offline (apply safe length limits to match model)
-            invnumber: limitStr(zraInvNumberRaw, 50),
-            receipt_no: limitStr(zraReceiptNoRaw, 50),
-            sdcid: limitStr(zraSdcIdRaw, 50),
-            receiptsig: limitStr(zraRcptSignRaw, 50),
-            intrldata: limitStr(zraIntrlDataRaw, 100),
-            qrcode_url: limitStr(zraQrUrlRaw, 255),
-            vsdcrcpdate: limitStr(zraVsdcDateRaw, 100),
-            invoice_no: limitStr(computedInvoiceNoRaw, 100),
-            qrfilepath: limitStr(qrFilePath, 255),
-            // Retry/Offline flags
-            zra_status: zraFailed ? 'pending' : 'sent',
-            zra_error: zraFailed ? (typeof salesResponse.error === 'string' ? salesResponse.error : JSON.stringify(salesResponse.error)) : null,
-            retry_count: zraFailed ? 0 : 0,
-            next_retry_at: zraFailed ? new Date(Date.now() + 2 * 60 * 1000) : null,
+            invnumber: limitStr(cisInvoiceNo, 50),
+            receipt_no: null,
+            sdcid: null,
+            receiptsig: null,
+            intrldata: null,
+            qrcode_url: null,
+            vsdcrcpdate: null,
+            invoice_no: null,
+            qrfilepath: null,
+            zra_status: 'pending',
+            zra_error: null,
+            retry_count: 0,
+            next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
             last_retry_at: null,
         }, { transaction: t });
 
@@ -483,16 +474,16 @@ router.post('/', auth, async (req, res) => {
                 notes: notes || null,
                 payments_breakdown: payments_breakdown_obj,
                 sale_date: new Date().toISOString(),
-                invoice_no: saveSalesData?.invoiceNo || saveSalesData?.invNumber || saveSalesData?.invnumber || computedInvoiceNoRaw || null,
-                invnumber: saveSalesData?.invoiceNo || saveSalesData?.invNumber || saveSalesData?.invnumber || salesData?.cisInvcNo || null,
-                receipt_no: saveSalesData?.rcptNo || null,
-                sdcid: saveSalesData?.sdcId || null,
-                receiptsig: saveSalesData?.rcptSign || null,
-                intrldata: saveSalesData?.intrlData || null,
-                qrcode_url: saveSalesData?.qrCodeUrl || null,
-                vsdcrcpdate: saveSalesData?.vsdcRcptPbctDate || null,
-                zra_status: zraFailed ? 'pending' : 'sent',
-                zra_error: zraFailed ? zraError : null
+                invoice_no: null,
+                invnumber: cisInvoiceNo,
+                receipt_no: null,
+                sdcid: null,
+                receiptsig: null,
+                intrldata: null,
+                qrcode_url: null,
+                vsdcrcpdate: null,
+                zra_status: 'pending',
+                zra_error: null
             },
             items: saleItems.map(item => ({
                 product_id: item.product_id,
@@ -527,7 +518,86 @@ router.post('/', auth, async (req, res) => {
         }, { transaction: t });
 
         await t.commit();
+        committed = true;
         console.log('Transaction committed successfully');
+
+        let zraFailed = true;
+        let zraError = null;
+
+        try {
+            console.log('Submitting sale to ZRA after local save...');
+            const salesData = await zraService.transformToZRASalesData(
+                saleDataForZRA,
+                saleItems,
+                req.user,
+                cisInvoiceNo
+            );
+            const salesResponse = await zraService.sendSalesData(salesData);
+
+            console.log('ZRA Sales Response for sale request:', JSON.stringify({
+                success: salesResponse.success,
+                endpoint: salesResponse.endpoint,
+                data: salesResponse.data,
+                error: salesResponse.error
+            }, null, 2));
+
+            if (salesResponse.success) {
+                const zraResult = await buildSaleUpdatesFromZraResponse(cisInvoiceNo, salesResponse);
+                if (zraResult.success) {
+                    await sale.update(zraResult.updates, { where: { id: newSale.id } });
+                    zraFailed = false;
+                } else {
+                    zraError = zraResult.error || 'Failed to apply ZRA response to sale';
+                    await sale.update({
+                        zra_error: zraError,
+                        next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
+                    }, { where: { id: newSale.id } });
+                }
+            } else {
+                zraError = typeof salesResponse.error === 'string'
+                    ? salesResponse.error
+                    : JSON.stringify(salesResponse.error);
+                console.error('ZRA Sales Integration failed:', salesResponse.error);
+                await sale.update({
+                    zra_error: zraError,
+                    next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
+                }, { where: { id: newSale.id } });
+            }
+        } catch (zraIntegrationError) {
+            zraError = zraIntegrationError.message || String(zraIntegrationError);
+            console.error('ZRA integration error after local save:', zraIntegrationError);
+            await sale.update({
+                zra_error: zraError,
+                next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
+            }, { where: { id: newSale.id } });
+        }
+
+        // Refresh outbox payload with latest sale/ZRA fields
+        const refreshedSale = await sale.findByPk(newSale.id, {
+            include: [
+                {
+                    model: saleitem,
+                    as: 'items',
+                    include: [{ model: product, as: 'product' }]
+                },
+                { model: customer, as: 'customer' },
+                { model: discount, as: 'discount' }
+            ]
+        });
+        if (refreshedSale) {
+            const refreshedPayload = buildSaleSyncPayload(refreshedSale);
+            await sync_outbox.update(
+                { payload: refreshedPayload },
+                {
+                    where: {
+                        event_type: 'sale.created',
+                        aggregate_type: 'sale',
+                        aggregate_id: newSale.id,
+                        store_id: req.user.store_id,
+                    }
+                }
+            );
+        }
 
         // Fetch complete sale data for response
         const completeSale = await sale.findByPk(newSale.id, {
@@ -558,6 +628,38 @@ router.post('/', auth, async (req, res) => {
             vsdcRcpDate: salePlain.vsdcrcpdate || salePlain.vsdc_rcp_date || null
         };
 
+        await logRequestAudit(models, req, {
+            action: 'sale.create',
+            outcome: 'success',
+            entityType: 'sale',
+            ...buildActorFromUser(req.user),
+            target_identifier: receiptNumber,
+            target_name: receiptNumber,
+            details: {
+                sale_id: newSale.id,
+                receipt_number: receiptNumber,
+                cis_invoice_no: cisInvoiceNo,
+                total_amount,
+                subtotal,
+                tax_amount,
+                discount_amount,
+                payment_method: effective_payment_method,
+                payments_breakdown: payments_breakdown_obj,
+                item_count: saleItems.length,
+                items: saleItems.map((item) => ({
+                    product_id: item.product_id,
+                    name: item.product?.name || null,
+                    quantity: item.quantity,
+                    unit_price: item.unit_price,
+                    total_price: item.total_price,
+                })),
+                zra_status: zraFailed ? 'pending' : 'sent',
+                zra_error: zraError,
+                receipt_no: salePlain.receipt_no || null,
+                invoice_no: salePlain.invoice_no || null,
+            },
+        });
+
         res.status(201).json({
             message: zraFailed ? 'Sale saved (ZRA pending due to network). Will retry automatically.' : 'Sale completed successfully',
             sale: salePlain,
@@ -576,8 +678,22 @@ router.post('/', auth, async (req, res) => {
         }
 
     } catch (error) {
-        await t.rollback();
+        if (!committed) {
+            await t.rollback();
+        }
         console.error('Sale creation error:', error);
+
+        await logRequestAudit(getModels(req), req, {
+            action: 'sale.create',
+            outcome: 'failure',
+            entityType: 'sale',
+            ...buildActorFromUser(req.user),
+            details: {
+                reason: error.message,
+                error_name: error.name || null,
+                committed,
+            },
+        });
 
         // Check if this is a ZRA-related error
         if (error.message && error.message.includes('ZRA')) {
@@ -711,6 +827,12 @@ router.get('/', auth, async (req, res) => {
         const offset = (page - 1) * limit;
         const filterStoreId = req.user.store_id;
 
+        const whereClause = buildListQueryFilters(req, {
+            dateField: 'sale_date',
+            amountField: 'total_amount',
+            searchFields: ['receipt_number', 'receipt_no', 'invoice_no', 'invnumber'],
+        });
+
         const include = [
             { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'], ...(filterStoreId ? { where: { store_id: filterStoreId }, required: true } : {}) },
             { model: customer, as: 'customer' },
@@ -718,8 +840,9 @@ router.get('/', auth, async (req, res) => {
             { model: saleitem, as: 'items', include: [{ model: product, as: 'product' }] }
         ];
 
-        console.log('[sales] list request', { page, limit, offset, store: filterStoreId });
+        console.log('[sales] list request', { page, limit, offset, store: filterStoreId, filters: whereClause });
         const { count, rows } = await sale.findAndCountAll({
+            where: whereClause,
             limit,
             offset,
             order: [['sale_date', 'DESC']],
@@ -864,15 +987,17 @@ router.get('/report/date-range', auth, async (req, res) => {
             { model: customer, as: 'customer' }
         ];
 
+        // Unbounded date-range scan: sort in JS to avoid a filesort over the large
+        // sale TEXT/JSON columns (notes, zra_error, payments_breakdown).
         const sales = await sale.findAll({
             where: {
                 sale_date: {
                     [Op.between]: [startDate, endDate]
                 }
             },
-            include,
-            order: [['sale_date', 'DESC']]
+            include
         });
+        sortRows(sales, [['sale_date', 'DESC']]);
 
         const activeSales = (await annotateSalesWithReturnState(sales)).filter(s => !s.is_fully_returned);
 

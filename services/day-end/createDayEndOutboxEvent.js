@@ -1,4 +1,5 @@
 const { Op } = require('sequelize');
+const { sortRows } = require('../query/inMemorySort');
 
 function buildUtcDayWindow(dateString) {
   const baseDate = new Date(dateString);
@@ -25,6 +26,8 @@ async function buildDayEndPayload(models, storeId, dateString) {
   const branchId = resolveBranchId();
   const terminalId = resolveTerminalId();
 
+  // Full-day payload build: load all rows for the day then sort in JS by id, so MySQL
+  // never has to filesort the large sale/credit-note TEXT/JSON columns.
   const salesForDay = await sale.findAll({
     where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
     include: [
@@ -32,9 +35,9 @@ async function buildDayEndPayload(models, storeId, dateString) {
       { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
       { model: customer, as: 'customer' },
       { model: discount, as: 'discount' },
-    ],
-    order: [['id', 'ASC']]
+    ]
   });
+  sortRows(salesForDay, [['id', 'ASC']]);
 
   const creditNotesForDay = await creditnote.findAll({
     where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
@@ -42,9 +45,9 @@ async function buildDayEndPayload(models, storeId, dateString) {
       { model: creditnoteitem, as: 'items', include: [{ model: product }] },
       { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
       { model: customer, as: 'customer' },
-    ],
-    order: [['id', 'ASC']]
+    ]
   });
+  sortRows(creditNotesForDay, [['id', 'ASC']]);
 
   return {
     date: dateString,

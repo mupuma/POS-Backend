@@ -74,14 +74,19 @@ async function getReturnStateMap(sales) {
   const saleIds = [...new Set(saleRows.map(sale => sale.id).filter(Boolean))];
   if (saleIds.length === 0) return new Map();
 
+  // Only the scalar amount + item quantities are needed to compute return state.
+  // Restrict attributes so we never select the large TEXT columns (notes, receiptsig,
+  // intrldata, zra_error, sage_error) and drop the ORDER BY (results are grouped into a
+  // map, so order is irrelevant) -> avoids filesort over blobs. This runs on every sale
+  // list/report, so it is a hot path.
   const creditNotes = await creditnote.findAll({
+    attributes: ['id', 'original_sale_id', 'total_amount'],
     where: { original_sale_id: { [Op.in]: saleIds } },
     include: [{
       model: creditnoteitem,
       as: 'items',
       attributes: ['id', 'quantity']
-    }],
-    order: [['createdAt', 'ASC']]
+    }]
   });
 
   const notesBySaleId = new Map();

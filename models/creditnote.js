@@ -197,6 +197,11 @@ module.exports = (sequelize) => {
             foreignKey: 'credit_note_id',
             as: 'items',
         });
+
+        CreditNote.belongsTo(models.sale, {
+            foreignKey: 'original_sale_id',
+            as: 'originalSale',
+        });
     };
 
     return CreditNote;
