@@ -10,7 +10,7 @@ const ZraRetryJob = require('../jobs/zraRetryJob');
 
 const ZRAIntegrationServiceStockDisposal = require("../services/stock-disposal/zraEndPoints");
 const SageInternalUsage = require("../services/stock-disposal/sageInternalUsages");
-const { createDayEndOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
+const { createDayEndOutboxEvent, createCreditNoteBatchOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
 
 function parseYmdDate(rawValue) {
     const match = String(rawValue || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -194,14 +194,26 @@ router.post('/day-end-sync', auth, async (req, res) => {
             dateString,
         });
 
-        if (!queueResult.payload || queueResult.payload.sales_count === 0) {
+        // Credit notes are batched and posted to Sage exactly like sales: as a single
+        // daily consolidated document, instead of one Sage document per credit note.
+        const creditNoteResult = await createCreditNoteBatchOutboxEvent(models, {
+            storeId,
+            userId: req.user.id,
+            dateString,
+        });
+
+        const salesQueued = Boolean(queueResult.queued);
+        const creditNotesQueued = Boolean(creditNoteResult.queued);
+
+        if (!salesQueued && !creditNotesQueued) {
             return res.status(200).json({
-                message: `No sales found on ${dateString} for store. Nothing queued.`,
+                message: `No sales or credit notes found on ${dateString} for store. Nothing queued.`,
                 date: dateString,
                 result: {
                     success: true,
                     queued: false,
                     salesCount: 0,
+                    creditNotesCount: 0,
                 }
             });
         }
@@ -215,14 +227,27 @@ router.post('/day-end-sync', auth, async (req, res) => {
         return res.json({
             message: `Day-end queued for ${dateString}`,
             date: dateString,
-            totalSales: queueResult.payload.sales_count,
+            totalSales: queueResult.payload?.sales_count || 0,
+            totalCreditNotes: creditNoteResult.payload?.credit_notes_count || 0,
             result: {
                 success: true,
                 queued: true,
-                created: queueResult.created,
-                outboxId: queueResult.outboxId,
-                idempotencyKey: queueResult.idempotencyKey,
-                events: queueResult.events || [],
+                sales: {
+                    queued: salesQueued,
+                    created: queueResult.created,
+                    outboxId: queueResult.outboxId,
+                    idempotencyKey: queueResult.idempotencyKey,
+                },
+                creditNotes: {
+                    queued: creditNotesQueued,
+                    created: creditNoteResult.created,
+                    outboxId: creditNoteResult.outboxId,
+                    idempotencyKey: creditNoteResult.idempotencyKey,
+                },
+                events: [
+                    ...(queueResult.events || []),
+                    ...(creditNoteResult.events || []),
+                ],
             }
         });
     } catch (err) {

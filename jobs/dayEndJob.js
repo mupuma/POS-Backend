@@ -1,5 +1,5 @@
 const cron = require('node-cron');
-const { createDayEndOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
+const { createDayEndOutboxEvent, createCreditNoteBatchOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
 
 /**
  * DayEndJob
@@ -38,15 +38,26 @@ class DayEndJob {
       return { ok: false, error: 'Failed to queue day-end event' };
     }
 
-    if (!result.queued) {
-      return { ok: true, queued: false, reason: 'No sales for this store/day' };
+    // Queue the day's credit notes as a single consolidated Sage batch, mirroring sales.
+    const creditNoteResult = await createCreditNoteBatchOutboxEvent(this.models, {
+      storeId: storeInstance.id,
+      userId: null,
+      dateString: todayStr,
+    });
+
+    if (!result.queued && !creditNoteResult.queued) {
+      return { ok: true, queued: false, reason: 'No sales or credit notes for this store/day' };
     }
 
     return {
       ok: true,
       queued: true,
       outboxId: result.outboxId,
-      events: result.events || [],
+      creditNoteOutboxId: creditNoteResult.outboxId,
+      events: [
+        ...(result.events || []),
+        ...(creditNoteResult.events || []),
+      ],
     };
   }
 
