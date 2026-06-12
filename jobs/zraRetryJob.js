@@ -2,6 +2,11 @@ const cron = require('node-cron');
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice');
 const { buildSaleUpdatesFromZraResponse } = require('../services/sale/zraSaleResponse');
 const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
+const {
+  applyCreditNoteZraResult,
+  logCreditNoteEvent,
+  buildCreditNoteAuditDetails,
+} = require('../services/credit-note/persistCreditNote');
 
 class ZraRetryJob {
   constructor(models) {
@@ -297,15 +302,29 @@ class ZraRetryJob {
         reasonCode,
       });
 
-      if (result.success && result.updates) {
-        await creditNoteInstance.update(result.updates);
+      const persisted = await applyCreditNoteZraResult(this.models, creditNoteInstance.id, result);
+
+      if (!persisted.zraFailed) {
+        const reloaded = await this.models.creditnote.findByPk(creditNoteInstance.id, {
+          include: [
+            { model: this.models.creditnoteitem, as: 'items', include: [{ model: this.models.product, as: 'product' }] },
+          ],
+        });
+
+        logCreditNoteEvent({
+          action: 'credit_note.zra_retry',
+          outcome: 'success',
+          actor_user_id: user?.id || creditNoteInstance.user_id,
+          actor_name: user?.full_name || null,
+          store_id: user?.store_id || null,
+          target_identifier: reloaded?.receipt_number,
+          details: buildCreditNoteAuditDetails(reloaded, originalSale, { source: 'zra_retry_job' }),
+        });
+
         return { success: true };
       }
 
-      await this.applyCreditNoteBackoff(
-        creditNoteInstance,
-        result.error || 'ZRA did not return SDC data'
-      );
+      await this.applyCreditNoteBackoff(creditNoteInstance, persisted.zraError || 'ZRA did not return SDC data');
       return { success: false };
     } catch (err) {
       await this.applyCreditNoteBackoff(creditNoteInstance, err.message);

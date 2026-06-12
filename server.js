@@ -142,6 +142,8 @@ const logPaths = initLogDirectory();
 console.log(`POS audit log directory: ${logPaths.root}`);
 console.log(`Sales log (readable): ${logPaths.salesReadable}`);
 console.log(`Sales log (JSON):     ${logPaths.salesJson}`);
+console.log(`Credit notes log (readable): ${logPaths.creditNotesReadable}`);
+console.log(`Credit notes log (JSON):     ${logPaths.creditNotes}`);
 
 // Create HTTP server and initialize notifications
 const server = createServer(app);

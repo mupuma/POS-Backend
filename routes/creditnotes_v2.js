@@ -5,8 +5,27 @@ const { Op, literal } = require('sequelize');
 const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
 const { buildListQueryFilters } = require('../services/query/listFilters');
 const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
+const {
+    applyCreditNoteZraResult,
+    logCreditNotePersistence,
+} = require('../services/credit-note/persistCreditNote');
 
 const router = express.Router();
+const CREDIT_NOTE_INCLUDES = [
+    { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
+    {
+        model: user,
+        as: 'cashier',
+        attributes: ['id', 'full_name'],
+        include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }],
+    },
+    { model: user, as: 'approver', attributes: ['id', 'full_name'] },
+    { model: customer, as: 'customer' },
+];
+
+async function loadCreditNoteById(creditNoteId) {
+    return creditnote.findByPk(creditNoteId, { include: CREDIT_NOTE_INCLUDES });
+}
 // In-memory lock set to prevent duplicate credit note processing for the same sale in concurrent requests
 const activeCreditNoteReturns = new Set();
 
@@ -84,14 +103,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
         const existingCN = await creditnote.findOne({ where: { receipt_number: `CN-${originalSale.receipt_number}` }, transaction: t });
         if (existingCN) {
             await t.rollback();
-            let fullCN = await creditnote.findByPk(existingCN.id, {
-                include: [
-                    { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
-                    { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
-                    { model: user, as: 'approver', attributes: ['id', 'full_name'] },
-                    { model: customer, as: 'customer' }
-                ]
-            });
+            let fullCN = await loadCreditNoteById(existingCN.id);
 
             if (fullCN.zra_status !== 'sent' || !fullCN.sdcid || !fullCN.receipt_no) {
                 const existingReturnItems = (fullCN.items || []).map((item) => ({
@@ -111,23 +123,16 @@ router.post('/:saleId/return', auth, async (req, res) => {
                     reasonCode: reason_code || '03',
                 });
 
-                if (zraResult.success && zraResult.updates) {
-                    await fullCN.update(zraResult.updates);
-                } else if (zraResult.error) {
-                    await fullCN.update({
-                        zra_error: zraResult.error.toString().slice(0, 1000),
-                        zra_status: 'pending',
-                        next_retry_at: new Date(),
-                    });
-                }
+                const models = getModels(req);
+                const persisted = await applyCreditNoteZraResult(models, fullCN.id, zraResult);
+                fullCN = await loadCreditNoteById(fullCN.id);
 
-                fullCN = await creditnote.findByPk(existingCN.id, {
-                    include: [
-                        { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
-                        { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
-                        { model: user, as: 'approver', attributes: ['id', 'full_name'] },
-                        { model: customer, as: 'customer' }
-                    ]
+                await logCreditNotePersistence(models, req, {
+                    creditNoteInstance: fullCN,
+                    originalSale,
+                    outcome: fullCN.zra_status === 'sent' ? 'success' : 'failure',
+                    reason: fullCN.zra_error,
+                    actor: buildActorFromUser(req.user),
                 });
             }
 
@@ -267,76 +272,61 @@ router.post('/:saleId/return', auth, async (req, res) => {
         // here. ZRA fiscalisation (per credit note) is still handled by the ZRA retry job.
         await t.commit();
 
-        const fullCN = await creditnote.findByPk(cn.id, {
-            include: [
-                { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
-                { model: user, as: 'approver', attributes: ['id', 'full_name'] },
-                { model: customer, as: 'customer' }
-            ]
-        });
+        const models = getModels(req);
+        let fullCN = await loadCreditNoteById(cn.id);
 
-        await logRequestAudit(getModels(req), req, {
-            action: 'credit_note.create',
-            outcome: 'success',
-            entityType: 'credit_note',
-            ...buildActorFromUser(req.user),
-            target_identifier: fullCN.receipt_number,
-            target_name: fullCN.receipt_number,
-            details: {
-                creditNoteId: fullCN.id,
-                originalSaleId: originalSale.id,
-                itemCount: returnItems.length,
-                totalAmount: Number(total_amount),
-            },
-        });
-
-        // Fiscalise with ZRA immediately (same pattern as sales) so the POS receipt
-        // includes SDC data. If ZRA is temporarily unavailable, leave pending for retry.
         let zraFailed = true;
         let zraError = null;
 
-        const zraResult = await submitCreditNoteToZra({
-            creditNoteInstance: fullCN,
-            originalSale,
-            returnItems,
-            user: req.user,
-            reasonCode: reason_code || '03',
-        });
-
-        if (zraResult.success && zraResult.updates) {
-            await fullCN.update(zraResult.updates);
-            zraFailed = false;
-        } else {
-            zraError = zraResult.error || 'ZRA unavailable; queued for retry';
-            await fullCN.update({
-                zra_error: zraError?.toString().slice(0, 1000),
-                zra_status: 'pending',
-                next_retry_at: new Date(),
+        try {
+            const zraResult = await submitCreditNoteToZra({
+                creditNoteInstance: fullCN,
+                originalSale,
+                returnItems,
+                user: req.user,
+                reasonCode: reason_code || '03',
             });
 
-            const zraRetryJob = req.app.locals.zraRetryJob;
-            if (zraRetryJob) {
-                zraRetryJob.run().catch((retryError) => {
-                    console.error('Immediate credit note ZRA retry failed:', retryError.message);
+            const persisted = await applyCreditNoteZraResult(models, cn.id, zraResult);
+            zraFailed = persisted.zraFailed;
+            zraError = persisted.zraError;
+            fullCN = await loadCreditNoteById(cn.id);
+        } catch (zraIntegrationError) {
+            zraError = zraIntegrationError.message || String(zraIntegrationError);
+            console.error('Credit note ZRA/persistence failed:', zraIntegrationError);
+            fullCN = await loadCreditNoteById(cn.id);
+
+            if (fullCN.zra_status !== 'sent') {
+                await applyCreditNoteZraResult(models, cn.id, {
+                    success: false,
+                    error: zraError,
                 });
+                fullCN = await loadCreditNoteById(cn.id);
+
+                const zraRetryJob = req.app.locals.zraRetryJob;
+                if (zraRetryJob) {
+                    zraRetryJob.run().catch((retryError) => {
+                        console.error('Immediate credit note ZRA retry failed:', retryError.message);
+                    });
+                }
             }
+
+            zraFailed = fullCN.zra_status !== 'sent';
         }
 
-        const responseCreditNote = await creditnote.findByPk(fullCN.id, {
-            include: [
-                { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
-                { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
-                { model: user, as: 'approver', attributes: ['id', 'full_name'] },
-                { model: customer, as: 'customer' }
-            ]
+        await logCreditNotePersistence(models, req, {
+            creditNoteInstance: fullCN,
+            originalSale,
+            outcome: zraFailed ? 'failure' : 'success',
+            reason: zraError,
+            actor: buildActorFromUser(req.user),
         });
 
         return res.status(201).json({
             message: zraFailed
                 ? 'Credit note saved (ZRA pending). Sage posting will occur in the daily credit-note batch.'
                 : 'Credit note created and fiscalised with ZRA. Sage posting will occur in the daily credit-note batch.',
-            creditNote: responseCreditNote,
+            creditNote: fullCN,
             originalSale: {
                 id: originalSale.id,
                 receipt_number: originalSale.receipt_number,

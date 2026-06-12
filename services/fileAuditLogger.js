@@ -65,6 +65,71 @@ function formatTimestamp(iso) {
         .replace(/\.\d+Z$/, ' UTC');
 }
 
+function getReadableCreditNotesLogPath(dateKey = getDateKey()) {
+    ensureLogRoot();
+    return path.join(LOG_ROOT, `credit-notes-readable-${dateKey}.log`);
+}
+
+function formatCreditNotesReadableBlock(record) {
+    const details = record.details || {};
+    const outcome = String(record.outcome || 'success').toUpperCase();
+    const receipt = details.receipt_number || record.target_identifier || '-';
+    const cashier = record.actor_name || record.actor_identifier || '-';
+    const role = record.actor_role ? ` (${record.actor_role})` : '';
+    const store = record.store_id != null ? `Store ${record.store_id}` : 'Store -';
+    const lines = [
+        `${'='.repeat(78)}`,
+        `${formatTimestamp(record.timestamp)} | ${outcome} | Credit Note: ${receipt}`,
+        `  Cashier: ${cashier}${role} | ${store}`,
+    ];
+
+    if (details.original_receipt_number || details.original_sale_id) {
+        lines.push(
+            `  Original sale: ${details.original_receipt_number || '-'} (#${details.original_sale_id ?? '-'})`
+        );
+    }
+
+    if (details.reason) {
+        lines.push(`  Reason: ${details.reason}`);
+    }
+
+    if (details.invnumber) {
+        lines.push(`  CIS credit note: ${details.invnumber}`);
+    }
+
+    lines.push(
+        `  Total: ${formatMoney(details.total_amount)} | Tax: ${formatMoney(details.tax_amount)} | Subtotal: ${formatMoney(details.subtotal)}`,
+        `  Payment: ${details.payment_method || '-'} | Items: ${details.item_count ?? (Array.isArray(details.items) ? details.items.length : '-')}`,
+    );
+
+    if (details.zra_status) {
+        lines.push(`  ZRA: ${details.zra_status}${details.zra_error ? ` (${details.zra_error})` : ''}`);
+    }
+    if (details.sdcid || details.receipt_no || details.invoice_no) {
+        lines.push(
+            `  SDC id: ${details.sdcid || '-'} | ZRA receipt: ${details.receipt_no || '-'} | ZRA invoice: ${details.invoice_no || '-'}`
+        );
+    }
+
+    if (outcome === 'FAILURE' && details.reason) {
+        lines.push(`  Reason: ${details.reason}`);
+    }
+
+    if (Array.isArray(details.items) && details.items.length > 0) {
+        lines.push('  Lines:');
+        for (const item of details.items) {
+            const name = item.name || `Product #${item.product_id ?? '?'}`;
+            const qty = item.quantity ?? '?';
+            const unit = formatMoney(item.unit_price);
+            const total = formatMoney(item.total_price);
+            lines.push(`    - ${name} x${qty} @ ${unit} = ${total}`);
+        }
+    }
+
+    lines.push(`${'='.repeat(78)}`, '');
+    return lines.join('\n');
+}
+
 function formatSalesReadableBlock(record) {
     const details = record.details || {};
     const outcome = String(record.outcome || 'success').toUpperCase();
@@ -173,6 +238,9 @@ function writeFileAuditLog(entry) {
         if (category === 'sales') {
             appendText(getReadableSalesLogPath(dateKey), formatSalesReadableBlock(record));
         }
+        if (category === 'credit-notes') {
+            appendText(getReadableCreditNotesLogPath(dateKey), formatCreditNotesReadableBlock(record));
+        }
     } catch (error) {
         console.error('Failed to write file audit log:', error.message);
     }
@@ -190,6 +258,7 @@ function initLogDirectory() {
         root: getLogRoot(),
         salesJson: getCategoryLogPath('sales', dateKey),
         salesReadable: getReadableSalesLogPath(dateKey),
+        creditNotesReadable: getReadableCreditNotesLogPath(dateKey),
         audit: getCategoryLogPath('audit', dateKey),
         auth: getCategoryLogPath('auth', dateKey),
         creditNotes: getCategoryLogPath('credit-notes', dateKey),
@@ -202,4 +271,5 @@ module.exports = {
     resolveCategory,
     initLogDirectory,
     getReadableSalesLogPath,
+    getReadableCreditNotesLogPath,
 };
