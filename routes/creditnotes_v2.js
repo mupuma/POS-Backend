@@ -4,6 +4,7 @@ const auth = require('../middleware/auth');
 const { Op, literal } = require('sequelize');
 const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
 const { buildListQueryFilters } = require('../services/query/listFilters');
+const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
 
 const router = express.Router();
 // In-memory lock set to prevent duplicate credit note processing for the same sale in concurrent requests
@@ -64,11 +65,26 @@ router.post('/:saleId/return', auth, async (req, res) => {
             return res.status(403).json({ message: 'Access denied: Sale does not belong to your store' });
         }
 
-        // Idempotency check: if a credit note for this sale already exists, return it without re-sending to ZRA
+        if (!originalSale.sdcid || !originalSale.receipt_no) {
+            await t.rollback();
+            return res.status(422).json({
+                message: 'Cannot process return: the original sale is not fiscalised with ZRA yet (missing SDC id / receipt number).',
+                originalSale: {
+                    id: originalSale.id,
+                    receipt_number: originalSale.receipt_number,
+                    zra_status: originalSale.zra_status,
+                    sdcid: originalSale.sdcid,
+                    receipt_no: originalSale.receipt_no,
+                },
+            });
+        }
+
+        // Idempotency check: if a credit note for this sale already exists, return it.
+        // If it still lacks SDC data, attempt ZRA fiscalisation before responding.
         const existingCN = await creditnote.findOne({ where: { receipt_number: `CN-${originalSale.receipt_number}` }, transaction: t });
         if (existingCN) {
             await t.rollback();
-            const fullCN = await creditnote.findByPk(existingCN.id, {
+            let fullCN = await creditnote.findByPk(existingCN.id, {
                 include: [
                     { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
                     { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
@@ -76,7 +92,57 @@ router.post('/:saleId/return', auth, async (req, res) => {
                     { model: customer, as: 'customer' }
                 ]
             });
-            return res.status(200).json({ message: 'Credit note already exists for this sale. Returning existing record.', creditNote: fullCN });
+
+            if (fullCN.zra_status !== 'sent' || !fullCN.sdcid || !fullCN.receipt_no) {
+                const existingReturnItems = (fullCN.items || []).map((item) => ({
+                    product_id: item.product_id,
+                    quantity: Number(item.quantity),
+                    unit_price: Number(item.unit_price),
+                    total_price: Number(item.total_price),
+                    tax_exclusive_total: Number(item.total_price) / 1.16,
+                    product: item.product || null,
+                }));
+
+                const zraResult = await submitCreditNoteToZra({
+                    creditNoteInstance: fullCN,
+                    originalSale,
+                    returnItems: existingReturnItems,
+                    user: req.user,
+                    reasonCode: reason_code || '03',
+                });
+
+                if (zraResult.success && zraResult.updates) {
+                    await fullCN.update(zraResult.updates);
+                } else if (zraResult.error) {
+                    await fullCN.update({
+                        zra_error: zraResult.error.toString().slice(0, 1000),
+                        zra_status: 'pending',
+                        next_retry_at: new Date(),
+                    });
+                }
+
+                fullCN = await creditnote.findByPk(existingCN.id, {
+                    include: [
+                        { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
+                        { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
+                        { model: user, as: 'approver', attributes: ['id', 'full_name'] },
+                        { model: customer, as: 'customer' }
+                    ]
+                });
+            }
+
+            return res.status(200).json({
+                message: fullCN.zra_status === 'sent'
+                    ? 'Credit note already exists for this sale.'
+                    : 'Credit note already exists for this sale. ZRA fiscalisation is still pending.',
+                creditNote: fullCN,
+                zra_integration: {
+                    success: fullCN.zra_status === 'sent',
+                    queued: fullCN.zra_status !== 'sent',
+                    status: fullCN.zra_status,
+                    error: fullCN.zra_error,
+                },
+            });
         }
 
         // Prepare return items and totals
@@ -225,15 +291,63 @@ router.post('/:saleId/return', auth, async (req, res) => {
             },
         });
 
+        // Fiscalise with ZRA immediately (same pattern as sales) so the POS receipt
+        // includes SDC data. If ZRA is temporarily unavailable, leave pending for retry.
+        let zraFailed = true;
+        let zraError = null;
+
+        const zraResult = await submitCreditNoteToZra({
+            creditNoteInstance: fullCN,
+            originalSale,
+            returnItems,
+            user: req.user,
+            reasonCode: reason_code || '03',
+        });
+
+        if (zraResult.success && zraResult.updates) {
+            await fullCN.update(zraResult.updates);
+            zraFailed = false;
+        } else {
+            zraError = zraResult.error || 'ZRA unavailable; queued for retry';
+            await fullCN.update({
+                zra_error: zraError?.toString().slice(0, 1000),
+                zra_status: 'pending',
+                next_retry_at: new Date(),
+            });
+
+            const zraRetryJob = req.app.locals.zraRetryJob;
+            if (zraRetryJob) {
+                zraRetryJob.run().catch((retryError) => {
+                    console.error('Immediate credit note ZRA retry failed:', retryError.message);
+                });
+            }
+        }
+
+        const responseCreditNote = await creditnote.findByPk(fullCN.id, {
+            include: [
+                { model: creditnoteitem, as: 'items', include: [{ model: product, as: 'product' }] },
+                { model: user, as: 'cashier', attributes: ['id', 'full_name'], include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }] },
+                { model: user, as: 'approver', attributes: ['id', 'full_name'] },
+                { model: customer, as: 'customer' }
+            ]
+        });
+
         return res.status(201).json({
-            message: 'Credit note created. ZRA fiscalisation is queued; Sage posting will occur in the daily credit-note batch.',
-            creditNote: fullCN,
+            message: zraFailed
+                ? 'Credit note saved (ZRA pending). Sage posting will occur in the daily credit-note batch.'
+                : 'Credit note created and fiscalised with ZRA. Sage posting will occur in the daily credit-note batch.',
+            creditNote: responseCreditNote,
             originalSale: {
                 id: originalSale.id,
                 receipt_number: originalSale.receipt_number,
                 total_amount: originalSale.total_amount
             },
-            zra_integration: { success: false, queued: true, status: 'pending' },
+            zra_integration: {
+                success: !zraFailed,
+                queued: zraFailed,
+                status: zraFailed ? 'pending' : 'sent',
+                error: zraError,
+            },
             sage_integration: {
                 queued: true,
                 status: 'pending',

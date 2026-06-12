@@ -1,21 +1,7 @@
 const cron = require('node-cron');
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice');
 const { buildSaleUpdatesFromZraResponse } = require('../services/sale/zraSaleResponse');
-const CreditNoteZRAIntegrationService = require('../services/credit-note/generateSmartInvoiceCreditNote');
-const fs = require('fs');
-const path = require('path');
-const QRCode = require('qrcode');
-
-async function generateQrCode(qrcodeUrl, receiptNo, saveDirectory) {
-  if (!fs.existsSync(saveDirectory)) {
-    fs.mkdirSync(saveDirectory, { recursive: true });
-  }
-
-  const fileName = `qrcode_${receiptNo}.png`;
-  const filePath = path.resolve(saveDirectory, fileName);
-  await QRCode.toFile(filePath, qrcodeUrl, { width: 150, margin: 2 });
-  return filePath;
-}
+const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
 
 class ZraRetryJob {
   constructor(models) {
@@ -26,7 +12,6 @@ class ZraRetryJob {
     this.maxRetries = 3; // limit total retries to 3
     this.baseDelayMinutes = 2; // retry attempts scheduled 2 minutes after a failure
     this.zraService = new ZRAIntegrationService();
-    this.creditNoteZraService = new CreditNoteZRAIntegrationService();
   }
 
   start() {
@@ -301,88 +286,26 @@ class ZraRetryJob {
         product: item.product || null,
       }));
 
-      const creditNoteData = {
-        subtotal: Number(creditNoteInstance.subtotal || 0),
-        discount_amount: Number(creditNoteInstance.discount_amount || 0),
-        tax_amount: Number(creditNoteInstance.tax_amount || 0),
-        total_amount: Number(creditNoteInstance.total_amount || 0),
-        tax_rate: 16,
-        payment_method: creditNoteInstance.payment_method,
-        amount_paid: Number(creditNoteInstance.amount_paid || 0),
-        change_amount: Number(creditNoteInstance.change_amount || 0),
-        notes: creditNoteInstance.notes,
-        customer: originalSale?.customer || creditNoteInstance.customer || null,
-        discount: originalSale?.discount || null,
-      };
-
       const user = creditNoteInstance.cashier || { store_id: null, id: creditNoteInstance.user_id };
       const reasonCode = creditNoteInstance.reason_code || '03';
 
-      // A ZRA credit note (refund) must reference the ORIGINAL sale's ZRA identifiers:
-      // its SDC id (orgSdcId) and its ZRA receipt number (orgInvcNo). Without them ZRA
-      // rejects the credit note, so we should not attempt/mark it as sent yet.
-      const orgSdcId = originalSale?.sdcid || null;
-      const orgInvcNo = originalSale?.receipt_no || null;
-      if (!orgSdcId || !orgInvcNo) {
-        await this.applyCreditNoteBackoff(
-          creditNoteInstance,
-          'Original sale is missing ZRA SDC id / receipt number; cannot register credit note with ZRA yet.'
-        );
-        return { success: false };
-      }
-
-      const salesData = await this.creditNoteZraService.transformToZRACreditNoteSalesData(
-        creditNoteData,
+      const result = await submitCreditNoteToZra({
+        creditNoteInstance,
+        originalSale,
         returnItems,
         user,
         reasonCode,
-        orgInvcNo,
-        orgSdcId
-      );
+      });
 
-      const response = await this.creditNoteZraService.sendCreditNoteSalesData(salesData);
-
-      // ZRA returns HTTP 200 even for business errors (resultCd != "000", data: null).
-      // Only treat the call as successful when the SDC fields are actually present,
-      // otherwise we would mark the credit note "sent" with empty SDC info.
-      const body = response?.data || null;
-      const d = body?.data || body?.resultData || body?.result || body?.responseData || body || {};
-      const receivedSdc = !!(response.success && d && d.rcptNo != null && d.sdcId != null);
-
-      if (receivedSdc) {
-        let qrFilePath = creditNoteInstance.qrfilepath || null;
-
-        if (d.qrCodeUrl && d.rcptNo) {
-          try {
-            qrFilePath = await generateQrCode(d.qrCodeUrl, d.rcptNo, './qrcodes');
-          } catch (qrError) {
-            console.error('QR generation failed for credit note retry:', qrError.message);
-          }
-        }
-
-        await creditNoteInstance.update({
-          invnumber: salesData?.cisInvcNo || d.invoiceNo || d.invNumber || d.invnumber || null,
-          receipt_no: d.rcptNo || null,
-          sdcid: d.sdcId || null,
-          receiptsig: d.rcptSign || null,
-          intrldata: d.intrlData || null,
-          qrcode_url: d.qrCodeUrl || null,
-          vsdcrcpdate: d.vsdcRcptPbctDate || null,
-          invoice_no: (d.sdcId && d.rcptNo) ? (`CRN${String(d.sdcId).substring(3)}/${d.rcptNo}`) : creditNoteInstance.invoice_no,
-          qrfilepath: qrFilePath,
-          zra_status: 'sent',
-          zra_error: null,
-          last_retry_at: new Date(),
-          next_retry_at: null,
-        });
-
+      if (result.success && result.updates) {
+        await creditNoteInstance.update(result.updates);
         return { success: true };
       }
 
-      const zraMessage = (body && (body.resultMsg || body.resultCd))
-        ? `ZRA ${body.resultCd || ''}: ${body.resultMsg || 'no SDC data returned'}`.trim()
-        : (typeof response.error === 'string' ? response.error : JSON.stringify(response.error || 'ZRA did not return SDC data'));
-      await this.applyCreditNoteBackoff(creditNoteInstance, zraMessage);
+      await this.applyCreditNoteBackoff(
+        creditNoteInstance,
+        result.error || 'ZRA did not return SDC data'
+      );
       return { success: false };
     } catch (err) {
       await this.applyCreditNoteBackoff(creditNoteInstance, err.message);
