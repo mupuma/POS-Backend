@@ -100,57 +100,9 @@ class ZraRetryJob {
     };
   }
 
-  async publishSaleStatusSync(saleInstance) {
-    if (!this.models.sync_outbox) {
-      return null;
-    }
-
-    const storeId = this.resolveSaleStoreId(saleInstance);
-    if (!storeId) {
-      console.warn(`ZraRetryJob: cannot queue central sync for sale ${saleInstance.id} without store id`);
-      return null;
-    }
-
-    try {
-      const payload = this.buildSaleSyncPayload(saleInstance);
-      const existingOutbox = await this.models.sync_outbox.findOne({
-        where: {
-          event_type: 'sale.created',
-          aggregate_type: 'sale',
-          aggregate_id: String(saleInstance.id),
-          store_id: storeId,
-          status: { [this.models.Sequelize.Op.in]: ['pending', 'failed', 'dead_letter'] },
-        },
-      });
-
-      if (existingOutbox) {
-        return await existingOutbox.update({
-          payload,
-          status: 'pending',
-          attempt_count: 0,
-          next_retry_at: new Date(),
-          last_error: null,
-          response_payload: null,
-        });
-      }
-
-      return await this.models.sync_outbox.create({
-        event_type: 'sale.created',
-        aggregate_type: 'sale',
-        aggregate_id: String(saleInstance.id),
-        store_id: storeId,
-        user_id: saleInstance.user_id,
-        receipt_number: saleInstance.receipt_number,
-        idempotency_key: `sale.created:store-${storeId}:sale-${saleInstance.id}:zra-status:${Date.now()}`,
-        payload,
-        status: 'pending',
-        attempt_count: 0,
-        next_retry_at: new Date(),
-      });
-    } catch (error) {
-      console.error('ZraRetryJob: failed to queue sale status sync:', error.message);
-      return null;
-    }
+  // Sales sync to central server via day-end batch only — no per-sale outbox events.
+  async publishSaleStatusSync() {
+    return null;
   }
 
   async run() {

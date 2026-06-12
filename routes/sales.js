@@ -1,5 +1,5 @@
 const express = require('express');
-const { sale, saleitem, product, user, customer, discount, store, productinventory, sync_outbox } = require('../models');
+const { sale, saleitem, product, user, customer, discount, store, productinventory } = require('../models');
 const auth = require('../middleware/auth');
 const { Op, sequelize, fn, col, literal } = require('sequelize');
 const fs = require('fs');
@@ -118,59 +118,13 @@ function normalizeZraSalesData(salesResponse) {
     return normalize(salesResponse);
 }
 
-async function requeueSaleSyncEvent(saleRecord, models) {
-    const storeId = saleRecord.store_id || saleRecord.cashier?.store_id || null;
-    console.log('[sales] requeueSaleSyncEvent start', {
-      saleId: saleRecord.id,
-      storeId,
-      receiptNumber: saleRecord.receipt_number,
+// Sales are synced to the central server via the day-end batch only (not per-sale).
+async function requeueSaleSyncEvent(saleRecord) {
+    console.log('[sales] requeueSaleSyncEvent skipped — sale sync is deferred to day-end batch', {
+        saleId: saleRecord?.id,
+        receiptNumber: saleRecord?.receipt_number,
     });
-
-    if (!storeId) {
-        throw new Error('Cannot requeue sale sync event without a store id');
-    }
-
-    const payload = buildSaleSyncPayload(saleRecord);
-    const existingOutbox = await models.sync_outbox.findOne({
-        where: {
-            event_type: 'sale.created',
-            aggregate_type: 'sale',
-            aggregate_id: String(saleRecord.id),
-            store_id: storeId,
-            status: { [Op.in]: ['pending', 'failed', 'dead_letter'] }
-        }
-    });
-
-    if (existingOutbox) {
-        console.log('[sales] requeueSaleSyncEvent updating existing outbox', {
-            outboxId: existingOutbox.id,
-            currentStatus: existingOutbox.status,
-        });
-
-        return await existingOutbox.update({
-            payload,
-            status: 'pending',
-            attempt_count: 0,
-            next_retry_at: new Date(),
-            last_error: null,
-            response_payload: null,
-        });
-    }
-
-    console.log('[sales] requeueSaleSyncEvent creating new outbox entry');
-    return await models.sync_outbox.create({
-        event_type: 'sale.created',
-        aggregate_type: 'sale',
-        aggregate_id: String(saleRecord.id),
-        store_id: storeId,
-        user_id: saleRecord.user_id,
-        receipt_number: saleRecord.receipt_number,
-        idempotency_key: `sale.created:store-${storeId}:sale-${saleRecord.id}:reprocess:${Date.now()}`,
-        payload,
-        status: 'pending',
-        attempt_count: 0,
-        next_retry_at: new Date(),
-    });
+    return null;
 }
 
 // Create new sale
@@ -451,72 +405,7 @@ router.post('/', auth, async (req, res) => {
 
         }
 
-        // Create sync outbox entry
-        const outboxPayload = {
-            branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
-            terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
-            sale: {
-                id: newSale.id,
-                receipt_number: receiptNumber,
-                user_id: req.user.id,
-                store_id: req.user.store_id,
-                branch_id: String(process.env.ZRA_BHF_ID || '000').trim() || '000',
-                terminal_id: String(process.env.TERMINAL_ID || process.env.ZRA_TERMINAL_ID || '000').trim() || '000',
-                customer_id: customer_id || null,
-                discount_id: discount_id || null,
-                subtotal,
-                discount_amount,
-                tax_amount,
-                total_amount,
-                payment_method: effective_payment_method,
-                amount_paid: effective_amount_paid,
-                change_amount,
-                notes: notes || null,
-                payments_breakdown: payments_breakdown_obj,
-                sale_date: new Date().toISOString(),
-                invoice_no: null,
-                invnumber: cisInvoiceNo,
-                receipt_no: null,
-                sdcid: null,
-                receiptsig: null,
-                intrldata: null,
-                qrcode_url: null,
-                vsdcrcpdate: null,
-                zra_status: 'pending',
-                zra_error: null
-            },
-            items: saleItems.map(item => ({
-                product_id: item.product_id,
-                quantity: Number(item.quantity),
-                unit_price: Number(item.unit_price),
-                total_price: Number(item.total_price),
-                tax_exclusive_total: Number(item.tax_exclusive_total),
-                product: {
-                    id: item.product.id,
-                    name: item.product.name,
-                    product_code: item.product.product_code,
-                    formatted_product_code: item.product.formatted_product_code || null,
-                    price: Number(item.product.price)
-                }
-            })),
-            customer: customerData,
-            discount: discountData
-        };
-
-        await sync_outbox.create({
-            event_type: 'sale.created',
-            aggregate_type: 'sale',
-            aggregate_id: newSale.id,
-            store_id: req.user.store_id,
-            user_id: req.user.id,
-            receipt_number: receiptNumber,
-            idempotency_key: `sale.created:store-${req.user.store_id}:sale-${newSale.id}:receipt-${receiptNumber}`,
-            payload: outboxPayload,
-            status: 'pending',
-            attempt_count: 0,
-            next_retry_at: new Date()
-        }, { transaction: t });
-
+        // Central sync is deferred to the day-end batch (`day_end.ready`), not per-sale.
         await t.commit();
         committed = true;
         console.log('Transaction committed successfully');
@@ -570,33 +459,6 @@ router.post('/', auth, async (req, res) => {
                 zra_error: zraError,
                 next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
             }, { where: { id: newSale.id } });
-        }
-
-        // Refresh outbox payload with latest sale/ZRA fields
-        const refreshedSale = await sale.findByPk(newSale.id, {
-            include: [
-                {
-                    model: saleitem,
-                    as: 'items',
-                    include: [{ model: product, as: 'product' }]
-                },
-                { model: customer, as: 'customer' },
-                { model: discount, as: 'discount' }
-            ]
-        });
-        if (refreshedSale) {
-            const refreshedPayload = buildSaleSyncPayload(refreshedSale);
-            await sync_outbox.update(
-                { payload: refreshedPayload },
-                {
-                    where: {
-                        event_type: 'sale.created',
-                        aggregate_type: 'sale',
-                        aggregate_id: newSale.id,
-                        store_id: req.user.store_id,
-                    }
-                }
-            );
         }
 
         // Fetch complete sale data for response
@@ -1273,24 +1135,16 @@ router.patch('/:saleId/reprocess', auth, async (req, res) => {
         }
 
         await saleRecord.update(updates);
-        const syncOutboxRow = await requeueSaleSyncEvent(saleRecord, req.app.locals.models || require('../models'));
+        await requeueSaleSyncEvent(saleRecord);
 
         console.log('[sales] sale reprocess completed', {
             saleId,
-            syncOutboxId: syncOutboxRow?.id,
             updatedFields: updates,
         });
 
-        if (req.app.locals.syncOutboxJob && typeof req.app.locals.syncOutboxJob.run === 'function') {
-            req.app.locals.syncOutboxJob.run().catch(error => {
-                console.error('Failed to trigger sync outbox job after sale reprocess:', error.message);
-            });
-        }
-
         return res.status(200).json({
-            message: 'Sale updated and requeued for central sync',
+            message: 'Sale updated locally. Central sync will occur in the next day-end batch.',
             sale: saleRecord,
-            sync_outbox_id: syncOutboxRow.id,
         });
     } catch (error) {
         console.error('Sale reprocess update failed:', error.message);

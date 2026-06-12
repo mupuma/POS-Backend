@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const axios = require('axios');
 const { Op } = require('sequelize');
+const { enrichDayEndPayloadSales } = require('../services/sync/enrichDayEndPayload');
 
 function resolveBranchId() {
   return String(process.env.ZRA_BHF_ID || '000').trim() || '000';
@@ -94,6 +95,34 @@ class SyncOutboxJob {
         locked_at: new Date()
       });
 
+      let outboundPayload = {
+        ...row.payload,
+        branch_id: row.payload?.branch_id || resolveBranchId(),
+        terminal_id: row.payload?.terminal_id || resolveTerminalId(),
+      };
+
+      if (row.event_type === 'day_end.ready') {
+        outboundPayload = await enrichDayEndPayloadSales(this.models, outboundPayload);
+      } else if (row.event_type === 'sale.created' || row.event_type === 'sale.updated') {
+        outboundPayload.sale = {
+          ...(row.payload?.sale || {}),
+          branch_id: row.payload?.sale?.branch_id || row.payload?.branch_id || resolveBranchId(),
+          terminal_id: row.payload?.sale?.terminal_id || row.payload?.terminal_id || resolveTerminalId(),
+          zra_status: row.payload?.sale?.zra_status || null,
+          zra_error: row.payload?.sale?.zra_error || null,
+          receipt_printed: row.payload?.sale?.receipt_printed ?? null,
+          qrcode_url: row.payload?.sale?.qrcode_url || null,
+          qrfilepath: row.payload?.sale?.qrfilepath || null,
+          receipt_no: row.payload?.sale?.receipt_no || null,
+          sdcid: row.payload?.sale?.sdcid || null,
+          receiptsig: row.payload?.sale?.receiptsig || null,
+          intrldata: row.payload?.sale?.intrldata || null,
+          vsdcrcpdate: row.payload?.sale?.vsdcrcpdate || null,
+          invoice_no: row.payload?.sale?.invoice_no || null,
+          invnumber: row.payload?.sale?.invnumber || null,
+        };
+      }
+
       const response = await axios.post(
         `${this.syncServerUrl}/api/sync/events`,
         {
@@ -104,26 +133,7 @@ class SyncOutboxJob {
           user_id: row.user_id,
           receipt_number: row.receipt_number,
           idempotency_key: row.idempotency_key,
-          payload: {
-            ...row.payload,
-            branch_id: row.payload?.branch_id || resolveBranchId(),
-            terminal_id: row.payload?.terminal_id || resolveTerminalId(),
-            sale: {
-              ...(row.payload?.sale || {}),
-              branch_id: row.payload?.sale?.branch_id || row.payload?.branch_id || resolveBranchId(),
-              terminal_id: row.payload?.sale?.terminal_id || row.payload?.terminal_id || resolveTerminalId(),
-              zra_status: row.payload?.sale?.zra_status || null,
-              zra_error: row.payload?.sale?.zra_error || null,
-              receipt_printed: row.payload?.sale?.receipt_printed ?? null,
-              qrcode_url: row.payload?.sale?.qrcode_url || null,
-              qrfilepath: row.payload?.sale?.qrfilepath || null,
-              receipt_no: row.payload?.sale?.receipt_no || null,
-              sdcid: row.payload?.sale?.sdcid || null,
-              receiptsig: row.payload?.sale?.receiptsig || null,
-              intrldata: row.payload?.sale?.intrldata || null,
-              vsdcrcpdate: row.payload?.sale?.vsdcrcpdate || null,
-            },
-          }
+          payload: outboundPayload,
         },
         {
           headers: {
