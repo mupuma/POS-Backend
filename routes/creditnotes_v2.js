@@ -34,6 +34,7 @@ function getModels(req) {
 }
 
 // Create credit note (return) - positive amounts; CRN prefix identifies CN
+
 router.post('/:saleId/return', auth, async (req, res) => {
     const t = await creditnote.sequelize.transaction();
 
@@ -63,8 +64,16 @@ router.post('/:saleId/return', auth, async (req, res) => {
         // Load original sale for validation/context
         const originalSale = await sale.findByPk(saleId, {
             include: [
-                { model: user, as: 'cashier', attributes: ['id', 'full_name', 'store_id'] },
-                { model: customer, as: 'customer' },
+                { 
+                    model: user, 
+                    as: 'cashier', 
+                    attributes: ['id', 'full_name', 'store_id'] 
+                },
+                { 
+                    model: customer, 
+                    as: 'customer',
+                    attributes: ['id', 'name', 'tpin', 'phone', 'email', 'legal_name'] // Explicitly include TPIN
+                },
                 {
                     model: require('../models').saleitem,
                     as: 'items',
@@ -84,6 +93,28 @@ router.post('/:saleId/return', auth, async (req, res) => {
             return res.status(403).json({ message: 'Access denied: Sale does not belong to your store' });
         }
 
+        // Validate customer and TPIN for ZRA requirements
+        if (!originalSale.customer) {
+            await t.rollback();
+            return res.status(400).json({ 
+                message: 'Cannot process return: Original sale has no customer associated. Customer information is required for ZRA fiscalisation.' 
+            });
+        }
+
+        if (!originalSale.customer.tpin) {
+            await t.rollback();
+            return res.status(422).json({ 
+                message: 'Cannot process return: Customer does not have a TPIN registered. TPIN is required for ZRA fiscalisation of credit notes.',
+                customer: {
+                    id: originalSale.customer.id,
+                    name: originalSale.customer.name,
+                    has_tpin: false
+                },
+                resolution: 'Please update the customer record with a valid TPIN before processing this return.'
+            });
+        }
+
+        // Validate original sale is fiscalised with ZRA
         if (!originalSale.sdcid || !originalSale.receipt_no) {
             await t.rollback();
             return res.status(422).json({
@@ -99,8 +130,11 @@ router.post('/:saleId/return', auth, async (req, res) => {
         }
 
         // Idempotency check: if a credit note for this sale already exists, return it.
-        // If it still lacks SDC data, attempt ZRA fiscalisation before responding.
-        const existingCN = await creditnote.findOne({ where: { receipt_number: `CN-${originalSale.receipt_number}` }, transaction: t });
+        const existingCN = await creditnote.findOne({ 
+            where: { receipt_number: `CN-${originalSale.receipt_number}` }, 
+            transaction: t 
+        });
+        
         if (existingCN) {
             await t.rollback();
             let fullCN = await loadCreditNoteById(existingCN.id);
@@ -121,6 +155,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
                     returnItems: existingReturnItems,
                     user: req.user,
                     reasonCode: reason_code || '03',
+                    custTpin: originalSale.customer.tpin, // Pass TPIN explicitly
                 });
 
                 const models = getModels(req);
@@ -195,32 +230,12 @@ router.post('/:saleId/return', auth, async (req, res) => {
         const tax_amount = (subtotal * tax_rate) / 100;
         const total_amount = subtotal + tax_amount;
 
-        const creditNoteData = {
-            subtotal,
-            discount_amount,
-            tax_amount,
-            total_amount,
-            tax_rate,
-            payment_method: originalSale.payment_method,
-            amount_paid: total_amount,
-            change_amount: 0,
-            notes: reason || reason_label || 'Credit Note',
-            customer: originalSale.customer,
-            discount: null
-        };
-
-        const originalInvoiceReference =
-            originalSale.invoice_no ||
-            originalSale.receipt_no ||
-            originalSale.receipt_number ||
-            String(originalSale.id);
-
-        // Persist Credit Note document (separate table)
+        // Persist Credit Note document
         const cn = await creditnote.create({
             receipt_number: `CN-${originalSale.receipt_number}`,
             user_id: req.user.id,
             approver_user_id: approver_user_id || req.user.id,
-            customer_id: originalSale.customer_id || null,
+            customer_id: originalSale.customer_id, // Use the ID, not TPIN
             subtotal,
             discount_amount,
             tax_amount,
@@ -228,7 +243,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
             payment_method: originalSale.payment_method,
             amount_paid: total_amount,
             change_amount: 0,
-             credit_note_date: new Date(),
+            credit_note_date: new Date(),
             notes: `Credit Note for Sale #${originalSale.id} - ${reason || reason_label || 'Return'}`,
             invnumber: null,
             receipt_no: null,
@@ -266,10 +281,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
         const creditNoteReference = cn.receipt_number;
 
-        // Sage posting is deferred to the consolidated daily credit-note batch
-        // (`credit_note_batch.ready`), exactly like sales are posted via the day-end batch.
-        // We therefore no longer enqueue a per-credit-note `credit_note.created` Sage event
-        // here. ZRA fiscalisation (per credit note) is still handled by the ZRA retry job.
+        // Commit transaction before external API calls
         await t.commit();
 
         const models = getModels(req);
@@ -285,6 +297,14 @@ router.post('/:saleId/return', auth, async (req, res) => {
                 returnItems,
                 user: req.user,
                 reasonCode: reason_code || '03',
+                customerTPIN: originalSale.customer.tpin, // Pass TPIN explicitly
+                customerData: {
+                    name: originalSale.customer.name,
+                    legal_name: originalSale.customer.legal_name,
+                    tpin: originalSale.customer.tpin,
+                    phone: originalSale.customer.phone,
+                    email: originalSale.customer.email,
+                }
             });
 
             const persisted = await applyCreditNoteZraResult(models, cn.id, zraResult);
@@ -332,6 +352,11 @@ router.post('/:saleId/return', auth, async (req, res) => {
                 receipt_number: originalSale.receipt_number,
                 total_amount: originalSale.total_amount
             },
+            customer_info: {
+                name: originalSale.customer.name,
+                tpin: originalSale.customer.tpin,
+                has_valid_tpin: !!originalSale.customer.tpin
+            },
             zra_integration: {
                 success: !zraFailed,
                 queued: zraFailed,
@@ -348,32 +373,36 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
     } catch (error) {
         console.error('Credit note transaction failed:', error);
-    await logRequestAudit(getModels(req), req, {
-        action: 'credit_note.create',
-        outcome: 'failure',
-        entityType: 'credit_note',
-        ...buildActorFromUser(req.user),
-        target_identifier: req.params.saleId,
-        details: {
-            saleId: Number(req.params.saleId),
-            message: error.message,
-        },
-    });
-  if (t) {
-    try { await t.rollback(); } catch (rbErr) { console.error('Rollback failed:', rbErr); }
-  }
-  return res.status(500).json({
-    message: 'Server error',
-    error: error.message,
-    // remove the next lines in production — only for debugging
-    details: {
-      name: error.name,
-      errors: error.errors,
-      sql: error.sql,
-      parent: error.parent && { code: error.parent.code, message: error.parent.sqlMessage || error.parent.message }
-    }
-  });
-} finally {
+        await logRequestAudit(getModels(req), req, {
+            action: 'credit_note.create',
+            outcome: 'failure',
+            entityType: 'credit_note',
+            ...buildActorFromUser(req.user),
+            target_identifier: req.params.saleId,
+            details: {
+                saleId: Number(req.params.saleId),
+                message: error.message,
+                stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+            },
+        });
+        
+        if (t) {
+            try { await t.rollback(); } catch (rbErr) { console.error('Rollback failed:', rbErr); }
+        }
+        
+        return res.status(500).json({
+            message: 'Server error',
+            error: error.message,
+            ...(process.env.NODE_ENV === 'development' && {
+                details: {
+                    name: error.name,
+                    errors: error.errors,
+                    sql: error.sql,
+                    parent: error.parent && { code: error.parent.code, message: error.parent.sqlMessage || error.parent.message }
+                }
+            })
+        });
+    } finally {
         // Release per-sale lock
         activeCreditNoteReturns.delete(lockKey);
     }
