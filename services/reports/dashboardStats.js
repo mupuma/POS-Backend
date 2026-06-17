@@ -65,7 +65,6 @@ async function computeDashboardStats(req) {
     where: { sale_date: { [Op.between]: [startOfToday, endOfToday] } },
     include: salesInclude,
     order: [['sale_date', 'DESC']],
-    limit: 10
   });
 
   // Week

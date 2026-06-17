@@ -46,7 +46,7 @@ function buildCreditNotePayload(creditNoteInstance, originalSale, returnItems) {
 
 function mapReturnItems(items) {
   return (items || []).map((item) => ({
-    product_id: item.product_id,
+    product_id: Number(item.product_id),
     quantity: Number(item.quantity),
     unit_price: Number(item.unit_price),
     total_price: Number(item.total_price),
@@ -128,6 +128,7 @@ async function submitCreditNoteToZra({
     return {
       success: false,
       pending: true,
+      pendingReason: 'missing_original_sale_zra',
       error: 'Original sale is missing ZRA SDC id / receipt number; cannot register credit note with ZRA yet.',
     };
   }

@@ -221,6 +221,11 @@ class ZraRetryJob {
     await this.publishSaleStatusSync(saleInstance);
   }
 
+  async isMissingOriginalSaleZra(errorMessage) {
+    return typeof errorMessage === 'string'
+      && errorMessage.includes('Original sale is missing ZRA SDC id / receipt number');
+  }
+
   async retryCreditNote(creditNoteInstance) {
     try {
       const originalSaleId = creditNoteInstance.original_sale_id;
@@ -235,11 +240,13 @@ class ZraRetryJob {
         : null;
 
       const returnItems = (creditNoteInstance.items || []).map((item) => ({
-        product_id: item.product_id,
+        product_id: Number(item.product_id),
         quantity: Number(item.quantity),
         unit_price: Number(item.unit_price),
         total_price: Number(item.total_price),
-        tax_exclusive_total: Number(item.total_price) / 1.16,
+        tax_exclusive_total: item.tax_exclusive_total != null
+          ? Number(item.tax_exclusive_total)
+          : Number(item.total_price) / 1.16,
         product: item.product || null,
       }));
 
@@ -254,28 +261,43 @@ class ZraRetryJob {
         reasonCode,
       });
 
-      const persisted = await applyCreditNoteZraResult(this.models, creditNoteInstance.id, result);
+      if (result.success) {
+        const persisted = await applyCreditNoteZraResult(this.models, creditNoteInstance.id, result);
 
-      if (!persisted.zraFailed) {
-        const reloaded = await this.models.creditnote.findByPk(creditNoteInstance.id, {
-          include: [
-            { model: this.models.creditnoteitem, as: 'items', include: [{ model: this.models.product, as: 'product' }] },
-          ],
-        });
+        if (!persisted.zraFailed) {
+          const reloaded = await this.models.creditnote.findByPk(creditNoteInstance.id, {
+            include: [
+              { model: this.models.creditnoteitem, as: 'items', include: [{ model: this.models.product, as: 'product' }] },
+            ],
+          });
 
-        logCreditNoteEvent({
-          action: 'credit_note.zra_retry',
-          outcome: 'success',
-          actor_user_id: user?.id || creditNoteInstance.user_id,
-          actor_name: user?.full_name || null,
-          store_id: user?.store_id || null,
-          target_identifier: reloaded?.receipt_number,
-          details: buildCreditNoteAuditDetails(reloaded, originalSale, { source: 'zra_retry_job' }),
-        });
+          logCreditNoteEvent({
+            action: 'credit_note.zra_retry',
+            outcome: 'success',
+            actor_user_id: user?.id || creditNoteInstance.user_id,
+            actor_name: user?.full_name || null,
+            store_id: user?.store_id || null,
+            target_identifier: reloaded?.receipt_number,
+            details: buildCreditNoteAuditDetails(reloaded, originalSale, { source: 'zra_retry_job' }),
+          });
 
-        return { success: true };
+          return { success: true };
+        }
       }
 
+      if (result.pending && await this.isMissingOriginalSaleZra(result.error)) {
+        const retries = (creditNoteInstance.retry_count || 0) + 1;
+        await creditNoteInstance.update({
+          retry_count: retries,
+          zra_error: String(result.error).slice(0, 1000),
+          zra_status: 'pending',
+          last_retry_at: new Date(),
+          next_retry_at: new Date(Date.now() + 5 * 60 * 1000),
+        });
+        return { success: false };
+      }
+
+      const persisted = await applyCreditNoteZraResult(this.models, creditNoteInstance.id, result, { retryDelayMinutes: 2 });
       await this.applyCreditNoteBackoff(creditNoteInstance, persisted.zraError || 'ZRA did not return SDC data');
       return { success: false };
     } catch (err) {

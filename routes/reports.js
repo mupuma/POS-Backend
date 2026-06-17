@@ -1718,7 +1718,7 @@ function buildCashierPerformance(salesList, returnsList = []) {
     (salesList || []).forEach((saleRow) => {
         const entry = ensureEntry(saleRow.user_id, saleRow.cashier?.full_name);
         entry.transactions += 1;
-        entry.gross_sales += Number(saleRow.subtotal || 0);
+        entry.gross_sales += Number(saleRow.total_amount || saleRow.subtotal || 0);
         entry.items_sold += (saleRow.items || []).reduce(
             (qty, item) => qty + Number(item.quantity || 0),
             0

@@ -17,7 +17,7 @@ async function persistCreditNoteFields(models, creditNoteId, patch) {
 /**
  * Persist ZRA fiscalisation outcome and verify SDC fields landed in the DB when ZRA succeeded.
  */
-async function applyCreditNoteZraResult(models, creditNoteId, zraResult) {
+async function applyCreditNoteZraResult(models, creditNoteId, zraResult, { retryDelayMinutes = 0 } = {}) {
   if (zraResult?.success && zraResult.updates) {
     await persistCreditNoteFields(models, creditNoteId, zraResult.updates);
 
@@ -40,10 +40,11 @@ async function applyCreditNoteZraResult(models, creditNoteId, zraResult) {
   }
 
   const zraError = zraResult?.error || 'ZRA unavailable; queued for retry';
+  const nextRetryAt = retryDelayMinutes > 0 ? new Date(Date.now() + retryDelayMinutes * 60 * 1000) : new Date();
   await persistCreditNoteFields(models, creditNoteId, {
     zra_error: zraError.toString().slice(0, 1000),
     zra_status: 'pending',
-    next_retry_at: new Date(),
+    next_retry_at: nextRetryAt,
   });
 
   return {

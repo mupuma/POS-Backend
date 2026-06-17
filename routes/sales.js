@@ -201,26 +201,26 @@ router.post('/', auth, async (req, res) => {
                 transaction: t
             });
 
-            const availableQty = inventory ? inventory.stock_quantity : 0;
+            // const availableQty = inventory ? inventory.stock_quantity : 0;
 
-            if (availableQty < item.quantity) {
-                await t.rollback();
-                await logRequestAudit(models, req, {
-                    action: 'sale.create',
-                    outcome: 'failure',
-                    entityType: 'sale',
-                    ...buildActorFromUser(req.user),
-                    details: {
-                        reason: `Insufficient stock for ${productData.name}`,
-                        product_id: item.product_id,
-                        requested_quantity: item.quantity,
-                        available_quantity: availableQty,
-                    },
-                });
-                return res.status(400).json({
-                    message: `Insufficient stock for ${productData.name}. Available: ${availableQty}`
-                });
-            }
+            // if (availableQty < item.quantity) {
+            //     await t.rollback();
+            //     await logRequestAudit(models, req, {
+            //         action: 'sale.create',
+            //         outcome: 'failure',
+            //         entityType: 'sale',
+            //         ...buildActorFromUser(req.user),
+            //         details: {
+            //             reason: `Insufficient stock for ${productData.name}`,
+            //             product_id: item.product_id,
+            //             requested_quantity: item.quantity,
+            //             available_quantity: availableQty,
+            //         },
+            //     });
+            //     return res.status(400).json({
+            //         message: `Insufficient stock for ${productData.name}. Available: ${availableQty}`
+            //     });
+            // }
 
             // Determine effective price: store override if present, else product price (assumed tax-inclusive)
             const effectiveUnitPrice = inventory && inventory.price_override != null

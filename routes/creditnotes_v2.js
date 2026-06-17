@@ -34,7 +34,6 @@ function getModels(req) {
 }
 
 // Create credit note (return) - positive amounts; CRN prefix identifies CN
-
 router.post('/:saleId/return', auth, async (req, res) => {
     const t = await creditnote.sequelize.transaction();
 
@@ -72,7 +71,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
                 { 
                     model: customer, 
                     as: 'customer',
-                    attributes: ['id', 'name', 'tpin', 'phone', 'email', 'legal_name'] // Explicitly include TPIN
+                    attributes: ['id', 'name', 'tpin', 'phone', 'email', 'legal_name']
                 },
                 {
                     model: require('../models').saleitem,
@@ -93,41 +92,66 @@ router.post('/:saleId/return', auth, async (req, res) => {
             return res.status(403).json({ message: 'Access denied: Sale does not belong to your store' });
         }
 
-        // Validate customer and TPIN for ZRA requirements
+        // Handle Walk-in Customer (no customer or no TPIN)
+        let customerTPIN = '1000000000'; // Default TPIN for walk-in customers
+        let customerName = 'Walk-in Customer';
+        let customerId = null;
+        let customerData = null;
+
         if (!originalSale.customer) {
-            await t.rollback();
-            return res.status(400).json({ 
-                message: 'Cannot process return: Original sale has no customer associated. Customer information is required for ZRA fiscalisation.' 
-            });
+            // No customer associated - treat as walk-in
+            console.log(`Sale ${saleId} has no customer, using Walk-in Customer default`);
+            customerTPIN = '1000000000';
+            customerName = 'Walk-in Customer';
+            customerId = null;
+            customerData = {
+                name: 'Walk-in Customer',
+                legal_name: 'Walk-in Customer',
+                tpin: '1000000000',
+                phone: null,
+                email: null
+            };
+        } else if (!originalSale.customer.tpin || originalSale.customer.tpin === '') {
+            // Customer exists but has no TPIN - treat as walk-in
+            console.log(`Customer ${originalSale.customer.id} has no TPIN, using Walk-in Customer default`);
+            customerTPIN = '1000000000';
+            customerName = originalSale.customer.name || 'Walk-in Customer';
+            customerId = originalSale.customer.id;
+            customerData = {
+                name: originalSale.customer.name || 'Walk-in Customer',
+                legal_name: originalSale.customer.legal_name || 'Walk-in Customer',
+                tpin: '1000000000',
+                phone: originalSale.customer.phone,
+                email: originalSale.customer.email,
+            };
+        } else {
+            // Valid customer with TPIN
+            customerTPIN = originalSale.customer.tpin;
+            customerName = originalSale.customer.name;
+            customerId = originalSale.customer.id;
+            customerData = {
+                name: originalSale.customer.name,
+                legal_name: originalSale.customer.legal_name || originalSale.customer.name,
+                tpin: originalSale.customer.tpin,
+                phone: originalSale.customer.phone,
+                email: originalSale.customer.email,
+            };
         }
 
-        if (!originalSale.customer.tpin) {
-            await t.rollback();
-            return res.status(422).json({ 
-                message: 'Cannot process return: Customer does not have a TPIN registered. TPIN is required for ZRA fiscalisation of credit notes.',
-                customer: {
-                    id: originalSale.customer.id,
-                    name: originalSale.customer.name,
-                    has_tpin: false
-                },
-                resolution: 'Please update the customer record with a valid TPIN before processing this return.'
-            });
-        }
-
-        // Validate original sale is fiscalised with ZRA
-        if (!originalSale.sdcid || !originalSale.receipt_no) {
-            await t.rollback();
-            return res.status(422).json({
-                message: 'Cannot process return: the original sale is not fiscalised with ZRA yet (missing SDC id / receipt number).',
-                originalSale: {
-                    id: originalSale.id,
-                    receipt_number: originalSale.receipt_number,
-                    zra_status: originalSale.zra_status,
-                    sdcid: originalSale.sdcid,
-                    receipt_no: originalSale.receipt_no,
-                },
-            });
-        }
+        // // Validate original sale is fiscalised with ZRA (required for credit note)
+        // if (!originalSale.sdcid || !originalSale.receipt_no) {
+        //     await t.rollback();
+        //     return res.status(422).json({
+        //         message: 'Cannot process return: the original sale is not fiscalised with ZRA yet (missing SDC id / receipt number).',
+        //         originalSale: {
+        //             id: originalSale.id,
+        //             receipt_number: originalSale.receipt_number,
+        //             zra_status: originalSale.zra_status,
+        //             sdcid: originalSale.sdcid,
+        //             receipt_no: originalSale.receipt_no,
+        //         },
+        //     });
+        // }
 
         // Idempotency check: if a credit note for this sale already exists, return it.
         const existingCN = await creditnote.findOne({ 
@@ -137,50 +161,29 @@ router.post('/:saleId/return', auth, async (req, res) => {
         
         if (existingCN) {
             await t.rollback();
-            let fullCN = await loadCreditNoteById(existingCN.id);
-
-            if (fullCN.zra_status !== 'sent' || !fullCN.sdcid || !fullCN.receipt_no) {
-                const existingReturnItems = (fullCN.items || []).map((item) => ({
-                    product_id: item.product_id,
-                    quantity: Number(item.quantity),
-                    unit_price: Number(item.unit_price),
-                    total_price: Number(item.total_price),
-                    tax_exclusive_total: Number(item.total_price) / 1.16,
-                    product: item.product || null,
-                }));
-
-                const zraResult = await submitCreditNoteToZra({
-                    creditNoteInstance: fullCN,
-                    originalSale,
-                    returnItems: existingReturnItems,
-                    user: req.user,
-                    reasonCode: reason_code || '03',
-                    custTpin: originalSale.customer.tpin, // Pass TPIN explicitly
-                });
-
-                const models = getModels(req);
-                const persisted = await applyCreditNoteZraResult(models, fullCN.id, zraResult);
-                fullCN = await loadCreditNoteById(fullCN.id);
-
-                await logCreditNotePersistence(models, req, {
-                    creditNoteInstance: fullCN,
-                    originalSale,
-                    outcome: fullCN.zra_status === 'sent' ? 'success' : 'failure',
-                    reason: fullCN.zra_error,
-                    actor: buildActorFromUser(req.user),
+            
+            // Check if already fiscalized
+            if (existingCN.zra_status === 'sent' && existingCN.sdcid) {
+                return res.status(200).json({
+                    message: 'Credit note already exists and has been fiscalized with ZRA.',
+                    creditNote: existingCN,
+                    zra_integration: {
+                        success: true,
+                        status: 'sent',
+                    },
                 });
             }
-
+            
+            // Return existing pending credit note
             return res.status(200).json({
-                message: fullCN.zra_status === 'sent'
-                    ? 'Credit note already exists for this sale.'
-                    : 'Credit note already exists for this sale. ZRA fiscalisation is still pending.',
-                creditNote: fullCN,
+                message: 'Credit note already exists. ZRA fiscalisation is pending in the queue.',
+                creditNote: existingCN,
                 zra_integration: {
-                    success: fullCN.zra_status === 'sent',
-                    queued: fullCN.zra_status !== 'sent',
-                    status: fullCN.zra_status,
-                    error: fullCN.zra_error,
+                    success: false,
+                    queued: true,
+                    status: existingCN.zra_status,
+                    error: existingCN.zra_error,
+                    next_retry_at: existingCN.next_retry_at,
                 },
             });
         }
@@ -191,34 +194,38 @@ router.post('/:saleId/return', auth, async (req, res) => {
         const returnItems = [];
 
         for (const item of items) {
-            const originalItem = originalSale.items.find(si => si.product_id === item.product_id);
+            const requestedProductId = Number(item.product_id);
+            const requestedQuantity = Number(item.quantity);
+            const requestedUnitPrice = Number(item.unit_price);
+            const originalItem = originalSale.items.find(si => Number(si.product_id) === requestedProductId);
+
             if (!originalItem) {
                 await t.rollback();
                 return res.status(400).json({ message: `Product ${item.product_name || item.product_id} was not in the original sale` });
             }
-            if (item.quantity > originalItem.quantity) {
+            if (requestedQuantity > Number(originalItem.quantity)) {
                 await t.rollback();
                 return res.status(400).json({ message: `Return quantity for ${item.product_name || item.product_id} exceeds original quantity` });
             }
 
-            const productData = await product.findByPk(item.product_id, { transaction: t });
+            const productData = await product.findByPk(requestedProductId, { transaction: t });
             if (!productData) {
                 await t.rollback();
-                return res.status(400).json({ message: `Product with ID ${item.product_id} not found` });
+                return res.status(400).json({ message: `Product with ID ${requestedProductId} not found` });
             }
 
-            const unit_price_inclusive = Number(item.unit_price);
+            const unit_price_inclusive = Number.isFinite(requestedUnitPrice) ? requestedUnitPrice : 0;
             const taxMultiplier = 1 + (Number(tax_rate) / 100);
             const unit_price_exclusive = unit_price_inclusive / taxMultiplier;
 
-            const tax_exclusive_total = item.quantity * unit_price_exclusive;
-            const tax_inclusive_total = item.quantity * unit_price_inclusive;
+            const tax_exclusive_total = requestedQuantity * unit_price_exclusive;
+            const tax_inclusive_total = requestedQuantity * unit_price_inclusive;
 
             subtotal += tax_exclusive_total;
 
             returnItems.push({
-                product_id: item.product_id,
-                quantity: item.quantity,
+                product_id: requestedProductId,
+                quantity: requestedQuantity,
                 unit_price: unit_price_inclusive,
                 total_price: tax_inclusive_total,
                 tax_exclusive_total,
@@ -230,12 +237,17 @@ router.post('/:saleId/return', auth, async (req, res) => {
         const tax_amount = (subtotal * tax_rate) / 100;
         const total_amount = subtotal + tax_amount;
 
-        // Persist Credit Note document
+        // If the original sale is missing ZRA refs, make this eligible immediately so the retry job can observe it.
+        const nextRetryAt = originalSale.sdcid && originalSale.receipt_no
+            ? new Date(Date.now() + 1 * 60 * 1000)
+            : new Date();
+
+        // Persist Credit Note document with queue status
         const cn = await creditnote.create({
             receipt_number: `CN-${originalSale.receipt_number}`,
             user_id: req.user.id,
             approver_user_id: approver_user_id || req.user.id,
-            customer_id: originalSale.customer_id, // Use the ID, not TPIN
+            customer_id: customerId,
             subtotal,
             discount_amount,
             tax_amount,
@@ -254,13 +266,14 @@ router.post('/:saleId/return', auth, async (req, res) => {
             vsdcrcpdate: null,
             invoice_no: null,
             qrfilepath: null,
-            zra_status: 'pending',
+            zra_status: 'pending', // Will be processed by queue
             zra_error: null,
             retry_count: 0,
-            next_retry_at: new Date(),
+            next_retry_at: nextRetryAt,
             last_retry_at: null,
             original_sale_id: originalSale.id,
             reason: reason || reason_label || 'Return',
+            reason_code: reason_code || '03',
         }, { transaction: t });
 
         // Store items and update stock (add back)
@@ -281,88 +294,87 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
         const creditNoteReference = cn.receipt_number;
 
-        // Commit transaction before external API calls
+        // Commit the transaction
         await t.commit();
 
-        const models = getModels(req);
+        // Load the full credit note with associations
         let fullCN = await loadCreditNoteById(cn.id);
 
-        let zraFailed = true;
-        let zraError = null;
+        const models = getModels(req);
+        const zraIntegration = {
+            success: false,
+            queued: true,
+            status: 'pending',
+            next_retry_at: nextRetryAt,
+            message: 'Credit note has been queued for ZRA fiscalisation',
+        };
 
-        try {
+        if (originalSale.sdcid && originalSale.receipt_no) {
             const zraResult = await submitCreditNoteToZra({
                 creditNoteInstance: fullCN,
                 originalSale,
                 returnItems,
-                user: req.user,
+                user: { store_id: req.user.store_id, id: req.user.id },
                 reasonCode: reason_code || '03',
-                customerTPIN: originalSale.customer.tpin, // Pass TPIN explicitly
-                customerData: {
-                    name: originalSale.customer.name,
-                    legal_name: originalSale.customer.legal_name,
-                    tpin: originalSale.customer.tpin,
-                    phone: originalSale.customer.phone,
-                    email: originalSale.customer.email,
-                }
             });
 
-            const persisted = await applyCreditNoteZraResult(models, cn.id, zraResult);
-            zraFailed = persisted.zraFailed;
-            zraError = persisted.zraError;
-            fullCN = await loadCreditNoteById(cn.id);
-        } catch (zraIntegrationError) {
-            zraError = zraIntegrationError.message || String(zraIntegrationError);
-            console.error('Credit note ZRA/persistence failed:', zraIntegrationError);
-            fullCN = await loadCreditNoteById(cn.id);
-
-            if (fullCN.zra_status !== 'sent') {
-                await applyCreditNoteZraResult(models, cn.id, {
-                    success: false,
-                    error: zraError,
-                });
+            if (zraResult.success) {
+                await applyCreditNoteZraResult(models, fullCN.id, zraResult);
                 fullCN = await loadCreditNoteById(cn.id);
 
-                const zraRetryJob = req.app.locals.zraRetryJob;
-                if (zraRetryJob) {
-                    zraRetryJob.run().catch((retryError) => {
-                        console.error('Immediate credit note ZRA retry failed:', retryError.message);
-                    });
-                }
-            }
+                zraIntegration.success = true;
+                zraIntegration.queued = false;
+                zraIntegration.status = 'sent';
+                zraIntegration.message = 'Credit note fiscalised with ZRA successfully';
+                zraIntegration.receipt_no = fullCN.receipt_no;
+                zraIntegration.sdcid = fullCN.sdcid;
+                zraIntegration.next_retry_at = fullCN.next_retry_at;
+            } else {
+                await applyCreditNoteZraResult(models, fullCN.id, zraResult, { retryDelayMinutes: 2 });
+                fullCN = await loadCreditNoteById(cn.id);
 
-            zraFailed = fullCN.zra_status !== 'sent';
+                zraIntegration.error = zraResult.error;
+                zraIntegration.pendingReason = zraResult.pendingReason || null;
+                zraIntegration.next_retry_at = fullCN.next_retry_at;
+            }
         }
 
+        // Trigger the retry job to process this credit note if queueing is still required
+        const zraRetryJob = req.app.locals.zraRetryJob;
+        if (zraRetryJob) {
+            setImmediate(() => {
+                zraRetryJob.run().catch(err => {
+                    console.error('Failed to trigger ZRA retry job for credit note:', err);
+                });
+            });
+        }
+
+        // Log the credit note creation
         await logCreditNotePersistence(models, req, {
             creditNoteInstance: fullCN,
             originalSale,
-            outcome: zraFailed ? 'failure' : 'success',
-            reason: zraError,
+            outcome: zraIntegration.success ? 'sent' : 'queued',
+            reason: zraIntegration.success ? 'Fiscalised immediately' : 'Queued for ZRA processing',
             actor: buildActorFromUser(req.user),
         });
 
         return res.status(201).json({
-            message: zraFailed
-                ? 'Credit note saved (ZRA pending). Sage posting will occur in the daily credit-note batch.'
-                : 'Credit note created and fiscalised with ZRA. Sage posting will occur in the daily credit-note batch.',
+            message: zraIntegration.success
+                ? 'Credit note created and fiscalised successfully.'
+                : 'Credit note created successfully and queued for ZRA fiscalisation.',
             creditNote: fullCN,
             originalSale: {
                 id: originalSale.id,
                 receipt_number: originalSale.receipt_number,
-                total_amount: originalSale.total_amount
+                total_amount: originalSale.total_amount,
             },
             customer_info: {
-                name: originalSale.customer.name,
-                tpin: originalSale.customer.tpin,
-                has_valid_tpin: !!originalSale.customer.tpin
+                name: customerName,
+                tpin: customerTPIN,
+                has_valid_tpin: true,
+                is_walk_in: (!originalSale.customer || !originalSale.customer.tpin),
             },
-            zra_integration: {
-                success: !zraFailed,
-                queued: zraFailed,
-                status: zraFailed ? 'pending' : 'sent',
-                error: zraError,
-            },
+            zra_integration: zraIntegration,
             sage_integration: {
                 queued: true,
                 status: 'pending',
@@ -373,7 +385,13 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
     } catch (error) {
         console.error('Credit note transaction failed:', error);
-        await logRequestAudit(getModels(req), req, {
+        
+        if (t) {
+            try { await t.rollback(); } catch (rbErr) { console.error('Rollback failed:', rbErr); }
+        }
+        
+        const models = getModels(req);
+        await logRequestAudit(models, req, {
             action: 'credit_note.create',
             outcome: 'failure',
             entityType: 'credit_note',
@@ -385,10 +403,6 @@ router.post('/:saleId/return', auth, async (req, res) => {
                 stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
             },
         });
-        
-        if (t) {
-            try { await t.rollback(); } catch (rbErr) { console.error('Rollback failed:', rbErr); }
-        }
         
         return res.status(500).json({
             message: 'Server error',
@@ -533,4 +547,173 @@ router.get('/:id', auth, async (req, res) => {
     }
 });
 
+
+// Add to your credit notes routes file
+router.post('/retry-failed', async (req, res) => {
+    try {
+        // // Check admin权限
+        // if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+        //     return res.status(403).json({ message: 'Access denied. Admin role required.' });
+        // }
+
+        const { creditNoteIds, forceAll = false } = req.body;
+        let updatedCount = 0;
+        let skippedCount = 0;
+        const results = [];
+
+        let targetIds = [];
+        
+        if (forceAll) {
+            // Get all failed/pending credit notes that haven't succeeded
+            const failedNotes = await creditnote.findAll({
+                where: {
+                    zra_status: ['failed', 'pending'],
+                    sdcid: null  // Only those not yet fiscalized
+                },
+                attributes: ['id']
+            });
+            targetIds = failedNotes.map(n => n.id);
+        } else if (creditNoteIds && creditNoteIds.length > 0) {
+            targetIds = creditNoteIds;
+        } else {
+            return res.status(400).json({ 
+                message: 'Please provide creditNoteIds array or set forceAll=true' 
+            });
+        }
+
+        for (const id of targetIds) {
+            const cn = await creditnote.findByPk(id, {
+                include: [
+                    { model: customer, as: 'customer' },
+                    { model: sale, as: 'originalSale', include: [{ model: customer, as: 'customer' }] }
+                ]
+            });
+
+            if (!cn) {
+                results.push({ id, status: 'skipped', reason: 'Credit note not found' });
+                skippedCount++;
+                continue;
+            }
+
+            // Check if already successful
+            if (cn.zra_status === 'sent' && cn.sdcid) {
+                results.push({ id, status: 'skipped', reason: 'Already fiscalized' });
+                skippedCount++;
+                continue;
+            }
+
+            // Validate customer TPIN
+            const originalCustomer = cn.originalSale?.customer;
+            const creditNoteCustomer = cn.customer;
+
+            if (!originalCustomer?.tpin || originalCustomer.tpin === 'null' || originalCustomer.tpin === '') {
+                results.push({ 
+                    id, 
+                    status: 'failed', 
+                    reason: 'Original sale customer missing TPIN',
+                    customer_id: originalCustomer?.id,
+                    customer_name: originalCustomer?.name
+                });
+                continue;
+            }
+
+            // Reset the credit note for retry
+            await cn.update({
+                zra_status: 'pending',
+                next_retry_at: new Date(),
+                retry_count: 0,
+                zra_error: null,
+                last_retry_at: null
+            });
+
+            results.push({ 
+                id, 
+                status: 'reset', 
+                receipt_number: cn.receipt_number,
+                customer_tpin: originalCustomer.tpin
+            });
+            updatedCount++;
+        }
+
+        // Trigger the retry job if there are items to process
+        const zraRetryJob = req.app.locals.zraRetryJob;
+        if (zraRetryJob && updatedCount > 0) {
+            // Run immediately
+            setImmediate(() => {
+                zraRetryJob.run().catch(err => {
+                    console.error('ZRA retry job failed:', err);
+                });
+            });
+        }
+
+        return res.status(200).json({
+            message: `Reset ${updatedCount} credit notes for retry, skipped ${skippedCount}`,
+            updated_count: updatedCount,
+            skipped_count: skippedCount,
+            results: results,
+            retry_triggered: updatedCount > 0
+        });
+
+    } catch (error) {
+        console.error('Failed to reset credit notes:', error);
+        return res.status(500).json({ 
+            message: 'Server error', 
+            error: error.message 
+        });
+    }
+});
+
+// Endpoint to get failed credit notes
+router.get('/failed', auth, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+            return res.status(403).json({ message: 'Access denied' });
+        }
+
+        const failedCreditNotes = await creditnote.findAll({
+            where: {
+                zra_status: ['failed', 'pending'],
+                sdcid: null
+            },
+            attributes: ['id', 'receipt_number', 'zra_status', 'retry_count', 'zra_error', 'createdAt'],
+            include: [
+                { 
+                    model: sale, 
+                    as: 'originalSale',
+                    attributes: ['id', 'receipt_number'],
+                    include: [{ model: customer, as: 'customer', attributes: ['id', 'name', 'tpin'] }]
+                },
+                { model: customer, as: 'customer', attributes: ['id', 'name', 'tpin'] }
+            ],
+            order: [['createdAt', 'DESC']]
+        });
+
+        // Separate by error type
+        const tpinIssues = failedCreditNotes.filter(cn => 
+            cn.zra_error && cn.zra_error.includes('custTpin')
+        );
+        const otherIssues = failedCreditNotes.filter(cn => 
+            !cn.zra_error || !cn.zra_error.includes('custTpin')
+        );
+
+        return res.status(200).json({
+            total: failedCreditNotes.length,
+            tpin_issues: tpinIssues.length,
+            other_issues: otherIssues.length,
+            credit_notes: failedCreditNotes,
+            tpin_issues_list: tpinIssues.map(cn => ({
+                id: cn.id,
+                receipt_number: cn.receipt_number,
+                sale_id: cn.originalSale?.id,
+                customer_name: cn.originalSale?.customer?.name,
+                customer_tpin: cn.originalSale?.customer?.tpin,
+                error: cn.zra_error
+            }))
+        });
+
+    } catch (error) {
+        console.error('Error fetching failed credit notes:', error);
+        return res.status(500).json({ message: 'Server error' });
+    }
+});
 module.exports = router;
