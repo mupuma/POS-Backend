@@ -34,6 +34,7 @@
     "morgan": "^1.10.1",
     "mysql2": "^3.14.1",
     "nexe-natives": "^1.0.2",
+    "node-cache": "^5.1.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.10",
     "pug": "3.0.3",
@@ -54,7 +55,11 @@
     "compression": "Brotli",
     "scripts": [
       "server.js",
-      "models/**/*.js"
+      "models/**/*.js",
+      "routes/**/*.js",
+      "controllers/**/*.js",
+      "services/**/*.js",
+      "utils/**/*.js"
     ],
     "assets": [
       "migrations/**/*",
@@ -64,7 +69,8 @@
       "node_modules/mysql2/build/Release/*.node",
       "node_modules/tedious/build/Release/*.node",
       "!node_modules/open/xdg-open",
-      "!node_modules/@azure/identity/node_modules/open/xdg-open"
+      "!node_modules/@azure/identity/node_modules/open/xdg-open",
+      "temp/**/*"
     ]
   }
 }

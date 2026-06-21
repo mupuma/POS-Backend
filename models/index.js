@@ -14,6 +14,13 @@ const sequelize = new Sequelize(
         host: process.env.DB_HOST || dbConfig.host,
         dialect: dbConfig.dialect,
         port: process.env.DB_PORT || dbConfig.port,
+        logging: false,
+        pool: {
+            max: Number(process.env.DB_POOL_MAX || 15),
+            min: Number(process.env.DB_POOL_MIN || 2),
+            acquire: Number(process.env.DB_POOL_ACQUIRE_MS || 30000),
+            idle: Number(process.env.DB_POOL_IDLE_MS || 10000),
+        },
     }
 );
 
