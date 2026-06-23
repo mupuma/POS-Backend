@@ -1,15 +1,11 @@
 const fs = require('fs').promises;
 const path = require('path');
 const ExcelJS = require('exceljs');
-const nodemailer = require('nodemailer');
-
-const DEFAULT_REPORT_RECIPIENTS = (process.env.SALES_REPORT_RECIPIENTS || process.env.SALES_REPORT_RECIPIENT || 'brightonbanda13@gmail.com');
-const REPORT_RECIPIENTS = DEFAULT_REPORT_RECIPIENTS.split(',').map((recipient) => recipient.trim()).filter(Boolean);
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
+const { runtimeTempDir } = require('../../utils/runtimePaths');
+const {
+    createEmailTransporter,
+    getEmailConfig,
+} = require('../emailTransportService');
 
 function formatReportDate(date) {
     return new Date(date).toLocaleDateString('en-GB', {
@@ -107,24 +103,6 @@ function getLastCompletedPeriod(now, startDay, durationMonths) {
 
 function getPeriodKey(reportType, startDate, endDate) {
     return `${reportType}:${startDate.toISOString().slice(0, 10)}_${endDate.toISOString().slice(0, 10)}`;
-}
-
-function createEmailTransporter() {
-    return nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_SECURE,
-        auth: { user: SMTP_USER, pass: SMTP_PASS },
-    });
-}
-
-async function verifyTransporter(transporter) {
-    try {
-        await transporter.verify();
-        return true;
-    } catch (error) {
-        return false;
-    }
 }
 
 function buildReportWorkbook(reportData, startDate, endDate, storeLabel, reportFrequency) {
@@ -248,8 +226,12 @@ async function generateSalesReport(models, startDate, endDate, storeId) {
 }
 
 async function sendSalesReportEmail({ models, storeId = null, store = null, startDate, endDate, reportFrequency = 'daily' }) {
-    if (!SMTP_USER || !SMTP_PASS) {
+    const emailConfig = getEmailConfig();
+    if (!emailConfig.user || !emailConfig.pass) {
         return { ok: false, error: 'SMTP credentials are not configured' };
+    }
+    if (emailConfig.recipients.length === 0) {
+        return { ok: false, error: 'SALES_REPORT_RECIPIENTS is not configured' };
     }
 
     const reportData = await generateSalesReport(models, startDate, endDate, storeId);
@@ -259,7 +241,7 @@ async function sendSalesReportEmail({ models, storeId = null, store = null, star
     const subject = buildSubject({ storeLabel, startDate, endDate, recordCount, totalAmount, reportFrequency });
 
     const workbook = buildReportWorkbook(reportData, startDate, endDate, storeLabel, reportFrequency);
-    const tempDir = path.join(__dirname, '../../temp');
+    const tempDir = runtimeTempDir();
     await fs.mkdir(tempDir, { recursive: true });
 
     const fileName = `sales_report_${reportFrequency}_${startDate.toISOString().slice(0, 10)}_to_${endDate.toISOString().slice(0, 10)}.xlsx`;
@@ -267,16 +249,21 @@ async function sendSalesReportEmail({ models, storeId = null, store = null, star
     await workbook.xlsx.writeFile(tempFilePath);
 
     const transporter = createEmailTransporter();
-    const verified = await verifyTransporter(transporter);
-    if (!verified) {
+    try {
+        await transporter.verify();
+    } catch (error) {
         await fs.unlink(tempFilePath).catch(() => {});
-        return { ok: false, error: 'Unable to verify SMTP transporter. Internet connectivity or SMTP credentials may be invalid.' };
+        return {
+            ok: false,
+            error: `Unable to verify SMTP transporter: ${error.message}`,
+            code: error.code || 'SMTP_VERIFY_FAILED',
+        };
     }
 
     try {
         await transporter.sendMail({
-            from: `"${process.env.COMPANY_NAME || 'DAPP POS'}" <${SMTP_USER}>`,
-            to: REPORT_RECIPIENTS,
+            from: `"${emailConfig.companyName}" <${emailConfig.fromAddress}>`,
+            to: emailConfig.recipients,
             subject,
             html: `
                 <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -303,7 +290,7 @@ async function sendSalesReportEmail({ models, storeId = null, store = null, star
 
     return {
         ok: true,
-        recipients: REPORT_RECIPIENTS,
+        recipients: emailConfig.recipients,
         subject,
         recordCount,
         totalAmount,
@@ -335,6 +322,7 @@ async function sendDailySalesReportsForAllStores(models, dateStr) {
 }
 
 async function sendMonthlySalesReportsForAllStores(models, options = {}) {
+    const reportRecipients = getEmailConfig().recipients;
     const durationMonths = Number(options.periodDurationMonths || process.env.SALES_REPORT_PERIOD_DURATION_MONTHS || 1);
     const startDay = Number(options.periodStartDay || process.env.SALES_REPORT_PERIOD_START_DAY || 1);
     const now = options.referenceDate || new Date();
@@ -355,7 +343,7 @@ async function sendMonthlySalesReportsForAllStores(models, options = {}) {
                 period_end: periodEnd,
                 status: 'pending',
                 attempt_count: 0,
-                email_to: REPORT_RECIPIENTS.join(','),
+                email_to: reportRecipients.join(','),
             },
         });
 
@@ -402,7 +390,6 @@ async function sendMonthlySalesReportsForAllStores(models, options = {}) {
 }
 
 module.exports = {
-    REPORT_RECIPIENTS,
     sendSalesReportEmail,
     sendDailySalesReportsForAllStores,
     sendMonthlySalesReportsForAllStores,

@@ -1,4 +1,5 @@
-require('dotenv').config();
+const { loadRuntimeEnv } = require('./config/runtimeEnv');
+const runtimeEnv = loadRuntimeEnv();
 
 const { initLogDirectory } = require('./services/fileAuditLogger');
 
@@ -19,6 +20,7 @@ const salesReportEmailJob = new SalesReportEmailJob(models);
 const SyncOutboxJob = require("./jobs/syncOutboxJob");
 const syncOutboxJob = new SyncOutboxJob(models);
 const customerKycJob = new CustomerKycJob(models);
+const { getEmailDiagnostics, verifyEmailTransport } = require('./services/emailTransportService');
 
 function setStartupState(stage, { ready = false, error = null } = {}) {
   app.locals.startupState = {
@@ -145,6 +147,8 @@ app.locals.models = models;
 const PORT = process.env.PORT || 3000;
 
 const logPaths = initLogDirectory();
+console.log(`Runtime environment: ${runtimeEnv.path || 'process environment only'}`);
+console.log('Email configuration:', getEmailDiagnostics());
 console.log(`POS audit log directory: ${logPaths.root}`);
 console.log(`Sales log (readable): ${logPaths.salesReadable}`);
 console.log(`Sales log (JSON):     ${logPaths.salesJson}`);
@@ -161,6 +165,11 @@ dayEndJob.start();
 salesReportEmailJob.start();
 syncOutboxJob.start();
 customerKycJob.start();
+if (String(process.env.SMTP_VERIFY_ON_STARTUP || '').toLowerCase() === 'true') {
+  verifyEmailTransport()
+    .then(() => console.log('SMTP transport verification succeeded'))
+    .catch((error) => console.error(`SMTP transport verification failed [${error.code || 'SMTP_ERROR'}]: ${error.message}`));
+}
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, stopping cron job...');

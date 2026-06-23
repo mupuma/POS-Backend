@@ -123,7 +123,8 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
         type: QueryTypes.SELECT,
     });
 
-    const [salesTotalsRows, salePayments, saleCategories, returnTotalsRows, returnPayments, returnCategories] = await Promise.all([
+    const [salesTotalsRows, salePayments, saleCategories, returnTotalsRows, returnPayments,
+        returnCategories, saleCashiers, returnCashiers] = await Promise.all([
         select(`
             SELECT COUNT(*) AS transactions,
                    COALESCE(SUM(s.subtotal), 0) AS gross_sales,
@@ -193,6 +194,40 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             WHERE ${returnScope}
             GROUP BY c.id, c.name
         `),
+        select(`
+            SELECT u.id AS cashier_id,
+                   COALESCE(u.full_name, 'Unknown') AS cashier_name,
+                   COUNT(*) AS transactions,
+                   COALESCE(SUM(s.subtotal), 0) AS gross_sales,
+                   COALESCE(SUM(s.total_amount), 0) AS total_sales,
+                   COALESCE(SUM(items.quantity), 0) AS items_sold
+            FROM sales s
+            JOIN users u ON s.user_id = u.id
+            LEFT JOIN (
+                SELECT sale_id, SUM(quantity) AS quantity
+                FROM saleitems
+                GROUP BY sale_id
+            ) items ON items.sale_id = s.id
+            WHERE ${saleScope}
+            GROUP BY u.id, u.full_name
+            ORDER BY total_sales DESC
+        `),
+        select(`
+            SELECT u.id AS cashier_id,
+                   COALESCE(u.full_name, 'Unknown') AS cashier_name,
+                   COUNT(*) AS returns_count,
+                   COALESCE(SUM(cn.total_amount), 0) AS returns_amount,
+                   COALESCE(SUM(items.quantity), 0) AS items_returned
+            FROM credit_notes cn
+            JOIN users u ON cn.user_id = u.id
+            LEFT JOIN (
+                SELECT credit_note_id, SUM(quantity) AS quantity
+                FROM credit_note_items
+                GROUP BY credit_note_id
+            ) items ON items.credit_note_id = cn.id
+            WHERE ${returnScope}
+            GROUP BY u.id, u.full_name
+        `),
     ]);
 
     const salesTotals = salesTotalsRows[0] || {};
@@ -230,6 +265,43 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
         categories.set(key, current);
     }
 
+    const cashiers = new Map();
+    for (const row of saleCashiers) {
+        const cashierId = String(row.cashier_id);
+        cashiers.set(cashierId, {
+            cashier_id: row.cashier_id,
+            cashier_name: row.cashier_name,
+            transactions: Number(row.transactions || 0),
+            returns: 0,
+            items_sold: Number(row.items_sold || 0),
+            items_returned: 0,
+            gross_sales: Number(row.gross_sales || 0),
+            total_sales: Number(row.total_sales || 0),
+            returns_amount: 0,
+            net_sales: Number(row.total_sales || 0),
+        });
+    }
+    for (const row of returnCashiers) {
+        const cashierId = String(row.cashier_id);
+        const current = cashiers.get(cashierId) || {
+            cashier_id: row.cashier_id,
+            cashier_name: row.cashier_name,
+            transactions: 0,
+            returns: 0,
+            items_sold: 0,
+            items_returned: 0,
+            gross_sales: 0,
+            total_sales: 0,
+            returns_amount: 0,
+            net_sales: 0,
+        };
+        current.returns = Number(row.returns_count || 0);
+        current.items_returned = Number(row.items_returned || 0);
+        current.returns_amount = Number(row.returns_amount || 0);
+        current.net_sales = current.total_sales - current.returns_amount;
+        cashiers.set(cashierId, current);
+    }
+
     const grossSales = Number(salesTotals.gross_sales || 0);
     const discounts = Number(salesTotals.discounts || 0);
     const salesTotalAmount = Number(salesTotals.total_amount || 0);
@@ -253,6 +325,7 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             net_revenue: salesTotalAmount - returnsAmount,
         },
         payments,
+        cashiers: [...cashiers.values()].sort((left, right) => right.net_sales - left.net_sales),
         categories: [...categories.values()],
     };
 }
@@ -1272,23 +1345,37 @@ router.get('/:reportType/export', auth, async (req, res) => {
 
 // Email Report Route - All reports are sent in Excel format only
 const ExcelJS = require('exceljs');
-const nodemailer = require('nodemailer');
 const fs = require('fs').promises;
 const path = require('path');
 const { pool } = require('../config/database'); // Adjust path as needed
+const { runtimeTempDir } = require('../utils/runtimePaths');
+const {
+    assertEmailConfigured,
+    createEmailTransporter,
+    getEmailDiagnostics,
+    verifyEmailTransport,
+} = require('../services/emailTransportService');
 
-// Configure email transporter (use environment variables)
-const createEmailTransporter = () => {
-    return nodemailer.createTransport({
-        host: process.env.SMTP_HOST || 'smtp.gmail.com',
-        port: process.env.SMTP_PORT || 587,
-        secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
-        auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS
-        }
-    });
-};
+router.get('/email/status', auth, async (req, res) => {
+    try {
+        const diagnostics = req.query.verify === 'true'
+            ? await verifyEmailTransport()
+            : getEmailDiagnostics();
+        return res.json({
+            success: true,
+            ...diagnostics,
+            verified: req.query.verify === 'true' ? true : undefined,
+        });
+    } catch (error) {
+        return res.status(503).json({
+            success: false,
+            ...getEmailDiagnostics(),
+            verified: false,
+            code: error.code || 'SMTP_VERIFY_FAILED',
+            message: error.message,
+        });
+    }
+});
 
 // Report generation functions
 const generateSalesReport = async (startDate, endDate, storeId, additionalParams) => {
@@ -1603,6 +1690,7 @@ router.post('/:reportType/email', auth, async (req, res) => {
     let tempFilePath = null;
 
     try {
+        const emailConfig = assertEmailConfigured();
         const { reportType } = req.params;
         const { format, start_date, end_date, email, ...additionalParams } = req.body;
 
@@ -1692,7 +1780,7 @@ router.post('/:reportType/email', auth, async (req, res) => {
         const workbook = await createExcelReport(reportType, reportData, startDate, endDate);
 
         // Save to temporary file
-        const tempDir = path.join(__dirname, '../temp');
+        const tempDir = runtimeTempDir();
         await fs.mkdir(tempDir, { recursive: true });
 
         const fileName = `${reportType}_report_${Date.now()}.xlsx`;
@@ -1702,9 +1790,10 @@ router.post('/:reportType/email', auth, async (req, res) => {
 
         // Send email with attachment
         const transporter = createEmailTransporter();
+        await transporter.verify();
 
         const mailOptions = {
-            from: `"${process.env.COMPANY_NAME || 'SwiftCart POS'}" <${process.env.SMTP_USER}>`,
+            from: `"${emailConfig.companyName}" <${emailConfig.fromAddress}>`,
             to: email,
             subject: `${reportType.toUpperCase()} Report - ${new Date(startDate).toLocaleDateString()} to ${new Date(endDate).toLocaleDateString()}`,
             html: `
@@ -1768,7 +1857,9 @@ router.post('/:reportType/email', auth, async (req, res) => {
         res.status(500).json({
             message: 'Server error while sending report email',
             success: false,
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+            code: error.code || 'EMAIL_SEND_FAILED',
+            error: error.message,
+            diagnostics: getEmailDiagnostics(),
         });
     }
 });
