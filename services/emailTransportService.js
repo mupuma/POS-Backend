@@ -16,7 +16,7 @@ function getEmailConfig() {
   const recipients = String(
     process.env.SALES_REPORT_RECIPIENTS
       || process.env.SALES_REPORT_RECIPIENT
-      || 'brightonbanda13@gmail.com'
+      || 'admin@dappzambia.org'
   ).split(',').map((value) => value.trim()).filter(Boolean);
 
   return {

@@ -380,10 +380,13 @@ router.get('/:id/performance', auth, async (req, res) => {
     });
 
     // Calculate performance metrics
+    const expectedAmount = userSales.reduce(
+        (sum, s) => sum + parseFloat(s.total_amount || 0), 0);
     const performance = {
       user: userData,
       total_sales: userSales.length,
-      total_revenue: userSales.reduce((sum, s) => sum + parseFloat(s.total_amount), 0),
+      total_revenue: expectedAmount,
+      expected_amount: expectedAmount,
       total_discounts_given: userSales.reduce((sum, s) => sum + parseFloat(s.discount_amount), 0),
       average_sale_amount: userSales.length > 0 ?
           userSales.reduce((sum, s) => sum + parseFloat(s.total_amount), 0) / userSales.length : 0,
@@ -461,12 +464,14 @@ router.get('/reports/all-performance', auth, async (req, res) => {
           user: s.cashier,
           total_sales: 0,
           total_revenue: 0,
+          expected_amount: 0,
           total_discounts: 0
         };
       }
 
       userPerformance[userId].total_sales += 1;
       userPerformance[userId].total_revenue += parseFloat(s.total_amount);
+      userPerformance[userId].expected_amount += parseFloat(s.total_amount);
       userPerformance[userId].total_discounts += parseFloat(s.discount_amount);
     });
 

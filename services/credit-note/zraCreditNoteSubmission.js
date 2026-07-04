@@ -121,6 +121,7 @@ async function submitCreditNoteToZra({
   returnItems,
   user,
   reasonCode = '03',
+  timeoutMs,
 }) {
   const { orgSdcId, orgInvcNo } = resolveOriginalSaleZraRefs(originalSale);
 
@@ -150,7 +151,10 @@ async function submitCreditNoteToZra({
     orgSdcId
   );
 
-  const response = await creditNoteZraService.sendCreditNoteSalesData(salesData);
+  const response = await creditNoteZraService.sendCreditNoteSalesData(
+    salesData,
+    { timeoutMs }
+  );
   const result = await buildCreditNoteUpdatesFromZraResponse(salesData.cisInvcNo, response);
 
   if (result.success) {

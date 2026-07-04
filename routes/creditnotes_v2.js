@@ -5,6 +5,7 @@ const { Op, literal } = require('sequelize');
 const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
 const { buildListQueryFilters } = require('../services/query/listFilters');
 const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
+const { clearDashboardCache } = require('../services/reports/dashboardStats');
 const {
     applyCreditNoteZraResult,
     logCreditNotePersistence,
@@ -281,6 +282,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
             await creditnoteitem.create({
                 credit_note_id: cn.id,
                 product_id: item.product_id,
+                category_id: item.product?.category_id || null,
                 quantity: item.quantity,
                 unit_price: item.unit_price,
                 total_price: item.total_price
@@ -296,6 +298,7 @@ router.post('/:saleId/return', auth, async (req, res) => {
 
         // Commit the transaction
         await t.commit();
+        clearDashboardCache(req.user.store_id);
 
         // Load the full credit note with associations
         let fullCN = await loadCreditNoteById(cn.id);

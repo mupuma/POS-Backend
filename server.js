@@ -91,6 +91,36 @@ async function ensureCreditNoteSchema() {
   }
 }
 
+async function ensureCreditNoteItemSchema() {
+  const queryInterface = models.sequelize.getQueryInterface();
+  let table;
+
+  try {
+    table = await queryInterface.describeTable('credit_note_items');
+  } catch (error) {
+    return;
+  }
+
+  if (!table.category_id) {
+    await queryInterface.addColumn('credit_note_items', 'category_id', {
+      type: models.Sequelize.INTEGER,
+      allowNull: true,
+      references: { model: 'categories', key: 'id' },
+      onUpdate: 'CASCADE',
+      onDelete: 'SET NULL',
+    });
+  }
+
+  // Preserve the category at the time of return for items created before this
+  // column existed. New credit notes populate it when their items are created.
+  await models.sequelize.query(`
+    UPDATE credit_note_items AS creditNoteItem
+    LEFT JOIN products AS product ON product.id = creditNoteItem.product_id
+    SET creditNoteItem.category_id = product.category_id
+    WHERE creditNoteItem.category_id IS NULL
+  `);
+}
+
 // Ensure indexes exist on frequently-sorted columns. Without an index on the
 // ORDER BY column, MySQL must filesort the matching rows, and because tables like
 // `sales`/`credit_notes` carry large TEXT/JSON columns (notes, zra_error,
@@ -160,7 +190,6 @@ const server = createServer(app);
 const notificationService = initializeNotificationSystem(server);
 setGlobalNotificationService(notificationService);
 inventorySyncJob.start();
-zraRetryJob.start();
 dayEndJob.start();
 salesReportEmailJob.start();
 syncOutboxJob.start();
@@ -169,6 +198,57 @@ if (String(process.env.SMTP_VERIFY_ON_STARTUP || '').toLowerCase() === 'true') {
   verifyEmailTransport()
     .then(() => console.log('SMTP transport verification succeeded'))
     .catch((error) => console.error(`SMTP transport verification failed [${error.code || 'SMTP_ERROR'}]: ${error.message}`));
+}
+
+async function ensureZraRetrySchema() {
+  const queryInterface = models.sequelize.getQueryInterface();
+  const definitions = [
+    ['zra_status', { type: models.Sequelize.ENUM('pending', 'sent', 'failed'), allowNull: false, defaultValue: 'pending' }],
+    ['zra_error', { type: models.Sequelize.TEXT, allowNull: true }],
+    ['retry_count', { type: models.Sequelize.INTEGER, allowNull: false, defaultValue: 0 }],
+    ['next_retry_at', { type: models.Sequelize.DATE(3), allowNull: true }],
+    ['last_retry_at', { type: models.Sequelize.DATE(3), allowNull: true }],
+  ];
+
+  for (const [tableName, model] of [
+    ['sales', models.sale],
+    ['credit_notes', models.creditnote],
+  ]) {
+    let table;
+    try {
+      table = await queryInterface.describeTable(tableName);
+    } catch (_) {
+      continue;
+    }
+
+    for (const [columnName, definition] of definitions) {
+      if (!table[columnName]) {
+        await queryInterface.addColumn(tableName, columnName, definition);
+      }
+    }
+
+    // Some deployed databases have these as DATE, which discards the time.
+    // Normalize them to millisecond DATETIME columns.
+    for (const columnName of ['next_retry_at', 'last_retry_at']) {
+      const type = String(table[columnName]?.type || '').toUpperCase();
+      if (type === 'DATE') {
+        await queryInterface.changeColumn(tableName, columnName, {
+          type: models.Sequelize.DATE(3),
+          allowNull: true,
+        });
+      }
+    }
+
+    await model.update(
+      { next_retry_at: new Date() },
+      {
+        where: {
+          zra_status: { [models.Sequelize.Op.in]: ['pending', 'failed'] },
+          next_retry_at: null,
+        },
+      }
+    );
+  }
 }
 // Graceful shutdown
 process.on('SIGTERM', () => {
@@ -207,6 +287,8 @@ db.sequelize.authenticate()
     setStartupState('ensuring_schema');
     return ensureCustomerSchema()
       .then(() => ensureCreditNoteSchema())
+      .then(() => ensureCreditNoteItemSchema())
+      .then(() => ensureZraRetrySchema())
       .then(() => ensureIndexes());
   })
   .then(() => {
@@ -219,6 +301,16 @@ db.sequelize.authenticate()
     server.listen(PORT, "127.0.0.1", () => {
   //  server.listen(PORT,  () => {
       setStartupState('ready', { ready: true });
+      // Start only after the schema/database is ready, then immediately recover
+      // overdue rows instead of waiting for the next cron boundary.
+      zraRetryJob.start();
+      setImmediate(() => {
+        zraRetryJob.run().then((result) => {
+          console.log('[zra-retry] startup recovery:', result);
+        }).catch((error) => {
+          console.error('[zra-retry] startup recovery failed:', error);
+        });
+      });
       console.log(`Server running on port ${PORT}`);
       console.log(`WebSocket server available at ws://localhost:${PORT}/ws/notifications`);
     });

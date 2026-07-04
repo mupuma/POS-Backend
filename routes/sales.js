@@ -6,7 +6,9 @@ const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
 const { annotateSalesWithReturnState } = require('../services/sales/returnState');
+const { clearDashboardCache } = require('../services/reports/dashboardStats');
 const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
+const { buildSaleReconstructionDetails } = require('../services/sale/saleReconstruction');
 
 const router = express.Router();
 
@@ -127,11 +129,98 @@ async function requeueSaleSyncEvent(saleRecord) {
     return null;
 }
 
+function queueImmediateZraSubmission({
+    saleId,
+    cisInvoiceNo,
+    saleDataForZRA,
+    saleItems,
+    submittingUser,
+}) {
+    setImmediate(async () => {
+        const startedAt = Date.now();
+        const zraService = new ZRAIntegrationService();
+        try {
+            console.log('[sales] background ZRA submission started', { saleId });
+            const salesData = await zraService.transformToZRASalesData(
+                saleDataForZRA,
+                saleItems,
+                submittingUser,
+                cisInvoiceNo
+            );
+            const salesResponse = await zraService.sendSalesData(salesData);
+
+            if (!salesResponse.success) {
+                const error = typeof salesResponse.error === 'string'
+                    ? salesResponse.error
+                    : JSON.stringify(salesResponse.error || 'Unknown ZRA error');
+                await sale.update({
+                    zra_error: error,
+                    next_retry_at: new Date(Date.now() + 30 * 1000),
+                }, { where: { id: saleId } });
+                console.error('[sales] background ZRA submission failed', {
+                    saleId,
+                    durationMs: Date.now() - startedAt,
+                    error,
+                });
+                return;
+            }
+
+            const zraResult = await buildSaleUpdatesFromZraResponse(
+                cisInvoiceNo,
+                salesResponse
+            );
+            if (!zraResult.success) {
+                await sale.update({
+                    zra_error: zraResult.error,
+                    next_retry_at: new Date(Date.now() + 30 * 1000),
+                }, { where: { id: saleId } });
+                return;
+            }
+
+            await sale.update(zraResult.updates, { where: { id: saleId } });
+            console.log('[sales] background ZRA submission completed', {
+                saleId,
+                durationMs: Date.now() - startedAt,
+                qrReady: !!zraResult.updates.qrfilepath,
+            });
+
+            // ZRA stock endpoints must follow a successful sales registration,
+            // but they must never delay the cashier or receipt response.
+            void processStockEndpointsInBackground(
+                saleId,
+                saleDataForZRA,
+                saleItems,
+                submittingUser,
+                zraService
+            );
+        } catch (error) {
+            const message = error?.message || String(error);
+            console.error('[sales] background ZRA integration error', {
+                saleId,
+                durationMs: Date.now() - startedAt,
+                error: message,
+            });
+            try {
+                await sale.update({
+                    zra_error: message,
+                    next_retry_at: new Date(Date.now() + 30 * 1000),
+                }, { where: { id: saleId } });
+            } catch (updateError) {
+                console.error('[sales] could not persist ZRA background error', {
+                    saleId,
+                    error: updateError?.message || String(updateError),
+                });
+            }
+        }
+    });
+}
+
 // Create new sale
 
 
 
 router.post('/', auth, async (req, res) => {
+    const requestStartedAt = Date.now();
     const t = await sale.sequelize.transaction();
     let committed = false;
 
@@ -152,6 +241,7 @@ router.post('/', auth, async (req, res) => {
 
         // Validate items
         if (!items || items.length === 0) {
+            await t.rollback();
             await logRequestAudit(models, req, {
                 action: 'sale.create',
                 outcome: 'failure',
@@ -179,9 +269,29 @@ router.post('/', auth, async (req, res) => {
         let subtotal = 0;
         const saleItems = [];
 
+        // Fetch the catalog and store inventory in two queries instead of two
+        // sequential queries per cart line. This keeps local checkout latency
+        // predictable as basket size grows.
+        const requestedProductIds = [...new Set(items.map(item => item.product_id))];
+        const productRows = await product.findAll({
+            where: { id: { [Op.in]: requestedProductIds } },
+            transaction: t,
+        });
+        const inventoryRows = await productinventory.findAll({
+            where: {
+                product_id: { [Op.in]: requestedProductIds },
+                store_id: req.user.store_id,
+            },
+            transaction: t,
+        });
+        const productsById = new Map(productRows.map(row => [String(row.id), row]));
+        const inventoryByProductId = new Map(
+            inventoryRows.map(row => [String(row.product_id), row])
+        );
+
         // Validate and calculate each item - also fetch product details for ZRA
         for (const item of items) {
-            const productData = await product.findByPk(item.product_id, { transaction: t });
+            const productData = productsById.get(String(item.product_id));
 
             if (!productData) {
                 await t.rollback();
@@ -196,10 +306,7 @@ router.post('/', auth, async (req, res) => {
             }
 
             // Check stock from productinventory for the user's store
-            const inventory = await productinventory.findOne({
-                where: { product_id: item.product_id, store_id: req.user.store_id },
-                transaction: t
-            });
+            const inventory = inventoryByProductId.get(String(item.product_id));
 
             // const availableQty = inventory ? inventory.stock_quantity : 0;
 
@@ -346,8 +453,8 @@ router.post('/', auth, async (req, res) => {
         const limitStr = (v, n) => (v == null ? null : String(v).slice(0, n));
 
         // Reserve receipt + CIS invoice numbers inside the transaction
-        const receiptNumber = await zraService.generateReceiptNumber(req.user.store_id, t);
-        const cisInvoiceNo = await zraService.generateCISInvoiceNumber(req.user.store_id, t);
+        const { receiptNumber, cisInvoiceNo } =
+            await zraService.generateSaleNumbers(req.user.store_id, t);
 
         // Create sale locally first so ZRA success can never be orphaned from our DB
         const newSale = await sale.create({
@@ -376,22 +483,22 @@ router.post('/', auth, async (req, res) => {
             zra_status: 'pending',
             zra_error: null,
             retry_count: 0,
-            next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
+            next_retry_at: new Date(Date.now() + 30 * 1000),
             last_retry_at: null,
         }, { transaction: t });
 
         console.log('Sale created successfully:', newSale.id);
 
-        // Create sale items and update stock
-        for (const item of saleItems) {
-            await saleitem.create({
+        // Create all lines in one DB round trip, then apply local stock changes.
+        await saleitem.bulkCreate(saleItems.map(item => ({
                 sale_id: newSale.id,
                 product_id: item.product_id,
                 quantity: item.quantity,
                 unit_price: item.unit_price,
                 total_price: item.total_price
-            }, { transaction: t });
+            })), { transaction: t });
 
+        for (const item of saleItems) {
             // Update product stock
             await productinventory.update(
                 {
@@ -408,79 +515,43 @@ router.post('/', auth, async (req, res) => {
         // Central sync is deferred to the day-end batch (`day_end.ready`), not per-sale.
         await t.commit();
         committed = true;
+        clearDashboardCache(req.user.store_id);
         console.log('Transaction committed successfully');
 
-        let zraFailed = true;
-        let zraError = null;
-
-        try {
-            console.log('Submitting sale to ZRA after local save...');
-            const salesData = await zraService.transformToZRASalesData(
-                saleDataForZRA,
-                saleItems,
-                req.user,
-                cisInvoiceNo
-            );
-            const salesResponse = await zraService.sendSalesData(salesData);
-
-            console.log('ZRA Sales Response for sale request:', JSON.stringify({
-                success: salesResponse.success,
-                endpoint: salesResponse.endpoint,
-                data: salesResponse.data,
-                error: salesResponse.error
-            }, null, 2));
-
-            if (salesResponse.success) {
-                const zraResult = await buildSaleUpdatesFromZraResponse(cisInvoiceNo, salesResponse);
-                if (zraResult.success) {
-                    await sale.update(zraResult.updates, { where: { id: newSale.id } });
-                    zraFailed = false;
-                } else {
-                    zraError = zraResult.error || 'Failed to apply ZRA response to sale';
-                    await sale.update({
-                        zra_error: zraError,
-                        next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
-                    }, { where: { id: newSale.id } });
-                }
-            } else {
-                zraError = typeof salesResponse.error === 'string'
-                    ? salesResponse.error
-                    : JSON.stringify(salesResponse.error);
-                console.error('ZRA Sales Integration failed:', salesResponse.error);
-                await sale.update({
-                    zra_error: zraError,
-                    next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
-                }, { where: { id: newSale.id } });
-            }
-        } catch (zraIntegrationError) {
-            zraError = zraIntegrationError.message || String(zraIntegrationError);
-            console.error('ZRA integration error after local save:', zraIntegrationError);
-            await sale.update({
-                zra_error: zraError,
-                next_retry_at: new Date(Date.now() + 2 * 60 * 1000),
-            }, { where: { id: newSale.id } });
-        }
-
-        // Fetch complete sale data for response
-        const completeSale = await sale.findByPk(newSale.id, {
-            include: [
-                {
-                    model: saleitem,
-                    as: 'items',
-                    include: [{ model: product, as: 'product' }]
-                },
-                {
-                    model: user, as: 'cashier', attributes: ['id', 'full_name'],
-                    include: [{ model: store, as: 'store', attributes: ['store_location', 'store_mobile_no'] }]
-                },
-                { model: customer, as: 'customer' },
-                { model: discount, as: 'discount' }
-            ]
+        // The local transaction is the cashier-facing completion boundary.
+        // Start ZRA immediately, but never await remote I/O in this request.
+        queueImmediateZraSubmission({
+            saleId: newSale.id,
+            cisInvoiceNo,
+            saleDataForZRA,
+            saleItems,
+            submittingUser: req.user,
         });
 
-        // Send response immediately
-        // Normalize the sale object for the response and include `vsdc` helper
-        const salePlain = completeSale && completeSale.get ? completeSale.get({ plain: true }) : (completeSale || {});
+        // Build the response from values already committed in this request.
+        // Re-querying every association here adds latency and is unnecessary;
+        // GET /sales/:id supplies the subsequently enriched ZRA fields.
+        const salePlain = newSale.get({ plain: true });
+        salePlain.items = saleItems.map(item => ({
+            sale_id: newSale.id,
+            product_id: item.product_id,
+            quantity: item.quantity,
+            unit_price: item.unit_price,
+            total_price: item.total_price,
+            product: item.product?.get
+                ? item.product.get({ plain: true })
+                : item.product,
+        }));
+        salePlain.cashier = {
+            id: req.user.id,
+            full_name: req.user.full_name,
+        };
+        salePlain.customer = customerData?.get
+            ? customerData.get({ plain: true })
+            : customerData;
+        salePlain.discount = discountData?.get
+            ? discountData.get({ plain: true })
+            : discountData;
         salePlain.vsdc = {
             sdcId: salePlain.sdcid || salePlain.sdc_id || null,
             rcptNo: salePlain.receipt_no || salePlain.rcptNo || null,
@@ -490,7 +561,7 @@ router.post('/', auth, async (req, res) => {
             vsdcRcpDate: salePlain.vsdcrcpdate || salePlain.vsdc_rcp_date || null
         };
 
-        await logRequestAudit(models, req, {
+        const auditEvent = {
             action: 'sale.create',
             outcome: 'success',
             entityType: 'sale',
@@ -515,35 +586,60 @@ router.post('/', auth, async (req, res) => {
                     unit_price: item.unit_price,
                     total_price: item.total_price,
                 })),
-                zra_status: zraFailed ? 'pending' : 'sent',
-                zra_error: zraError,
+                zra_status: salePlain.zra_status || 'pending',
+                zra_error: salePlain.zra_error || null,
                 receipt_no: salePlain.receipt_no || null,
                 invoice_no: salePlain.invoice_no || null,
             },
+        };
+        setImmediate(() => {
+            logRequestAudit(models, req, auditEvent).catch(error => {
+                console.error('[sales] sale audit write failed', {
+                    saleId: newSale.id,
+                    error: error?.message || String(error),
+                });
+            });
         });
 
+        const processingTimeMs = Date.now() - requestStartedAt;
+        res.setHeader('Server-Timing', `sale;dur=${processingTimeMs}`);
         res.status(201).json({
-            message: zraFailed ? 'Sale saved (ZRA pending due to network). Will retry automatically.' : 'Sale completed successfully',
+            message: 'Sale completed locally. ZRA registration is processing in the background.',
             sale: salePlain,
+            processing_time_ms: processingTimeMs,
             zra_integration: {
-                success: !zraFailed,
+                success: salePlain.zra_status === 'sent',
+                queued: salePlain.zra_status !== 'sent',
                 sales_endpoint: {
-                    success: !zraFailed,
-                    message: zraFailed ? (zraError || 'ZRA unavailable; queued for retry') : 'Sales data submitted successfully to ZRA'
+                    success: salePlain.zra_status === 'sent',
+                    message: salePlain.zra_status === 'sent'
+                        ? 'Sales data submitted successfully to ZRA'
+                        : 'ZRA submission started in the background'
                 }
             }
         });
-
-        // Process stock endpoints in the background only if ZRA succeeded (to keep sequence)
-        if (!zraFailed) {
-            processStockEndpointsInBackground(newSale.id, saleDataForZRA, saleItems, req.user, zraService);
-        }
+        console.log('[sales] cashier response sent', {
+            saleId: newSale.id,
+            processingTimeMs,
+            withinSixSecondTarget: processingTimeMs <= 6000,
+        });
 
     } catch (error) {
         if (!committed) {
             await t.rollback();
         }
         console.error('Sale creation error:', error);
+
+        const reconstructionDetails = buildSaleReconstructionDetails({
+            items: saleItems || [],
+            subtotal,
+            tax_amount,
+            total_amount,
+            discount_amount,
+            payment_method: effective_payment_method,
+            amount_paid: effective_amount_paid,
+            change_amount,
+        });
 
         await logRequestAudit(getModels(req), req, {
             action: 'sale.create',
@@ -554,6 +650,7 @@ router.post('/', auth, async (req, res) => {
                 reason: error.message,
                 error_name: error.name || null,
                 committed,
+                reconstruction: reconstructionDetails,
             },
         });
 
@@ -1135,6 +1232,23 @@ router.patch('/:saleId/reprocess', auth, async (req, res) => {
         }
 
         await saleRecord.update(updates);
+        let retryTriggered = false;
+        if (updates.zra_status === 'pending') {
+            await saleRecord.update({
+                retry_count: 0,
+                next_retry_at: new Date(),
+                last_retry_at: null,
+            });
+            const zraRetryJob = req.app.locals.zraRetryJob;
+            if (zraRetryJob) {
+                retryTriggered = true;
+                setImmediate(() => {
+                    zraRetryJob.run().catch(error => {
+                        console.error('[sales] manual ZRA retry failed:', error);
+                    });
+                });
+            }
+        }
         await requeueSaleSyncEvent(saleRecord);
 
         console.log('[sales] sale reprocess completed', {
@@ -1145,6 +1259,8 @@ router.patch('/:saleId/reprocess', auth, async (req, res) => {
         return res.status(200).json({
             message: 'Sale updated locally. Central sync will occur in the next day-end batch.',
             sale: saleRecord,
+            retry_triggered: retryTriggered,
+            next_retry_at: saleRecord.next_retry_at?.toISOString?.() || saleRecord.next_retry_at,
         });
     } catch (error) {
         console.error('Sale reprocess update failed:', error.message);

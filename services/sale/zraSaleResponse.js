@@ -46,6 +46,18 @@ async function generateQrCode(qrcodeUrl, receiptNo, saveDirectory = './qrcodes')
  * @param {object} salesResponse Response from sendSalesData
  * @returns {Promise<{ success: boolean, updates?: object, saveSalesData?: object, error?: string }>}
  */
+function requiresComplianceRefresh(saleInstance) {
+    const zraStatus = saleInstance?.zra_status;
+    const hasRequiredRefs = Boolean(saleInstance?.sdcid && saleInstance?.receipt_no);
+    const hasComplianceFields = Boolean(
+        saleInstance?.receiptsig || saleInstance?.intrldata || saleInstance?.qrcode_url || saleInstance?.vsdcrcpdate
+    );
+
+    return zraStatus === 'sent'
+        ? (!hasRequiredRefs || !hasComplianceFields)
+        : true;
+}
+
 async function buildSaleUpdatesFromZraResponse(cisInvcNo, salesResponse) {
     if (!salesResponse?.success) {
         const error = typeof salesResponse?.error === 'string'
@@ -69,9 +81,17 @@ async function buildSaleUpdatesFromZraResponse(cisInvcNo, salesResponse) {
         }
     }
 
-    const computedInvoiceNoRaw = (saveSalesData.sdcId && saveSalesData.rcptNo)
-        ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
-        : null;
+    const hasRequiredZraRefs = Boolean(saveSalesData.sdcId && saveSalesData.rcptNo);
+    if (!hasRequiredZraRefs) {
+        const detail = saveSalesData.resultMsg ? ` (${saveSalesData.resultMsg})` : '';
+        return {
+            success: false,
+            error: `ZRA did not return SDC data${detail}`,
+            saveSalesData,
+        };
+    }
+
+    const computedInvoiceNoRaw = generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo);
 
     return {
         success: true,
@@ -98,4 +118,5 @@ module.exports = {
     generateInvoiceNumber,
     normalizeZraSalesData,
     buildSaleUpdatesFromZraResponse,
+    requiresComplianceRefresh,
 };

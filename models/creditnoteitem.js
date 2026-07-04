@@ -2,6 +2,10 @@ const { DataTypes } = require('sequelize');
 
 module.exports = (sequelize) => {
     const creditnoteitem = sequelize.define('creditnoteitem', {
+        category_id: {
+            type: DataTypes.INTEGER,
+            allowNull: true
+        },
         quantity: {
             type: DataTypes.INTEGER,
             allowNull: false
@@ -22,6 +26,7 @@ module.exports = (sequelize) => {
     creditnoteitem.associate = function(models) {
         creditnoteitem.belongsTo(models.creditnote, { foreignKey: 'credit_note_id' });
         creditnoteitem.belongsTo(models.product, { foreignKey: 'product_id' });
+        creditnoteitem.belongsTo(models.category, { foreignKey: 'category_id', as: 'category' });
     };
 
     return creditnoteitem;

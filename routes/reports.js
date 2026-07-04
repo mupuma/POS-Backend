@@ -2,7 +2,7 @@
 const express = require("express");
 
 const router = express.Router();
-const { sale, saleitem, product, user, customer, category, productinventory, sequelize, creditnote, creditnoteitem } = require('../models');
+const { sale, saleitem, product, user, customer, category, productinventory, sequelize, creditnote, creditnoteitem, store } = require('../models');
 const auth = require('../middleware/auth');
 const { Op, QueryTypes } = require('sequelize');
 const { annotateSalesWithReturnState, getReturnStateMap } = require('../services/sales/returnState');
@@ -113,10 +113,11 @@ function normalizePaymentMethod(method) {
 async function generateTraditionalReport({ startDate, endDate, storeId, userId }) {
     const replacements = { startDate, endDate, storeId, userId: userId || null };
     const userFilter = userId ? ' AND s.user_id = :userId' : '';
+    const returnUserFilter = userId ? ' AND cn.user_id = :userId' : '';
     const saleScope = `s.sale_date BETWEEN :startDate AND :endDate
         AND u.store_id = :storeId${userFilter}`;
     const returnScope = `cn.credit_note_date BETWEEN :startDate AND :endDate
-        AND u.store_id = :storeId`;
+        AND u.store_id = :storeId${returnUserFilter}`;
 
     const select = (sql) => sequelize.query(sql, {
         replacements,
@@ -190,7 +191,7 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             JOIN users u ON cn.user_id = u.id
             JOIN credit_note_items cni ON cni.credit_note_id = cn.id
             JOIN products p ON p.id = cni.product_id
-            LEFT JOIN categories c ON c.id = p.category_id
+            LEFT JOIN categories c ON c.id = COALESCE(cni.category_id, p.category_id)
             WHERE ${returnScope}
             GROUP BY c.id, c.name
         `),
@@ -237,10 +238,14 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
         const key = normalizePaymentMethod(row.payment_method);
         payments[key] += Number(row.amount || 0);
     }
+    const returnPaymentTotals = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
     for (const row of returnPayments) {
         const key = normalizePaymentMethod(row.payment_method);
-        payments[key] -= Number(row.amount || 0);
+        returnPaymentTotals[key] += Number(row.amount || 0);
     }
+    const netPayments = Object.fromEntries(
+        Object.keys(payments).map(key => [key, payments[key] - returnPaymentTotals[key]])
+    );
 
     const categories = new Map();
     for (const row of saleCategories) {
@@ -277,6 +282,7 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             items_returned: 0,
             gross_sales: Number(row.gross_sales || 0),
             total_sales: Number(row.total_sales || 0),
+            expected_amount: Number(row.total_sales || 0),
             returns_amount: 0,
             net_sales: Number(row.total_sales || 0),
         });
@@ -292,13 +298,15 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             items_returned: 0,
             gross_sales: 0,
             total_sales: 0,
+            expected_amount: 0,
             returns_amount: 0,
             net_sales: 0,
         };
         current.returns = Number(row.returns_count || 0);
         current.items_returned = Number(row.items_returned || 0);
         current.returns_amount = Number(row.returns_amount || 0);
-        current.net_sales = current.total_sales - current.returns_amount;
+        current.expected_amount = current.total_sales - current.returns_amount;
+        current.net_sales = current.expected_amount;
         cashiers.set(cashierId, current);
     }
 
@@ -306,6 +314,7 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
     const discounts = Number(salesTotals.discounts || 0);
     const salesTotalAmount = Number(salesTotals.total_amount || 0);
     const returnsAmount = Number(returnTotals.returns_amount || 0);
+    const netRevenue = salesTotalAmount - returnsAmount;
 
     return {
         counts: {
@@ -322,11 +331,35 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             returns_amount: returnsAmount,
             returns_tax: Number(returnTotals.returns_tax || 0),
             returns_discount: Number(returnTotals.returns_discount || 0),
-            net_revenue: salesTotalAmount - returnsAmount,
+            total_sales_including_tax: salesTotalAmount,
+            net_revenue: netRevenue,
+            expected_from_cashiers: netRevenue,
+            expected_cash: netPayments.CASH,
         },
-        payments,
-        cashiers: [...cashiers.values()].sort((left, right) => right.net_sales - left.net_sales),
+        payments: netPayments,
+        sales_payments: payments,
+        return_payments: returnPaymentTotals,
+        cashiers: [...cashiers.values()].sort((left, right) => right.expected_amount - left.expected_amount),
         categories: [...categories.values()],
+    };
+}
+
+async function getTraditionalReportStore(storeId) {
+    if (!storeId) return null;
+
+    const reportStore = await store.findByPk(storeId, {
+        attributes: ['id', 'store_number', 'store_location', 'store_mobile_no'],
+        raw: true,
+    });
+
+    if (!reportStore) return null;
+
+    return {
+        id: reportStore.id,
+        name: reportStore.store_number,
+        number: reportStore.store_number,
+        location: reportStore.store_location,
+        mobile_no: reportStore.store_mobile_no,
     };
 }
 
@@ -377,6 +410,7 @@ router.get('/sales', auth, async (req, res) => {
             traditional.report_name = isZ ? 'Z Report' : 'X Report';
             traditional.period = { start: start_date, end: end_date };
             traditional.store_id = filterStoreId || null;
+            traditional.store = await getTraditionalReportStore(filterStoreId);
             traditional.cashier = req.user?.full_name
                 ? { id: req.user.id, name: req.user.full_name }
                 : undefined;
@@ -485,13 +519,16 @@ router.get('/sales', auth, async (req, res) => {
                 {
                     model: creditnoteitem,
                     as: 'items',
-                    attributes: ['id', 'product_id', 'quantity', 'total_price'],
-                    include: [{
-                        model: product,
-                        as: 'product',
-                        attributes: ['id', 'category_id'],
-                        include: [{ model: category, as: 'category', attributes: ['id', 'name'] }]
-                    }]
+                    attributes: ['id', 'product_id', 'category_id', 'quantity', 'total_price'],
+                    include: [
+                        {
+                            model: product,
+                            as: 'product',
+                            attributes: ['id', 'category_id'],
+                            include: [{ model: category, as: 'category', attributes: ['id', 'name'] }]
+                        },
+                        { model: category, as: 'category', attributes: ['id', 'name'] }
+                    ]
                 }
             ];
 
@@ -521,23 +558,31 @@ router.get('/sales', auth, async (req, res) => {
                 return 'OTHER';
             };
 
-            const paymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
+            const salesPaymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
             activeSales.forEach(s => {
                 const bd = s.payments_breakdown;
                 if (bd && typeof bd === 'object') {
                     Object.entries(bd).forEach(([method, amt]) => {
                         const key = normalizeMethod(method);
-                        paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(amt || 0);
+                        salesPaymentBreakdown[key] = (salesPaymentBreakdown[key] || 0) + Number(amt || 0);
                     });
                 } else {
                     const key = normalizeMethod(s.payment_method);
-                    paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(s.total_amount || 0);
+                    salesPaymentBreakdown[key] = (salesPaymentBreakdown[key] || 0) + Number(s.total_amount || 0);
                 }
             });
+            const returnPaymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
             returnsList.forEach(r => {
                 const key = normalizeMethod(r.payment_method);
-                paymentBreakdown[key] = (paymentBreakdown[key] || 0) - Number(r.total_amount || 0);
+                returnPaymentBreakdown[key] += Number(r.total_amount || 0);
             });
+            const paymentBreakdown = Object.fromEntries(
+                Object.keys(salesPaymentBreakdown).map(key => [
+                    key,
+                    salesPaymentBreakdown[key] - returnPaymentBreakdown[key]
+                ])
+            );
+            const netRevenue = salesTotalAmount - returnsTotalAmount;
 
             const itemsSold = activeSales.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
             const itemsReturned = returnsList.reduce((s, x) => s + ((x.items || []).reduce((q, i) => q + Number(i.quantity || 0), 0)), 0);
@@ -560,7 +605,7 @@ router.get('/sales', auth, async (req, res) => {
             });
             returnsList.forEach(ret => {
                 (ret.items || []).forEach(i => {
-                    const cat = i.product && i.product.category;
+                    const cat = i.category || (i.product && i.product.category);
                     addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), -Number(i.total_price || 0));
                 });
             });
@@ -584,9 +629,14 @@ router.get('/sales', auth, async (req, res) => {
                     returns_amount: returnsTotalAmount,
                     returns_tax: returnsTax,
                     returns_discount: returnsDiscount,
-                    net_revenue: salesTotalAmount - returnsTotalAmount
+                    total_sales_including_tax: salesTotalAmount,
+                    net_revenue: netRevenue,
+                    expected_from_cashiers: netRevenue,
+                    expected_cash: paymentBreakdown.CASH
                 },
                 payments: paymentBreakdown,
+                sales_payments: salesPaymentBreakdown,
+                return_payments: returnPaymentBreakdown,
                 categories: Object.values(categoryMap)
             };
 
@@ -852,19 +902,20 @@ router.get('/user-activity', auth, async (req, res) => {
             }]
         });
 
-        const activeUserSales = (await getActiveSalesRows(userSales)).active;
         const userActivityMap = new Map();
 
-        activeUserSales.forEach(s => {
+        userSales.forEach(s => {
             const key = s.user_id;
             const current = userActivityMap.get(key) || {
                 user_id: key,
                 cashier: s.cashier || null,
                 total_sales: 0,
                 total_revenue: 0,
+                expected_amount: 0,
             };
             current.total_sales += 1;
             current.total_revenue += Number(s.total_amount || 0);
+            current.expected_amount += Number(s.total_amount || 0);
             userActivityMap.set(key, current);
         });
 
@@ -1466,6 +1517,7 @@ const generateUserActivityReport = async (startDate, endDate, storeId, additiona
             u.role,
             COUNT(DISTINCT s.id) as total_sales,
             COALESCE(SUM(s.total_amount), 0) as total_revenue,
+            COALESCE(SUM(s.total_amount), 0) as expected_amount,
             MIN(s.sale_date) as first_sale,
             MAX(s.sale_date) as last_sale
         FROM users u
@@ -1507,8 +1559,10 @@ const generateTaxReport = async (startDate, endDate, storeId, additionalParams) 
             DATE(s.sale_date) as sale_date,
             COUNT(s.id) as transactions_count,
             SUM(s.total_amount) as gross_sales,
-            SUM(s.total_amount * 0.16) as vat_collected,
-            SUM(s.total_amount * 0.84) as net_sales,
+            SUM(s.total_amount * 16 / 116) as vat_collected,
+            SUM(s.total_amount * 100 / 116) as sales_before_tax,
+            SUM(s.total_amount) as expected_amount,
+            SUM(s.total_amount) as net_sales,
             s.payment_method
         FROM sales s
         JOIN users u ON s.user_id = u.id
@@ -1605,7 +1659,7 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
                 { header: 'Username', key: 'username', width: 30 },
                 { header: 'Role', key: 'role', width: 15 },
                 { header: 'Total Sales', key: 'total_sales', width: 15 },
-                { header: 'Total Revenue', key: 'total_revenue', width: 15 },
+                { header: 'Expected Amount (Incl. Tax)', key: 'expected_amount', width: 24 },
                 { header: 'First Sale', key: 'first_sale', width: 20 },
                 { header: 'Last Sale', key: 'last_sale', width: 20 }
             ];
@@ -1623,9 +1677,10 @@ const createExcelReport = async (reportType, data, startDate, endDate) => {
             columns = [
                 { header: 'Date', key: 'sale_date', width: 15 },
                 { header: 'Transactions', key: 'transactions_count', width: 15 },
-                { header: 'Gross Sales', key: 'gross_sales', width: 15 },
+                { header: 'Total Sales (Incl. Tax)', key: 'gross_sales', width: 20 },
                 { header: 'VAT (16%)', key: 'vat_collected', width: 15 },
-                { header: 'Net Sales', key: 'net_sales', width: 15 },
+                { header: 'Sales Before Tax', key: 'sales_before_tax', width: 18 },
+                { header: 'Expected Amount', key: 'expected_amount', width: 18 },
                 { header: 'Payment Method', key: 'payment_method', width: 15 }
             ];
             break;
@@ -1883,11 +1938,14 @@ router.get('/returns', auth, async (req, res) => {
             {
                 model: creditnoteitem,
                 as: 'items',
-                include: [{
-                    model: product,
-                    as: 'product',
-                    include: [{ model: category, as: 'category' }]
-                }]
+                include: [
+                    {
+                        model: product,
+                        as: 'product',
+                        include: [{ model: category, as: 'category' }]
+                    },
+                    { model: category, as: 'category' }
+                ]
             }
         ];
 
@@ -1987,11 +2045,14 @@ router.get('/transactions', auth, async (req, res) => {
             {
                 model: creditnoteitem,
                 as: 'items',
-                include: [{
-                    model: product,
-                    as: 'product',
-                    include: [{ model: category, as: 'category' }]
-                }]
+                include: [
+                    {
+                        model: product,
+                        as: 'product',
+                        include: [{ model: category, as: 'category' }]
+                    },
+                    { model: category, as: 'category' }
+                ]
             }
         ];
         if (category_id || product_id) {
@@ -2009,7 +2070,9 @@ router.get('/transactions', auth, async (req, res) => {
             total_returns: returnsList.length,
             items_count: (salesList.reduce((s, x) => s + (x.items ? x.items.length : 0), 0)) + (returnsList.reduce((s, x) => s + (x.items ? x.items.length : 0), 0)),
             items_quantity: (salesList.reduce((s, x) => s + (x.items ? x.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0)) + (returnsList.reduce((s, x) => s + (x.items ? x.items.reduce((q, i) => q + Number(i.quantity || 0), 0) : 0), 0)),
-            revenue: salesList.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0) - returnsList.reduce((sum, r) => sum + parseFloat(r.total_amount || 0), 0),
+            revenue: salesList.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            expected_amount: salesList.reduce((sum, s) => sum + parseFloat(s.total_amount || 0), 0),
+            returns_amount: returnsList.reduce((sum, r) => sum + parseFloat(r.total_amount || 0), 0),
         };
 
         // Per-category breakdown
@@ -2032,7 +2095,7 @@ router.get('/transactions', auth, async (req, res) => {
         // Returns items negative revenue and quantities
         returnsList.forEach(r => {
             (r.items || []).forEach(i => {
-                const cat = i.product && i.product.category;
+                const cat = i.category || (i.product && i.product.category);
                 addToCategory(cat ? cat.id : null, cat ? cat.name : null, Number(i.quantity || 0), -Number(i.total_price || 0));
             });
         });
@@ -2062,24 +2125,31 @@ router.get('/transactions', auth, async (req, res) => {
             const returnsTax = returnsList.reduce((sum, r) => sum + Number(r.tax_amount || 0), 0);
             const returnsDiscount = returnsList.reduce((sum, r) => sum + Number(r.discount_amount || 0), 0);
 
-            // Payment methods breakdown (net of returns if method matches)
-            const paymentBreakdown = {};
+            const salesPaymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
             salesList.forEach(s => {
                 const bd = s.payments_breakdown;
                 if (bd && typeof bd === 'object') {
                     Object.entries(bd).forEach(([method, amt]) => {
-                        const key = (method || 'unknown').toString();
-                        paymentBreakdown[key] = (paymentBreakdown[key] || 0) + Number(amt || 0);
+                        const key = normalizePaymentMethod(method);
+                        salesPaymentBreakdown[key] += Number(amt || 0);
                     });
                 } else {
-                    const method = s.payment_method || 'unknown';
-                    paymentBreakdown[method] = (paymentBreakdown[method] || 0) + Number(s.total_amount || 0);
+                    const key = normalizePaymentMethod(s.payment_method);
+                    salesPaymentBreakdown[key] += Number(s.total_amount || 0);
                 }
             });
+            const returnPaymentBreakdown = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
             returnsList.forEach(r => {
-                const method = r.payment_method || 'unknown';
-                paymentBreakdown[method] = (paymentBreakdown[method] || 0) - Number(r.total_amount || 0);
+                const key = normalizePaymentMethod(r.payment_method);
+                returnPaymentBreakdown[key] += Number(r.total_amount || 0);
             });
+            const paymentBreakdown = Object.fromEntries(
+                Object.keys(salesPaymentBreakdown).map(key => [
+                    key,
+                    salesPaymentBreakdown[key] - returnPaymentBreakdown[key]
+                ])
+            );
+            const netRevenue = salesTotalAmount - returnsTotalAmount;
 
             const traditional = {
                 report_name: isZ ? 'Z Report' : 'X Report',
@@ -2100,9 +2170,14 @@ router.get('/transactions', auth, async (req, res) => {
                     returns_amount: returnsTotalAmount,
                     returns_tax: returnsTax,
                     returns_discount: returnsDiscount,
-                    net_revenue: salesTotalAmount - returnsTotalAmount
+                    total_sales_including_tax: salesTotalAmount,
+                    net_revenue: netRevenue,
+                    expected_from_cashiers: netRevenue,
+                    expected_cash: paymentBreakdown.CASH
                 },
                 payments: paymentBreakdown,
+                sales_payments: salesPaymentBreakdown,
+                return_payments: returnPaymentBreakdown,
                 categories
             };
 

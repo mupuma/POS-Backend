@@ -401,7 +401,7 @@ class ZRACreditNoteIntegrationService {
      * @param {object} salesData
      * @returns {Promise}
      */
-    async sendCreditNoteSalesData(salesData) {
+    async sendCreditNoteSalesData(salesData, { timeoutMs } = {}) {
         try {
             // Validate data
             const validation = this.validateZRAData(salesData, 'sales');
@@ -422,7 +422,9 @@ class ZRACreditNoteIntegrationService {
                     headers: {
                         'Content-Type': 'application/json'
                     },
-
+                    timeout: Number(
+                        timeoutMs || process.env.ZRA_CREDIT_NOTE_TIMEOUT_MS || 8000
+                    ),
                 }
             );
 

@@ -41,6 +41,34 @@ class ZRAIntegrationService {
     }
 
     /**
+     * Reserve both local sale numbers with one locked store read and one update.
+     * This shortens checkout and keeps the two sequences atomic.
+     */
+    async generateSaleNumbers(storeId, transaction = null) {
+        const findOptions = { transaction };
+        if (transaction) {
+            findOptions.lock = transaction.LOCK.UPDATE;
+        }
+        const storeObj = await store.findByPk(storeId, findOptions);
+        if (!storeObj) throw new Error('Store not found');
+
+        const storeDigits = (storeObj.store_number || '').match(/(\d+)/)?.[1] || '1001';
+        const increment = (current, prefix) => {
+            const match = current && current.match(new RegExp(`^(${prefix}\\d+-)(\\d+)$`));
+            return match
+                ? `${match[1]}${parseInt(match[2], 10) + 1}`
+                : `${prefix}${storeDigits}-1`;
+        };
+        const receiptNumber = increment(storeObj.receipt_number, 'RCP');
+        const cisInvoiceNo = increment(storeObj.invoice_number, 'INV');
+        await storeObj.update({
+            receipt_number: receiptNumber,
+            invoice_number: cisInvoiceNo,
+        }, { transaction });
+        return { receiptNumber, cisInvoiceNo };
+    }
+
+    /**
      * Calculate VAT amounts for tax-exclusive amounts
      * @param {number} taxExclusiveAmount - Amount without tax
      * @param {number} taxRate - Tax rate percentage
@@ -479,7 +507,7 @@ class ZRAIntegrationService {
      * @param {object} salesData
      * @returns {Promise}
      */
-    async sendSalesData(salesData) {
+    async sendSalesData(salesData, { timeoutMs } = {}) {
         try {
             // Validate data
             const validation = this.validateZRAData(salesData, 'sales');
@@ -500,7 +528,11 @@ class ZRAIntegrationService {
                     headers: {
                         'Content-Type': 'application/json'
                     },
-
+                    // A stalled ZRA socket must not occupy the immediate worker
+                    // indefinitely. The sale remains pending for the retry job.
+                    timeout: Number(
+                        timeoutMs || process.env.ZRA_SALES_TIMEOUT_MS || 8000
+                    ),
                 }
             );
 

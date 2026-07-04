@@ -1,6 +1,7 @@
 const cron = require('node-cron');
+const { Op } = require('sequelize');
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice');
-const { buildSaleUpdatesFromZraResponse } = require('../services/sale/zraSaleResponse');
+const { buildSaleUpdatesFromZraResponse, requiresComplianceRefresh } = require('../services/sale/zraSaleResponse');
 const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
 const {
   applyCreditNoteZraResult,
@@ -13,9 +14,14 @@ class ZraRetryJob {
     this.models = models;
     this.isRunning = false;
     this.cronJob = null;
-    this.intervalCron = '*/1 * * * *'; // every minute
-    this.maxRetries = 3; // limit total retries to 3
-    this.baseDelayMinutes = 2; // retry attempts scheduled 2 minutes after a failure
+    this.intervalCron = process.env.ZRA_RETRY_CRON || '*/15 * * * * *';
+    // Zero means unlimited. Compliance submissions must not silently become
+    // terminal after an arbitrary number of transient failures.
+    this.maxRetries = Number(process.env.ZRA_MAX_RETRIES || 0);
+    this.baseDelaySeconds = Number(process.env.ZRA_RETRY_BASE_DELAY_SECONDS || 30);
+    this.maxDelayMinutes = Number(process.env.ZRA_RETRY_MAX_DELAY_MINUTES || 15);
+    this.retryTimeoutMs = Number(process.env.ZRA_RETRY_TIMEOUT_MS || 30000);
+    this.batchSize = Number(process.env.ZRA_RETRY_BATCH_SIZE || 25);
     this.zraService = new ZRAIntegrationService();
   }
 
@@ -25,7 +31,7 @@ class ZraRetryJob {
       try {
         await this.run();
       } catch (e) {
-        // swallow errors
+        console.error('[zra-retry] scheduled run failed:', e);
       }
     }, { scheduled: true, timezone: 'Africa/Lusaka' });
   }
@@ -112,13 +118,30 @@ class ZraRetryJob {
       const now = new Date();
       const pending = await this.models.sale.findAll({
         where: {
-          zra_status: ['pending'], // only pick records still pending retries
-          next_retry_at: { [this.models.sequelize.Op.lte]: now }
+          [Op.or]: [
+            { zra_status: { [Op.in]: ['pending', 'failed'] } },
+            {
+              zra_status: 'sent',
+              [Op.or]: [
+                { receipt_no: null },
+                { sdcid: null },
+                { receiptsig: null },
+                { intrldata: null },
+              ],
+            },
+          ],
+          [Op.or]: [
+            { next_retry_at: { [Op.lte]: now } },
+            { next_retry_at: null },
+          ],
         },
-        limit: 10,
+        limit: this.batchSize,
+        order: [['next_retry_at', 'ASC'], ['id', 'ASC']],
         include: [
           { model: this.models.saleitem, as: 'items', include: [{ model: this.models.product, as: 'product' }] },
-          { model: this.models.user, as: 'cashier' }
+          { model: this.models.user, as: 'cashier' },
+          { model: this.models.customer, as: 'customer' },
+          { model: this.models.discount, as: 'discount' },
         ]
       });
 
@@ -128,10 +151,14 @@ class ZraRetryJob {
 
       const pendingCreditNotes = await this.models.creditnote.findAll({
         where: {
-          zra_status: ['pending'],
-          next_retry_at: { [this.models.sequelize.Op.lte]: now }
+          zra_status: { [Op.in]: ['pending', 'failed'] },
+          [Op.or]: [
+            { next_retry_at: { [Op.lte]: now } },
+            { next_retry_at: null },
+          ],
         },
-        limit: 10,
+        limit: this.batchSize,
+        order: [['next_retry_at', 'ASC'], ['id', 'ASC']],
         include: [
           { model: this.models.creditnoteitem, as: 'items', include: [{ model: this.models.product, as: 'product' }] },
           { model: this.models.user, as: 'cashier' },
@@ -148,12 +175,24 @@ class ZraRetryJob {
       return { success: true, processed: pending.length + pendingCreditNotes.length };
     } catch (err) {
       this.isRunning = false;
+      console.error('[zra-retry] run failed:', err);
       return { success: false, error: err.message };
     }
   }
 
   async retryOne(saleInstance) {
     try {
+      if (!await this.claim(saleInstance)) {
+        return { success: true, skipped: true };
+      }
+      if (!requiresComplianceRefresh(saleInstance)) {
+        await saleInstance.update({
+          zra_status: 'sent',
+          zra_error: null,
+          next_retry_at: null,
+        });
+        return { success: true, skipped: true, reason: 'compliance-complete' };
+      }
       const items = (saleInstance.items || []).map(i => ({
         product_id: i.product_id,
         quantity: Number(i.quantity),
@@ -184,7 +223,9 @@ class ZraRetryJob {
         user,
         saleInstance.invnumber || null
       );
-      const response = await this.zraService.sendSalesData(salesData);
+      const response = await this.zraService.sendSalesData(salesData, {
+        timeoutMs: this.retryTimeoutMs,
+      });
 
       if (response.success) {
         const zraResult = await buildSaleUpdatesFromZraResponse(saleInstance.invnumber, response);
@@ -208,8 +249,8 @@ class ZraRetryJob {
 
   async applyBackoff(saleInstance, errorMessage) {
     const retries = (saleInstance.retry_count || 0) + 1;
-    const isTerminal = retries >= this.maxRetries;
-    const nextRetry = isTerminal ? null : new Date(Date.now() + this.baseDelayMinutes * 60 * 1000);
+    const isTerminal = this.maxRetries > 0 && retries >= this.maxRetries;
+    const nextRetry = isTerminal ? null : this.nextRetryDate(retries);
     const status = isTerminal ? 'failed' : 'pending';
     await saleInstance.update({
       retry_count: retries,
@@ -221,6 +262,40 @@ class ZraRetryJob {
     await this.publishSaleStatusSync(saleInstance);
   }
 
+  nextRetryDate(retries) {
+    const exponent = Math.min(Math.max(retries - 1, 0), 10);
+    const delayMs = Math.min(
+      this.baseDelaySeconds * (2 ** exponent) * 1000,
+      this.maxDelayMinutes * 60 * 1000,
+    );
+    return new Date(Date.now() + delayMs);
+  }
+
+  async claim(instance) {
+    const leaseMs = Math.max(this.retryTimeoutMs + 30000, 60000);
+    const now = new Date();
+    const [claimed] = await instance.constructor.update(
+      {
+        zra_status: 'pending',
+        last_retry_at: now,
+        next_retry_at: new Date(now.getTime() + leaseMs),
+      },
+      {
+        where: {
+          id: instance.id,
+          zra_status: { [Op.in]: ['pending', 'failed'] },
+          [Op.or]: [
+            { next_retry_at: { [Op.lte]: now } },
+            { next_retry_at: null },
+          ],
+        },
+      }
+    );
+    if (claimed === 0) return false;
+    await instance.reload();
+    return true;
+  }
+
   async isMissingOriginalSaleZra(errorMessage) {
     return typeof errorMessage === 'string'
       && errorMessage.includes('Original sale is missing ZRA SDC id / receipt number');
@@ -228,6 +303,9 @@ class ZraRetryJob {
 
   async retryCreditNote(creditNoteInstance) {
     try {
+      if (!await this.claim(creditNoteInstance)) {
+        return { success: true, skipped: true };
+      }
       const originalSaleId = creditNoteInstance.original_sale_id;
       const originalSale = originalSaleId
         ? await this.models.sale.findByPk(originalSaleId, {
@@ -259,6 +337,7 @@ class ZraRetryJob {
         returnItems,
         user,
         reasonCode,
+        timeoutMs: this.retryTimeoutMs,
       });
 
       if (result.success) {
@@ -292,7 +371,7 @@ class ZraRetryJob {
           zra_error: String(result.error).slice(0, 1000),
           zra_status: 'pending',
           last_retry_at: new Date(),
-          next_retry_at: new Date(Date.now() + 5 * 60 * 1000),
+          next_retry_at: this.nextRetryDate(retries),
         });
         return { success: false };
       }
@@ -308,8 +387,8 @@ class ZraRetryJob {
 
   async applyCreditNoteBackoff(creditNoteInstance, errorMessage) {
     const retries = (creditNoteInstance.retry_count || 0) + 1;
-    const isTerminal = retries >= this.maxRetries;
-    const nextRetry = isTerminal ? null : new Date(Date.now() + this.baseDelayMinutes * 60 * 1000);
+    const isTerminal = this.maxRetries > 0 && retries >= this.maxRetries;
+    const nextRetry = isTerminal ? null : this.nextRetryDate(retries);
     const status = isTerminal ? 'failed' : 'pending';
 
     await creditNoteInstance.update({

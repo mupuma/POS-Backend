@@ -34,16 +34,6 @@ function query(sql, replacements) {
   return sequelize.query(sql, { replacements, type: QueryTypes.SELECT });
 }
 
-// A sale is excluded only when its accumulated credit notes fully reverse its value.
-// The original implementation calculated this in Node after loading every sale and return.
-const ACTIVE_SALE_SQL = `NOT EXISTS (
-  SELECT 1
-  FROM credit_notes returned
-  WHERE returned.original_sale_id = s.id
-  GROUP BY returned.original_sale_id
-  HAVING COALESCE(SUM(returned.total_amount), 0) >= s.total_amount
-)`;
-
 async function salesTotal(storeId, startDate, endDate) {
   const rows = await query(`
     SELECT COUNT(*) AS transactions,
@@ -52,7 +42,6 @@ async function salesTotal(storeId, startDate, endDate) {
     JOIN users u ON u.id = s.user_id
     WHERE u.store_id = :storeId
       AND s.sale_date BETWEEN :startDate AND :endDate
-      AND ${ACTIVE_SALE_SQL}
   `, { storeId, startDate, endDate });
   return rows[0] || {};
 }
@@ -106,7 +95,6 @@ async function computeDashboardStatsUncached(storeId) {
       JOIN users u ON u.id = s.user_id
       WHERE u.store_id = :storeId
         AND s.sale_date BETWEEN :startOfMonth AND :endOfToday
-        AND ${ACTIVE_SALE_SQL}
       GROUP BY s.payment_method
     `, replacements),
     query(`
@@ -115,7 +103,6 @@ async function computeDashboardStatsUncached(storeId) {
       JOIN users u ON u.id = s.user_id
       WHERE u.store_id = :storeId
         AND s.sale_date BETWEEN :startOfToday AND :endOfToday
-        AND ${ACTIVE_SALE_SQL}
       ORDER BY s.sale_date DESC, s.id DESC
       LIMIT ${RECEIPT_SAMPLE_LIMIT}
     `, replacements),
@@ -129,7 +116,6 @@ async function computeDashboardStatsUncached(storeId) {
       JOIN products p ON p.id = si.product_id
       WHERE u.store_id = :storeId
         AND s.sale_date BETWEEN :startOfMonth AND :endOfToday
-        AND ${ACTIVE_SALE_SQL}
       GROUP BY p.id, p.name
       ORDER BY total_quantity DESC
       LIMIT 5
@@ -141,7 +127,6 @@ async function computeDashboardStatsUncached(storeId) {
       JOIN users u ON u.id = s.user_id
       WHERE u.store_id = :storeId
         AND s.sale_date BETWEEN :startOfToday AND :endOfToday
-        AND ${ACTIVE_SALE_SQL}
       ORDER BY s.sale_date DESC, s.id DESC
       LIMIT 10
     `, replacements),
