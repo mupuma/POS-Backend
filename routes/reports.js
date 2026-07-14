@@ -7,6 +7,51 @@ const auth = require('../middleware/auth');
 const { Op, QueryTypes } = require('sequelize');
 const { annotateSalesWithReturnState, getReturnStateMap } = require('../services/sales/returnState');
 const { buildActorFromUser, logRequestAudit } = require('../services/auditLogService');
+const {
+    allocateSalePayments,
+    allocateSimplePayments,
+} = require('../services/reports/paymentAllocation');
+
+const X_REPORT_CATEGORY_ORDER = [
+    'clothes',
+    'childrens',
+    'bags',
+    'material',
+    'materials',
+    'tinies',
+    'shoes',
+    'plastic bags',
+];
+
+const X_REPORT_CATEGORY_RANK = new Map(
+    X_REPORT_CATEGORY_ORDER.map((name, index) => [name, index])
+);
+
+function normalizeCategoryName(value) {
+    return String(value || '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+}
+
+function sortXReportCategories(categories) {
+    return [...categories].sort((left, right) => {
+        const leftName = normalizeCategoryName(left.category_name);
+        const rightName = normalizeCategoryName(right.category_name);
+        const leftRank = X_REPORT_CATEGORY_RANK.has(leftName)
+            ? X_REPORT_CATEGORY_RANK.get(leftName)
+            : Number.MAX_SAFE_INTEGER;
+        const rightRank = X_REPORT_CATEGORY_RANK.has(rightName)
+            ? X_REPORT_CATEGORY_RANK.get(rightName)
+            : Number.MAX_SAFE_INTEGER;
+
+        if (leftRank !== rightRank) {
+            return leftRank - rightRank;
+        }
+
+        return leftName.localeCompare(rightName);
+    });
+}
 
 function getModels(req) {
     return req.app.locals.models || require('../models');
@@ -143,11 +188,10 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             WHERE ${saleScope}
         `),
         select(`
-            SELECT s.payment_method, COALESCE(SUM(s.total_amount), 0) AS amount
+            SELECT s.payment_method, s.total_amount, s.change_amount, s.payments_breakdown
             FROM sales s
             JOIN users u ON s.user_id = u.id
             WHERE ${saleScope}
-            GROUP BY s.payment_method
         `),
         select(`
             SELECT c.id AS category_id, COALESCE(c.name, 'Uncategorized') AS category_name,
@@ -177,11 +221,10 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
             WHERE ${returnScope}
         `),
         select(`
-            SELECT cn.payment_method, COALESCE(SUM(cn.total_amount), 0) AS amount
+            SELECT cn.payment_method, cn.total_amount
             FROM credit_notes cn
             JOIN users u ON cn.user_id = u.id
             WHERE ${returnScope}
-            GROUP BY cn.payment_method
         `),
         select(`
             SELECT c.id AS category_id, COALESCE(c.name, 'Uncategorized') AS category_name,
@@ -233,16 +276,8 @@ async function generateTraditionalReport({ startDate, endDate, storeId, userId }
 
     const salesTotals = salesTotalsRows[0] || {};
     const returnTotals = returnTotalsRows[0] || {};
-    const payments = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
-    for (const row of salePayments) {
-        const key = normalizePaymentMethod(row.payment_method);
-        payments[key] += Number(row.amount || 0);
-    }
-    const returnPaymentTotals = { CASH: 0, CARD: 0, MOBILE_MONEY: 0, OTHER: 0 };
-    for (const row of returnPayments) {
-        const key = normalizePaymentMethod(row.payment_method);
-        returnPaymentTotals[key] += Number(row.amount || 0);
-    }
+    const payments = allocateSalePayments(salePayments);
+    const returnPaymentTotals = allocateSimplePayments(returnPayments);
     const netPayments = Object.fromEntries(
         Object.keys(payments).map(key => [key, payments[key] - returnPaymentTotals[key]])
     );
@@ -2100,7 +2135,7 @@ router.get('/transactions', auth, async (req, res) => {
             });
         });
 
-        const categories = Object.values(categoryMap);
+        const categories = sortXReportCategories(Object.values(categoryMap));
 
         const payload = {
             report_type,
