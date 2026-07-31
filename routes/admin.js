@@ -11,6 +11,8 @@ const ZraRetryJob = require('../jobs/zraRetryJob');
 const ZRAIntegrationServiceStockDisposal = require("../services/stock-disposal/zraEndPoints");
 const SageInternalUsage = require("../services/stock-disposal/sageInternalUsages");
 const { createDayEndOutboxEvent, createCreditNoteBatchOutboxEvent } = require('../services/day-end/createDayEndOutboxEvent');
+const { deleteProtectedLogs } = require('../services/protectedLogDeletion');
+const { writeAuditLog } = require('../services/auditLogService');
 
 function parseYmdDate(rawValue) {
     const match = String(rawValue || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -74,6 +76,66 @@ function buildDayEndHistoryMessage(outboxRow) {
 
     return `Current status: ${outboxRow.status}`;
 }
+
+router.delete('/logs', authMiddleware, async (req, res) => {
+    if (req.user?.role !== 'admin') {
+        return res.status(403).json({ message: 'Only admins can delete POS log files' });
+    }
+
+    try {
+        const result = deleteProtectedLogs({
+            password: req.body?.developerPassword || req.headers['x-developer-password'],
+            date: req.body?.date || req.query.date,
+            category: req.body?.category || req.query.category,
+            fileName: req.body?.fileName || req.query.fileName,
+            all: req.body?.all === true || req.query.all === 'true',
+        });
+
+        await writeAuditLog(req.app.locals.models, {
+            action: 'logs.delete',
+            entityType: 'log_file',
+            outcome: 'success',
+            actor_user_id: req.user.id || null,
+            actor_identifier: req.user.username || null,
+            actor_name: req.user.full_name || null,
+            actor_role: req.user.role || null,
+            store_id: req.user.store_id || null,
+            ip_address: req.ip || req.socket?.remoteAddress || null,
+            user_agent: req.headers['user-agent'] || null,
+            details: {
+                deletedCount: result.deletedCount,
+                deleted: result.deleted,
+                logRoot: result.logRoot,
+                date: req.body?.date || req.query.date || null,
+                category: req.body?.category || req.query.category || null,
+                fileName: req.body?.fileName || req.query.fileName || null,
+                all: req.body?.all === true || req.query.all === 'true',
+            },
+        });
+
+        return res.json({
+            success: true,
+            ...result,
+        });
+    } catch (error) {
+        await writeAuditLog(req.app.locals.models, {
+            action: 'logs.delete',
+            entityType: 'log_file',
+            outcome: 'failure',
+            actor_user_id: req.user.id || null,
+            actor_identifier: req.user.username || null,
+            actor_name: req.user.full_name || null,
+            actor_role: req.user.role || null,
+            store_id: req.user.store_id || null,
+            ip_address: req.ip || req.socket?.remoteAddress || null,
+            user_agent: req.headers['user-agent'] || null,
+            details: { reason: error.message },
+        });
+
+        const status = /password/i.test(error.message) ? 403 : 400;
+        return res.status(status).json({ success: false, message: error.message });
+    }
+});
 
 /**
  * Creates internal usage for disposed stock

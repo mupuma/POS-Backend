@@ -2,15 +2,20 @@
 const { Sequelize } = require('sequelize');
 
 const {
-  MSSQL_HOST = 'localhost',
+  MSSQL_SERVER,
+  MSSQL_HOST,
   MSSQL_PORT = 1433,
   MSSQL_DATABASE = 'DAPDAT',
-  MSSQL_USERNAME = 'sa',
+  MSSQL_USER,
+  MSSQL_USERNAME,
   MSSQL_PASSWORD = 'root',
   MSSQL_ENCRYPT = 'true',
   MSSQL_TRUST_SERVER_CERT = 'true',
   MSSQL_INSTANCE,
 } = process.env;
+
+const host = MSSQL_HOST || MSSQL_SERVER || 'localhost';
+const username = MSSQL_USER || MSSQL_USERNAME || 'sa';
 
 const dialectOptions = {
   options: {
@@ -24,8 +29,8 @@ if (MSSQL_INSTANCE) {
   dialectOptions.options.instanceName = MSSQL_INSTANCE;
 }
 
-const mssqlSequelize = new Sequelize(MSSQL_DATABASE, MSSQL_USERNAME, MSSQL_PASSWORD, {
-  host: MSSQL_HOST,
+const mssqlSequelize = new Sequelize(MSSQL_DATABASE, username, MSSQL_PASSWORD, {
+  host,
   port: Number(MSSQL_PORT),
   dialect: 'mssql',
   logging: false, // set to console.log to debug queries

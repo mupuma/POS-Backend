@@ -12,6 +12,18 @@ function buildDayEndAggregateId(dateString) {
   return Number(String(dateString).replace(/-/g, ''));
 }
 
+function dayWindowWhere(primaryField, fallbackField, startOfDay, endOfDay) {
+  return {
+    [Op.or]: [
+      { [primaryField]: { [Op.between]: [startOfDay, endOfDay] } },
+      {
+        [primaryField]: null,
+        [fallbackField]: { [Op.between]: [startOfDay, endOfDay] },
+      },
+    ],
+  };
+}
+
 function resolveBranchId() {
   return String(process.env.ZRA_BHF_ID || '000').trim() || '000';
 }
@@ -29,7 +41,7 @@ async function buildDayEndPayload(models, storeId, dateString) {
   // Full-day payload build: load all rows for the day then sort in JS by id, so MySQL
   // never has to filesort the large sale/credit-note TEXT/JSON columns.
   const salesForDay = await sale.findAll({
-    where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
+    where: dayWindowWhere('sale_date', 'createdAt', startOfDay, endOfDay),
     include: [
       { model: saleitem, as: 'items', include: [{ model: product }] },
       { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
@@ -40,7 +52,7 @@ async function buildDayEndPayload(models, storeId, dateString) {
   sortRows(salesForDay, [['id', 'ASC']]);
 
   const creditNotesForDay = await creditnote.findAll({
-    where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
+    where: dayWindowWhere('credit_note_date', 'createdAt', startOfDay, endOfDay),
     include: [
       { model: creditnoteitem, as: 'items', include: [{ model: product }] },
       { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },
@@ -141,7 +153,7 @@ async function buildCreditNoteBatchPayload(models, storeId, dateString) {
   const terminalId = resolveTerminalId();
 
   const creditNotesForDay = await creditnote.findAll({
-    where: { createdAt: { [Op.between]: [startOfDay, endOfDay] } },
+    where: dayWindowWhere('credit_note_date', 'createdAt', startOfDay, endOfDay),
     include: [
       { model: creditnoteitem, as: 'items', include: [{ model: product }] },
       { model: user, as: 'cashier', where: { store_id: storeId }, required: true, include: [{ model: store }] },

@@ -180,6 +180,7 @@ const logPaths = initLogDirectory();
 console.log(`Runtime environment: ${runtimeEnv.path || 'process environment only'}`);
 console.log('Email configuration:', getEmailDiagnostics());
 console.log(`POS audit log directory: ${logPaths.root}`);
+console.log(`POS audit log deletion lock: ${logPaths.protection?.protected ? 'enabled' : `not enabled (${logPaths.protection?.reason || 'unknown'})`}`);
 console.log(`Sales log (readable): ${logPaths.salesReadable}`);
 console.log(`Sales log (JSON):     ${logPaths.salesJson}`);
 console.log(`Credit notes log (readable): ${logPaths.creditNotesReadable}`);

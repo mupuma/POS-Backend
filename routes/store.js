@@ -118,6 +118,16 @@ router.post('/', [
         .withMessage('Store location must be between 1 and 255 characters')
         .trim(),
 
+    body('store_customer_number')
+        .isLength({ min: 1, max: 255 })
+        .withMessage('Store customer number is required for Sage posting')
+        .trim(),
+
+    body('store_rev_account')
+        .isLength({ min: 1, max: 255 })
+        .withMessage('Store revenue account is required for Sage posting')
+        .trim(),
+
     body('store_mobile_no')
         .isLength({ min: 10, max: 10 })
         .withMessage('Mobile number must be exactly 10 characters')
@@ -142,7 +152,7 @@ router.post('/', [
             });
         }
 
-        const { store_number,store_rev_account, store_location, store_mobile_no, invoice_number } = req.body;
+        const { store_number, store_rev_account, store_customer_number, store_location, store_mobile_no, invoice_number } = req.body;
 
         // Check if store number already exists
         const existingStore = await store.findOne({
@@ -168,6 +178,7 @@ router.post('/', [
             store_number,
             store_location,
             store_rev_account,
+            store_customer_number,
             store_mobile_no,
             invoice_number: invoiceNumber
         });
@@ -215,6 +226,18 @@ router.put('/:id', [
         .optional()
         .isLength({ min: 1, max: 255 })
         .withMessage('Store location must be between 1 and 255 characters')
+        .trim(),
+
+    body('store_customer_number')
+        .optional()
+        .isLength({ min: 1, max: 255 })
+        .withMessage('Store customer number is required for Sage posting')
+        .trim(),
+
+    body('store_rev_account')
+        .optional()
+        .isLength({ min: 1, max: 255 })
+        .withMessage('Store revenue account is required for Sage posting')
         .trim(),
 
     body('store_mobile_no')

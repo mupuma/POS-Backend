@@ -130,7 +130,7 @@ class SageShipment {
                     RecordPrinted: false,
                     NumberOfOptionalFields: 0,
                     EnteredBy: user?.full_name || "SYSTEM",
-                    PostingDate: utcDate,
+                    //PostingDate: utcDate,
                     CustomerExists: true,
                     PostSequenceNumber: 0,
                     ProcessCommand: "NothingToProcess",

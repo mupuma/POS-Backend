@@ -117,7 +117,7 @@ class SageInternalUsage {
                     NumberOfOptionalFields: 0,
                     EmployeeNumber: employeeNumber || "",
                     EnteredBy: user?.full_name || "ADMIN",
-                    PostingDate: utcDate,
+                   // PostingDate: utcDate,
                     PostSequenceNumber: 0,
                     IsCanadianPayrollActive: false,
                     IsUSPayrollActive: false,

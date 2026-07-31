@@ -111,7 +111,7 @@ class AccountsReceivableBatchReturn {
                 EntryNumber: entryNumber,
                 CustomerNumber:user?.store?.store_customer_number,
                 DateGenerated: utcDate,
-                PostingDate: utcDate,
+               // PostingDate: utcDate,
                 DueDate: utcDate,
                 AsOfDate: utcDate,
                 DocumentDate: utcDate,

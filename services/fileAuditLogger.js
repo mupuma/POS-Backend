@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { protectLogDirectory } = require('./logFileProtection');
 
 function resolveLogRoot() {
     if (process.env.POS_LOG_DIR) {
@@ -253,9 +254,17 @@ function getLogRoot() {
 
 function initLogDirectory() {
     ensureLogRoot();
+    let protection = { protected: false, reason: 'not-attempted' };
+    try {
+        protection = protectLogDirectory(LOG_ROOT);
+    } catch (error) {
+        protection = { protected: false, reason: error.message };
+        console.warn('Failed to lock POS audit log directory:', error.message);
+    }
     const dateKey = getDateKey();
     return {
         root: getLogRoot(),
+        protection,
         salesJson: getCategoryLogPath('sales', dateKey),
         salesReadable: getReadableSalesLogPath(dateKey),
         creditNotesReadable: getReadableCreditNotesLogPath(dateKey),
