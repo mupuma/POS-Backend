@@ -26,7 +26,25 @@ function pickZraFields(saleRow) {
       picked[field] = plain[field];
     }
   }
-  return picked;
+  return normalizeZraStatusForSync(picked);
+}
+
+function hasRequiredZraReceiptData(sale) {
+  return Boolean(sale?.sdcid && sale?.receipt_no);
+}
+
+function normalizeZraStatusForSync(sale) {
+  const normalized = { ...sale };
+  const status = String(normalized.zra_status || 'pending').toLowerCase();
+  const error = normalized.zra_error == null ? '' : String(normalized.zra_error).trim();
+
+  if (status === 'sent' && !hasRequiredZraReceiptData(normalized)) {
+    normalized.zra_status = error ? 'failed' : 'pending';
+  } else {
+    normalized.zra_status = ['pending', 'sent', 'failed'].includes(status) ? status : 'pending';
+  }
+
+  return normalized;
 }
 
 /**
@@ -56,7 +74,7 @@ async function enrichDayEndPayloadSales(models, payload) {
     ...payload,
     sales: payload.sales.map((sale) => ({
       ...sale,
-      ...(liveById.get(String(sale.id)) || {}),
+      ...normalizeZraStatusForSync(liveById.get(String(sale.id)) || {}),
     })),
   };
 }
@@ -64,4 +82,5 @@ async function enrichDayEndPayloadSales(models, payload) {
 module.exports = {
   enrichDayEndPayloadSales,
   pickZraFields,
+  normalizeZraStatusForSync,
 };

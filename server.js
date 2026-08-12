@@ -190,15 +190,19 @@ console.log(`Credit notes log (JSON):     ${logPaths.creditNotes}`);
 const server = createServer(app);
 const notificationService = initializeNotificationSystem(server);
 setGlobalNotificationService(notificationService);
-inventorySyncJob.start();
-dayEndJob.start();
-salesReportEmailJob.start();
-syncOutboxJob.start();
-customerKycJob.start();
 if (String(process.env.SMTP_VERIFY_ON_STARTUP || '').toLowerCase() === 'true') {
   verifyEmailTransport()
     .then(() => console.log('SMTP transport verification succeeded'))
     .catch((error) => console.error(`SMTP transport verification failed [${error.code || 'SMTP_ERROR'}]: ${error.message}`));
+}
+
+function startBackgroundJobs() {
+  inventorySyncJob.start();
+  dayEndJob.start();
+  salesReportEmailJob.start();
+  syncOutboxJob.start();
+  customerKycJob.start();
+  zraRetryJob.start();
 }
 
 async function ensureZraRetrySchema() {
@@ -302,9 +306,9 @@ db.sequelize.authenticate()
     server.listen(PORT, "127.0.0.1", () => {
   //  server.listen(PORT,  () => {
       setStartupState('ready', { ready: true });
+      startBackgroundJobs();
       // Start only after the schema/database is ready, then immediately recover
       // overdue rows instead of waiting for the next cron boundary.
-      zraRetryJob.start();
       setImmediate(() => {
         zraRetryJob.run().then((result) => {
           console.log('[zra-retry] startup recovery:', result);

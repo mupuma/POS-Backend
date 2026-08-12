@@ -1,5 +1,8 @@
 const { store, productinventory } = require('../../models');
 const axios = require('axios');
+const { writeZraSalesRequestLog } = require('./zraFullResponseLogger');
+const { isZraSaleAlreadyExistsResponse, normalizeZraSalesData } = require('./zraSaleResponse');
+const { fetchSdcSaleByCisInvoice } = require('./sdcSqliteRecovery');
 
 /**
  * ZRA Integration Service
@@ -9,6 +12,12 @@ class ZRAIntegrationService {
     constructor() {
         this.baseURL = process.env.ZRA_BASE_URL;
         // 30 seconds timeout
+    }
+
+    buildUrl(endpointPath) {
+        const baseUrl = String(this.baseURL || '').replace(/\/+$/, '');
+        const path = String(endpointPath || '').replace(/^\/+/, '');
+        return `${baseUrl}/${path}`;
     }
 
     /**
@@ -502,32 +511,136 @@ class ZRAIntegrationService {
         };
     }
 
+    buildSaleDetailsLookupPayload(salesData) {
+        return {
+            tpin: salesData?.tpin || process.env.ZRA_TPIN || "1002010901",
+            bhfId: salesData?.bhfId || process.env.ZRA_BHF_ID || "000",
+            cisInvcNo: salesData?.cisInvcNo || null,
+        };
+    }
+
+    isTimeoutError(error) {
+        return error?.code === 'ECONNABORTED'
+            || error?.code === 'ETIMEDOUT'
+            || /timeout|timed\s*out/i.test(error?.message || '');
+    }
+
+    isMissingSdcDataResponse(responseData) {
+        const normalized = normalizeZraSalesData({ success: true, data: responseData });
+        return String(normalized.resultCd || '000') === '000'
+            && (!normalized.sdcId || !normalized.rcptNo || !normalized.rcptSign);
+    }
+
+    isRejectedSalesResponse(responseData) {
+        const normalized = normalizeZraSalesData({ success: true, data: responseData });
+        return Boolean(normalized.resultCd) && String(normalized.resultCd) !== '000';
+    }
+
+    async fetchExistingSaleDetails(salesData, { timeoutMs } = {}) {
+        const payload = this.buildSaleDetailsLookupPayload(salesData);
+        if (!payload.cisInvcNo) {
+            return {
+                success: false,
+                endpoint: 'selectSales',
+                error: 'Cannot look up existing ZRA sale without cisInvcNo',
+                request: payload,
+            };
+        }
+
+        const endpointPath = process.env.ZRA_SALE_DETAILS_ENDPOINT || '/trnsSales/selectSales';
+        const url = this.buildUrl(endpointPath);
+        try {
+            const response = await axios.post(
+                url,
+                payload,
+                {
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: Number(timeoutMs || process.env.ZRA_LOOKUP_TIMEOUT_MS || 8000),
+                }
+            );
+
+            return {
+                success: true,
+                endpoint: 'selectSales',
+                url,
+                request: payload,
+                data: response.data,
+            };
+        } catch (error) {
+            return {
+                success: false,
+                endpoint: 'selectSales',
+                url,
+                request: payload,
+                error: error.response?.data || error.message,
+            };
+        }
+    }
+
+    async fetchSaleFromSdcSqlite(salesData, { reason, timeoutMs } = {}) {
+        const recovery = await fetchSdcSaleByCisInvoice(salesData?.cisInvcNo, {
+            tpin: salesData?.tpin,
+            bhfId: salesData?.bhfId,
+            timeoutMs,
+        });
+        return {
+            source: 'sdc_sqlite_recovery',
+            reason,
+            ...recovery,
+        };
+    }
+
     /**
      * Send sales data to ZRA
      * @param {object} salesData
      * @returns {Promise}
      */
-    async sendSalesData(salesData, { timeoutMs } = {}) {
+    async sendSalesData(salesData, { timeoutMs, logKind = 'current' } = {}) {
+        const url = this.buildUrl('/trnsSales/saveSales');
+        const headers = {
+            'Content-Type': 'application/json'
+        };
+        const requestLogContext = {
+            source: 'zra_service.sendSalesData',
+            logKind,
+            endpoint: 'saveSales',
+            method: 'POST',
+            url,
+            headers,
+            cisInvoiceNo: salesData?.cisInvcNo || null,
+            body: salesData,
+        };
+        let requestLogPath = null;
         try {
             // Validate data
             const validation = this.validateZRAData(salesData, 'sales');
             if (!validation.isValid) {
+                requestLogPath = writeZraSalesRequestLog({
+                    ...requestLogContext,
+                    outcome: 'validation_failed',
+                });
                 return {
                     success: false,
                     error: `Validation failed: ${validation.errors.join(', ')}`,
-                    endpoint: 'saveSales'
+                    endpoint: 'saveSales',
+                    request: requestLogContext,
+                    requestLogPath
                 };
             }
 
             console.log('Sending sales data to ZRA:', JSON.stringify(salesData, null, 2));
+            requestLogPath = writeZraSalesRequestLog({
+                ...requestLogContext,
+                outcome: 'sent_to_zra',
+            });
 
             const response = await axios.post(
-                `${this.baseURL}/trnsSales/saveSales`,
+                url,
                 salesData,
                 {
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers,
                     // A stalled ZRA socket must not occupy the immediate worker
                     // indefinitely. The sale remains pending for the retry job.
                     timeout: Number(
@@ -537,18 +650,76 @@ class ZRAIntegrationService {
             );
 
             console.log('ZRA Sales Response:', response.data);
+            let existingSaleLookup = null;
+            if (isZraSaleAlreadyExistsResponse(response.data)) {
+                existingSaleLookup = await this.fetchExistingSaleDetails(salesData, { timeoutMs });
+                console.log('ZRA existing sale lookup:', existingSaleLookup.data || existingSaleLookup.error);
+            }
+            let sdcRecovery = null;
+            if (isZraSaleAlreadyExistsResponse(response.data)) {
+                sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
+                    reason: 'zra_sale_already_exists',
+                    timeoutMs,
+                });
+                console.log('SDC SQLite recovery after duplicate response:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
+            } else if (this.isRejectedSalesResponse(response.data)) {
+                sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
+                    reason: 'zra_rejected_sales_response',
+                    timeoutMs,
+                });
+                console.log('SDC SQLite recovery after rejected ZRA response:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
+            } else if (this.isMissingSdcDataResponse(response.data)) {
+                sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
+                    reason: 'zra_success_missing_sdc_data',
+                    timeoutMs,
+                });
+                console.log('SDC SQLite recovery after missing SDC data:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
+            }
 
             return {
                 success: true,
                 data: response.data,
-                endpoint: 'saveSales'
+                endpoint: 'saveSales',
+                existingSaleLookup,
+                sdcRecovery,
+                requestLogPath
             };
         } catch (error) {
             console.error('ZRA Sales API Error:', error.response?.data || error.message);
+            const zraError = error.response?.data || error.message;
+            let existingSaleLookup = null;
+            if (isZraSaleAlreadyExistsResponse(zraError)) {
+                existingSaleLookup = await this.fetchExistingSaleDetails(salesData, { timeoutMs });
+                console.log('ZRA existing sale lookup:', existingSaleLookup.data || existingSaleLookup.error);
+            }
+            let sdcRecovery = null;
+            sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
+                reason: this.isTimeoutError(error)
+                    ? 'zra_timeout'
+                    : (isZraSaleAlreadyExistsResponse(zraError) ? 'zra_sale_already_exists' : 'zra_post_failed'),
+                timeoutMs,
+            });
+            console.log('SDC SQLite recovery after ZRA error:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
+            if (sdcRecovery?.found) {
+                return {
+                    success: true,
+                    data: null,
+                    endpoint: 'saveSales',
+                    recoveredFrom: 'sdc_sqlite',
+                    sdcRecovery,
+                    existingSaleLookup,
+                    request: requestLogContext,
+                    requestLogPath
+                };
+            }
             return {
                 success: false,
-                error: error.response?.data || error.message,
-                endpoint: 'saveSales'
+                error: zraError,
+                endpoint: 'saveSales',
+                sdcRecovery,
+                existingSaleLookup,
+                request: requestLogContext,
+                requestLogPath
             };
         }
     }
@@ -563,7 +734,7 @@ class ZRAIntegrationService {
             console.log('Sending stock items data to ZRA:', JSON.stringify(stockItemsData, null, 2));
 
             const response = await axios.post(
-                `${this.baseURL}/stock/saveStockItems`,
+                this.buildUrl('/stock/saveStockItems'),
                 stockItemsData,
                 {
                     headers: {
@@ -600,7 +771,7 @@ class ZRAIntegrationService {
             console.log('Sending stock master data to ZRA:', JSON.stringify(stockMasterData, null, 2));
 
             const response = await axios.post(
-                `${this.baseURL}/stockMaster/saveStockMaster`,
+                this.buildUrl('/stockMaster/saveStockMaster'),
                 stockMasterData,
                 {
                     headers: {

@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const { Op } = require('sequelize');
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice');
 const { buildSaleUpdatesFromZraResponse, requiresComplianceRefresh } = require('../services/sale/zraSaleResponse');
+const { writeZraSalesResponseLog } = require('../services/sale/zraFullResponseLogger');
 const { submitCreditNoteToZra } = require('../services/credit-note/zraCreditNoteSubmission');
 const {
   applyCreditNoteZraResult,
@@ -118,21 +119,27 @@ class ZraRetryJob {
       const now = new Date();
       const pending = await this.models.sale.findAll({
         where: {
-          [Op.or]: [
-            { zra_status: { [Op.in]: ['pending', 'failed'] } },
+          [Op.and]: [
             {
-              zra_status: 'sent',
               [Op.or]: [
-                { receipt_no: null },
-                { sdcid: null },
-                { receiptsig: null },
-                { intrldata: null },
+                { zra_status: { [Op.in]: ['pending', 'failed'] } },
+                {
+                  zra_status: 'sent',
+                  [Op.or]: [
+                    { receipt_no: null },
+                    { sdcid: null },
+                    { receiptsig: null },
+                    { intrldata: null },
+                  ],
+                },
               ],
             },
-          ],
-          [Op.or]: [
-            { next_retry_at: { [Op.lte]: now } },
-            { next_retry_at: null },
+            {
+              [Op.or]: [
+                { next_retry_at: { [Op.lte]: now } },
+                { next_retry_at: null },
+              ],
+            },
           ],
         },
         limit: this.batchSize,
@@ -225,23 +232,67 @@ class ZraRetryJob {
       );
       const response = await this.zraService.sendSalesData(salesData, {
         timeoutMs: this.retryTimeoutMs,
+        logKind: 'retry',
       });
 
       if (response.success) {
         const zraResult = await buildSaleUpdatesFromZraResponse(saleInstance.invnumber, response);
         if (zraResult.success) {
+          writeZraSalesResponseLog({
+            source: 'zra_retry.sales',
+            logKind: 'retry',
+            saleId: saleInstance.id,
+            receiptNumber: saleInstance.receipt_number,
+            cisInvoiceNo: saleInstance.invnumber || null,
+            outcome: response.sdcRecovery?.found
+              ? 'zra_sales_recovered_from_sdc_sqlite'
+              : 'zra_sales_sent',
+            normalizedResponse: zraResult.saveSalesData || null,
+            fullResponse: response,
+          });
           await saleInstance.update(zraResult.updates);
           await this.publishSaleStatusSync(saleInstance);
           return { success: true };
         }
 
+        writeZraSalesResponseLog({
+          source: 'zra_retry.sales',
+          logKind: 'retry',
+          saleId: saleInstance.id,
+          receiptNumber: saleInstance.receipt_number,
+          cisInvoiceNo: saleInstance.invnumber || null,
+          outcome: 'zra_sales_missing_required_data',
+          error: zraResult.error,
+          normalizedResponse: zraResult.saveSalesData || null,
+          fullResponse: response,
+        });
         await this.applyBackoff(saleInstance, zraResult.error || 'Failed to apply ZRA response');
         return { success: false };
       } else {
+        writeZraSalesResponseLog({
+          source: 'zra_retry.sales',
+          logKind: 'retry',
+          saleId: saleInstance.id,
+          receiptNumber: saleInstance.receipt_number,
+          cisInvoiceNo: saleInstance.invnumber || null,
+          outcome: 'zra_sales_failed',
+          error: response.error || 'Unknown ZRA error',
+          fullResponse: response,
+        });
         await this.applyBackoff(saleInstance, response.error || 'Unknown ZRA error');
         return { success: false };
       }
     } catch (err) {
+      writeZraSalesResponseLog({
+        source: 'zra_retry.sales',
+        logKind: 'retry',
+        saleId: saleInstance.id,
+        receiptNumber: saleInstance.receipt_number,
+        cisInvoiceNo: saleInstance.invnumber || null,
+        outcome: 'zra_sales_exception',
+        error: err.message,
+        fullResponse: err,
+      });
       await this.applyBackoff(saleInstance, err.message);
       return { success: false };
     }
@@ -283,10 +334,27 @@ class ZraRetryJob {
       {
         where: {
           id: instance.id,
-          zra_status: { [Op.in]: ['pending', 'failed'] },
-          [Op.or]: [
-            { next_retry_at: { [Op.lte]: now } },
-            { next_retry_at: null },
+          [Op.and]: [
+            {
+              [Op.or]: [
+                { zra_status: { [Op.in]: ['pending', 'failed'] } },
+                {
+                  zra_status: 'sent',
+                  [Op.or]: [
+                    { receipt_no: null },
+                    { sdcid: null },
+                    { receiptsig: null },
+                    { intrldata: null },
+                  ],
+                },
+              ],
+            },
+            {
+              [Op.or]: [
+                { next_retry_at: { [Op.lte]: now } },
+                { next_retry_at: null },
+              ],
+            },
           ],
         },
       }

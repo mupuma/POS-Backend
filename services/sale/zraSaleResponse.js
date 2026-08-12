@@ -9,21 +9,53 @@ function generateInvoiceNumber(sdcid, receiptNo) {
 function normalizeZraSalesData(salesResponse) {
     const outer = salesResponse?.data || null;
     const inner = outer?.data || null;
+    const recovered = salesResponse?.sdcRecovery?.found ? salesResponse.sdcRecovery.data : null;
 
     return {
-        rcptNo: inner?.rcptNo ?? outer?.rcptNo ?? null,
-        sdcId: inner?.sdcId ?? outer?.sdcId ?? null,
-        rcptSign: inner?.rcptSign ?? outer?.rcptSign ?? null,
-        intrlData: inner?.intrlData ?? outer?.intrlData ?? null,
-        qrCodeUrl: inner?.qrCodeUrl ?? outer?.qrCodeUrl ?? null,
-        vsdcRcptPbctDate: inner?.vsdcRcptPbctDate ?? outer?.vsdcRcptPbctDate ?? null,
+        rcptNo: inner?.rcptNo ?? outer?.rcptNo ?? recovered?.rcptNo ?? null,
+        sdcId: inner?.sdcId ?? outer?.sdcId ?? recovered?.sdcId ?? null,
+        rcptSign: inner?.rcptSign ?? outer?.rcptSign ?? recovered?.rcptSign ?? null,
+        intrlData: inner?.intrlData ?? outer?.intrlData ?? recovered?.intrlData ?? null,
+        qrCodeUrl: inner?.qrCodeUrl ?? outer?.qrCodeUrl ?? recovered?.qrCodeUrl ?? null,
+        vsdcRcptPbctDate: inner?.vsdcRcptPbctDate ?? outer?.vsdcRcptPbctDate ?? recovered?.vsdcRcptPbctDate ?? null,
         resultCd: outer?.resultCd ?? null,
         resultMsg: outer?.resultMsg ?? null,
+        recoverySource: recovered ? salesResponse.sdcRecovery.source : null,
+        recoveryReason: recovered ? salesResponse.sdcRecovery.reason : null,
         raw: salesResponse?.data || null,
     };
 }
 
 const limitStr = (v, n) => (v == null ? null : String(v).slice(0, n));
+
+function getZraResultMessage(response) {
+    if (response == null) return '';
+    if (typeof response === 'string') return response;
+    if (response instanceof Error) return response.message || '';
+
+    const data = response.data || response.error || response;
+    if (typeof data === 'string') return data;
+    if (!data || typeof data !== 'object') return '';
+
+    return [
+        data.resultCd,
+        data.resultMsg,
+        data.message,
+        data.error,
+        data.data?.resultCd,
+        data.data?.resultMsg,
+        data.data?.message,
+        data.data?.error,
+    ]
+        .filter((value) => value != null)
+        .map((value) => String(value))
+        .join(' ');
+}
+
+function isZraSaleAlreadyExistsResponse(response) {
+    return /\b(already\s+exist(?:s|ed)?|already\s+registered|duplicate|exists\s+already)\b/i
+        .test(getZraResultMessage(response));
+}
 
 async function generateQrCode(qrcodeUrl, receiptNo, saveDirectory = './qrcodes') {
     if (!fs.existsSync(saveDirectory)) {
@@ -68,6 +100,16 @@ async function buildSaleUpdatesFromZraResponse(cisInvcNo, salesResponse) {
 
     const saveSalesData = normalizeZraSalesData(salesResponse);
     let qrFilePath = null;
+
+    const hasRecoveredSdcData = Boolean(salesResponse?.sdcRecovery?.found);
+    if (saveSalesData.resultCd && String(saveSalesData.resultCd) !== '000' && !hasRecoveredSdcData) {
+        const detail = saveSalesData.resultMsg ? ` (${saveSalesData.resultMsg})` : '';
+        return {
+            success: false,
+            error: `ZRA rejected sales data with result code ${saveSalesData.resultCd}${detail}`,
+            saveSalesData,
+        };
+    }
 
     if (saveSalesData.qrCodeUrl && saveSalesData.rcptNo) {
         try {
@@ -116,6 +158,8 @@ async function buildSaleUpdatesFromZraResponse(cisInvcNo, salesResponse) {
 
 module.exports = {
     generateInvoiceNumber,
+    getZraResultMessage,
+    isZraSaleAlreadyExistsResponse,
     normalizeZraSalesData,
     buildSaleUpdatesFromZraResponse,
     requiresComplianceRefresh,

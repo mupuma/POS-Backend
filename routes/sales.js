@@ -19,6 +19,7 @@ function getModels(req) {
 // Import the correct ZRA Integration Service
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice'); // Adjust path as needed
 const { buildSaleUpdatesFromZraResponse } = require('../services/sale/zraSaleResponse');
+const { writeZraSalesResponseLog } = require('../services/sale/zraFullResponseLogger');
 const { buildListQueryFilters } = require('../services/query/listFilters');
 const { sortRows } = require('../services/query/inMemorySort');
 // Deprecated random receipt generator (kept for reference)
@@ -129,89 +130,143 @@ async function requeueSaleSyncEvent(saleRecord) {
     return null;
 }
 
-function queueImmediateZraSubmission({
+async function processInitialZraSubmission({
     saleId,
     cisInvoiceNo,
     saleDataForZRA,
     saleItems,
     submittingUser,
+    timeoutMs,
+    source = 'sales.background_initial_submission',
 }) {
-    setImmediate(async () => {
-        const startedAt = Date.now();
-        const zraService = new ZRAIntegrationService();
-        try {
-            console.log('[sales] background ZRA submission started', { saleId });
-            const salesData = await zraService.transformToZRASalesData(
-                saleDataForZRA,
-                saleItems,
-                submittingUser,
-                cisInvoiceNo
-            );
-            const salesResponse = await zraService.sendSalesData(salesData);
+    const startedAt = Date.now();
+    const zraService = new ZRAIntegrationService();
+    try {
+        console.log('[sales] ZRA submission started', { saleId, source });
+        const salesData = await zraService.transformToZRASalesData(
+            saleDataForZRA,
+            saleItems,
+            submittingUser,
+            cisInvoiceNo
+        );
+        const salesResponse = await zraService.sendSalesData(salesData, { timeoutMs });
 
-            if (!salesResponse.success) {
-                const error = typeof salesResponse.error === 'string'
-                    ? salesResponse.error
-                    : JSON.stringify(salesResponse.error || 'Unknown ZRA error');
-                await sale.update({
-                    zra_error: error,
-                    next_retry_at: new Date(Date.now() + 30 * 1000),
-                }, { where: { id: saleId } });
-                console.error('[sales] background ZRA submission failed', {
-                    saleId,
-                    durationMs: Date.now() - startedAt,
-                    error,
-                });
-                return;
-            }
-
-            const zraResult = await buildSaleUpdatesFromZraResponse(
+        if (!salesResponse.success) {
+            const error = typeof salesResponse.error === 'string'
+                ? salesResponse.error
+                : JSON.stringify(salesResponse.error || 'Unknown ZRA error');
+            writeZraSalesResponseLog({
+                source,
+                logKind: 'current',
+                saleId,
                 cisInvoiceNo,
-                salesResponse
-            );
-            if (!zraResult.success) {
-                await sale.update({
-                    zra_error: zraResult.error,
-                    next_retry_at: new Date(Date.now() + 30 * 1000),
-                }, { where: { id: saleId } });
-                return;
-            }
-
-            await sale.update(zraResult.updates, { where: { id: saleId } });
-            console.log('[sales] background ZRA submission completed', {
+                outcome: 'zra_sales_failed',
+                error,
+                fullResponse: salesResponse,
+            });
+            await sale.update({
+                zra_error: error,
+                next_retry_at: new Date(Date.now() + 30 * 1000),
+            }, { where: { id: saleId } });
+            console.error('[sales] ZRA submission failed', {
                 saleId,
                 durationMs: Date.now() - startedAt,
-                qrReady: !!zraResult.updates.qrfilepath,
+                error,
             });
-
-            // ZRA stock endpoints must follow a successful sales registration,
-            // but they must never delay the cashier or receipt response.
-            void processStockEndpointsInBackground(
-                saleId,
-                saleDataForZRA,
-                saleItems,
-                submittingUser,
-                zraService
-            );
-        } catch (error) {
-            const message = error?.message || String(error);
-            console.error('[sales] background ZRA integration error', {
-                saleId,
-                durationMs: Date.now() - startedAt,
-                error: message,
-            });
-            try {
-                await sale.update({
-                    zra_error: message,
-                    next_retry_at: new Date(Date.now() + 30 * 1000),
-                }, { where: { id: saleId } });
-            } catch (updateError) {
-                console.error('[sales] could not persist ZRA background error', {
-                    saleId,
-                    error: updateError?.message || String(updateError),
-                });
-            }
+            return { success: false, error };
         }
+
+        const zraResult = await buildSaleUpdatesFromZraResponse(
+            cisInvoiceNo,
+            salesResponse
+        );
+        if (!zraResult.success) {
+            writeZraSalesResponseLog({
+                source,
+                logKind: 'current',
+                saleId,
+                cisInvoiceNo,
+                outcome: 'zra_sales_missing_required_data',
+                error: zraResult.error,
+                normalizedResponse: zraResult.saveSalesData || null,
+                fullResponse: salesResponse,
+            });
+            await sale.update({
+                zra_error: zraResult.error,
+                next_retry_at: new Date(Date.now() + 30 * 1000),
+            }, { where: { id: saleId } });
+            return { success: false, error: zraResult.error };
+        }
+
+        writeZraSalesResponseLog({
+            source,
+            logKind: 'current',
+            saleId,
+            cisInvoiceNo,
+            outcome: salesResponse.sdcRecovery?.found
+                ? 'zra_sales_recovered_from_sdc_sqlite'
+                : 'zra_sales_sent',
+            normalizedResponse: zraResult.saveSalesData || null,
+            fullResponse: salesResponse,
+        });
+        await sale.update(zraResult.updates, { where: { id: saleId } });
+        console.log('[sales] ZRA submission completed', {
+            saleId,
+            source,
+            durationMs: Date.now() - startedAt,
+            qrReady: !!zraResult.updates.qrfilepath,
+        });
+
+        // ZRA stock endpoints must follow a successful sales registration,
+        // but they must never delay the cashier or receipt response.
+        void processStockEndpointsInBackground(
+            saleId,
+            saleDataForZRA,
+            saleItems,
+            submittingUser,
+            zraService
+        );
+        return { success: true, updates: zraResult.updates, recovered: !!salesResponse.sdcRecovery?.found };
+    } catch (error) {
+        const message = error?.message || String(error);
+        writeZraSalesResponseLog({
+            source,
+            logKind: 'current',
+            saleId,
+            cisInvoiceNo,
+            outcome: 'zra_sales_exception',
+            error: message,
+            fullResponse: error,
+        });
+        console.error('[sales] ZRA integration error', {
+            saleId,
+            source,
+            durationMs: Date.now() - startedAt,
+            error: message,
+        });
+        try {
+            await sale.update({
+                zra_error: message,
+                next_retry_at: new Date(Date.now() + 30 * 1000),
+            }, { where: { id: saleId } });
+        } catch (updateError) {
+            console.error('[sales] could not persist ZRA error', {
+                saleId,
+                error: updateError?.message || String(updateError),
+            });
+        }
+        return { success: false, error: message };
+    }
+}
+
+function queueImmediateZraSubmission(args) {
+    setImmediate(() => {
+        processInitialZraSubmission(args).catch(error => {
+            console.error('[sales] queued ZRA submission failed unexpectedly', {
+                saleId: args.saleId,
+                error: error?.message || String(error),
+            });
+        });
     });
 }
 
