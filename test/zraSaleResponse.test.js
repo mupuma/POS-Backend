@@ -10,7 +10,11 @@ const {
 } = require('../services/sale/zraSaleResponse');
 const { normalizeZraStatusForSync } = require('../services/sync/enrichDayEndPayload');
 const ZRAIntegrationService = require('../services/sale/generateSmartInvoice');
-const { buildQrCodeUrl, mapSdcSaleRowToZraData } = require('../services/sale/sdcSqliteRecovery');
+const {
+  buildQrCodeUrl,
+  buildSdcSaleLookupSql,
+  mapSdcSaleRowToZraData,
+} = require('../services/sale/sdcSqliteRecovery');
 
 function readLastJsonLine(filePath) {
   const lines = fs.readFileSync(filePath, 'utf8').trim().split(/\r?\n/);
@@ -262,6 +266,13 @@ test('maps SDC SQLite receipt rows to local receipt fields', () => {
   }
 });
 
+test('looks up SDC SQLite recovery by invoice number only', () => {
+  const sql = buildSdcSaleLookupSql('INV1703-1472');
+
+  assert.match(sql, /s\.cis_invc_no = 'INV1703-1472'/);
+  assert.doesNotMatch(sql, /rcpt_pbct_dt AS TEXT\), 1, 8\)/);
+});
+
 test('uses recovered SDC SQLite data when ZRA duplicate response has fiscal fields in sidb', async () => {
   const previousSdcId = process.env.ZRA_SDC_ID;
   process.env.ZRA_SDC_ID = 'SDC0030003671';
@@ -302,6 +313,53 @@ test('uses recovered SDC SQLite data when ZRA duplicate response has fiscal fiel
     result.updates.qrcode_url,
     'https://siportal.zra.org.zm/indexInvoiceData?Data=1001688419066B7HUJCBBNHQ4OJ45'
   );
+
+  if (previousSdcId == null) {
+    delete process.env.ZRA_SDC_ID;
+  } else {
+    process.env.ZRA_SDC_ID = previousSdcId;
+  }
+});
+
+test('persists recovered SDC SQLite receipt fields even when sdc id is unavailable', async () => {
+  const previousSdcId = process.env.ZRA_SDC_ID;
+  delete process.env.ZRA_SDC_ID;
+
+  const response = {
+    success: true,
+    data: {
+      resultCd: '899',
+      resultMsg: 'This is an invalid device',
+    },
+    sdcRecovery: {
+      found: true,
+      source: 'sdc_sqlite_recovery',
+      reason: 'zra_post_failed',
+      data: {
+        rcptNo: '651',
+        sdcId: null,
+        rcptSign: 'B7HUJCBBNHQ4OJ45',
+        intrlData: 'BAYFRSHYOKUSJF53MGZEWRIW7Y',
+        qrCodeUrl: buildQrCodeUrl({
+          tpin: '1001688419',
+          bhfId: '022',
+          rcptSign: 'B7HUJCBBNHQ4OJ45',
+        }),
+        vsdcRcptPbctDate: '20260301104245',
+      },
+    },
+  };
+
+  const result = await buildSaleUpdatesFromZraResponse('INV1106-669', response);
+
+  assert.equal(result.success, true);
+  assert.equal(result.updates.zra_status, 'sent');
+  assert.equal(result.updates.receipt_no, '651');
+  assert.equal(result.updates.sdcid, null);
+  assert.equal(result.updates.receiptsig, 'B7HUJCBBNHQ4OJ45');
+  assert.equal(result.updates.intrldata, 'BAYFRSHYOKUSJF53MGZEWRIW7Y');
+  assert.equal(result.updates.vsdcrcpdate, '20260301104245');
+  assert.equal(result.updates.invoice_no, null);
 
   if (previousSdcId == null) {
     delete process.env.ZRA_SDC_ID;

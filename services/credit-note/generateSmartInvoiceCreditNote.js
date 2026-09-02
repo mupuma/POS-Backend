@@ -1,5 +1,12 @@
 const { store } = require('../../models');
 const axios = require('axios');
+const { fetchSdcSaleByCisInvoice } = require('../sale/sdcSqliteRecovery');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const positiveNumber = (value, fallback) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
 
 /**
  * ZRA Integration Service
@@ -396,6 +403,44 @@ class ZRACreditNoteIntegrationService {
         };
     }
 
+    async fetchCreditNoteFromSdcSqlite(salesData, { reason, timeoutMs } = {}) {
+        const recoveryWaitMs = positiveNumber(process.env.ZRA_SDC_RECOVERY_WAIT_MS, 8000);
+        const intervalMs = Math.max(
+            positiveNumber(process.env.ZRA_SDC_RECOVERY_INTERVAL_MS, 500),
+            100
+        );
+        const lookupTimeoutMs = Math.max(
+            positiveNumber(
+                process.env.ZRA_SDC_LOOKUP_TIMEOUT_MS,
+                Math.min(positiveNumber(timeoutMs, 2000), 2000)
+            ),
+            500
+        );
+        const deadline = Date.now() + recoveryWaitMs;
+        let recovery = null;
+        let attempts = 0;
+
+        do {
+            attempts += 1;
+            recovery = await fetchSdcSaleByCisInvoice(salesData?.cisInvcNo, {
+                tpin: salesData?.tpin,
+                bhfId: salesData?.bhfId,
+                timeoutMs: lookupTimeoutMs,
+            });
+            if (recovery.found || Date.now() >= deadline) {
+                break;
+            }
+            await sleep(Math.min(intervalMs, Math.max(deadline - Date.now(), 0)));
+        } while (Date.now() < deadline);
+
+        return {
+            source: 'sdc_sqlite_recovery',
+            reason,
+            ...recovery,
+            attempts,
+        };
+    }
+
     /**
      * Send sales data to ZRA
      * @param {object} salesData
@@ -429,18 +474,40 @@ class ZRACreditNoteIntegrationService {
             );
 
             console.log('ZRA Sales Response:', response.data);
+            const sdcRecovery = await this.fetchCreditNoteFromSdcSqlite(salesData, {
+                reason: 'zra_credit_note_api_response_sidb_lookup',
+                timeoutMs,
+            });
+            console.log('SDC SQLite lookup after ZRA credit note response:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
 
             return {
                 success: true,
                 data: response.data,
-                endpoint: 'saveSales'
+                endpoint: 'saveSales',
+                recoveredFrom: sdcRecovery?.found ? 'sdc_sqlite' : undefined,
+                sdcRecovery
             };
         } catch (error) {
             console.error('ZRA Sales API Error:', error.response?.data || error.message);
+            const sdcRecovery = await this.fetchCreditNoteFromSdcSqlite(salesData, {
+                reason: 'zra_credit_note_post_failed',
+                timeoutMs,
+            });
+            console.log('SDC SQLite recovery after ZRA credit note error:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
+            if (sdcRecovery?.found) {
+                return {
+                    success: true,
+                    data: null,
+                    endpoint: 'saveSales',
+                    recoveredFrom: 'sdc_sqlite',
+                    sdcRecovery
+                };
+            }
             return {
                 success: false,
                 error: error.response?.data || error.message,
-                endpoint: 'saveSales'
+                endpoint: 'saveSales',
+                sdcRecovery
             };
         }
     }

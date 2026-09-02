@@ -4,6 +4,12 @@ const { writeZraSalesRequestLog } = require('./zraFullResponseLogger');
 const { isZraSaleAlreadyExistsResponse, normalizeZraSalesData } = require('./zraSaleResponse');
 const { fetchSdcSaleByCisInvoice } = require('./sdcSqliteRecovery');
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const positiveNumber = (value, fallback) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 /**
  * ZRA Integration Service
  * Handles communication with ZRA VSDC system for sales transactions
@@ -580,15 +586,40 @@ class ZRAIntegrationService {
     }
 
     async fetchSaleFromSdcSqlite(salesData, { reason, timeoutMs } = {}) {
-        const recovery = await fetchSdcSaleByCisInvoice(salesData?.cisInvcNo, {
-            tpin: salesData?.tpin,
-            bhfId: salesData?.bhfId,
-            timeoutMs,
-        });
+        const recoveryWaitMs = positiveNumber(process.env.ZRA_SDC_RECOVERY_WAIT_MS, 8000);
+        const intervalMs = Math.max(
+            positiveNumber(process.env.ZRA_SDC_RECOVERY_INTERVAL_MS, 500),
+            100
+        );
+        const lookupTimeoutMs = Math.max(
+            positiveNumber(
+                process.env.ZRA_SDC_LOOKUP_TIMEOUT_MS,
+                Math.min(positiveNumber(timeoutMs, 2000), 2000)
+            ),
+            500
+        );
+        const deadline = Date.now() + recoveryWaitMs;
+        let recovery = null;
+        let attempts = 0;
+
+        do {
+            attempts += 1;
+            recovery = await fetchSdcSaleByCisInvoice(salesData?.cisInvcNo, {
+                tpin: salesData?.tpin,
+                bhfId: salesData?.bhfId,
+                timeoutMs: lookupTimeoutMs,
+            });
+            if (recovery.found || Date.now() >= deadline) {
+                break;
+            }
+            await sleep(Math.min(intervalMs, Math.max(deadline - Date.now(), 0)));
+        } while (Date.now() < deadline);
+
         return {
             source: 'sdc_sqlite_recovery',
             reason,
             ...recovery,
+            attempts,
         };
     }
 
@@ -630,7 +661,6 @@ class ZRAIntegrationService {
                 };
             }
 
-            console.log('Sending sales data to ZRA:', JSON.stringify(salesData, null, 2));
             requestLogPath = writeZraSalesRequestLog({
                 ...requestLogContext,
                 outcome: 'sent_to_zra',
@@ -641,8 +671,6 @@ class ZRAIntegrationService {
                 salesData,
                 {
                     headers,
-                    // A stalled ZRA socket must not occupy the immediate worker
-                    // indefinitely. The sale remains pending for the retry job.
                     timeout: Number(
                         timeoutMs || process.env.ZRA_SALES_TIMEOUT_MS || 8000
                     ),
@@ -655,31 +683,19 @@ class ZRAIntegrationService {
                 existingSaleLookup = await this.fetchExistingSaleDetails(salesData, { timeoutMs });
                 console.log('ZRA existing sale lookup:', existingSaleLookup.data || existingSaleLookup.error);
             }
-            let sdcRecovery = null;
-            if (isZraSaleAlreadyExistsResponse(response.data)) {
-                sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
-                    reason: 'zra_sale_already_exists',
-                    timeoutMs,
-                });
-                console.log('SDC SQLite recovery after duplicate response:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
-            } else if (this.isRejectedSalesResponse(response.data)) {
-                sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
-                    reason: 'zra_rejected_sales_response',
-                    timeoutMs,
-                });
-                console.log('SDC SQLite recovery after rejected ZRA response:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
-            } else if (this.isMissingSdcDataResponse(response.data)) {
-                sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
-                    reason: 'zra_success_missing_sdc_data',
-                    timeoutMs,
-                });
-                console.log('SDC SQLite recovery after missing SDC data:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
-            }
+            const sdcRecovery = await this.fetchSaleFromSdcSqlite(salesData, {
+                reason: this.isMissingSdcDataResponse(response.data)
+                    ? 'zra_success_missing_sdc_data'
+                    : (isZraSaleAlreadyExistsResponse(response.data) ? 'zra_sale_already_exists' : 'zra_api_response_sidb_lookup'),
+                timeoutMs,
+            });
+            console.log('SDC SQLite lookup after ZRA API response:', sdcRecovery.found ? sdcRecovery.data : sdcRecovery.error || 'not found');
 
             return {
                 success: true,
                 data: response.data,
                 endpoint: 'saveSales',
+                recoveredFrom: sdcRecovery?.found ? 'sdc_sqlite' : undefined,
                 existingSaleLookup,
                 sdcRecovery,
                 requestLogPath

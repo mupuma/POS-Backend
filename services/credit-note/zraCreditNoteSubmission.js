@@ -66,11 +66,20 @@ async function buildCreditNoteUpdatesFromZraResponse(cisInvcNo, salesResponse) {
   }
 
   const zraData = normalizeZraSalesData(salesResponse);
+  const hasRecoveredSdcData = Boolean(salesResponse?.sdcRecovery?.found);
   const receivedSdc = zraData.rcptNo != null
     && zraData.sdcId != null
-    && (zraData.resultCd == null || zraData.resultCd === '000');
+    && (zraData.resultCd == null || zraData.resultCd === '000' || hasRecoveredSdcData);
+  const hasRecoveredReceiptFields = hasRecoveredSdcData
+    && zraData.rcptNo != null
+    && Boolean(
+      zraData.rcptSign
+      || zraData.intrlData
+      || zraData.qrCodeUrl
+      || zraData.vsdcRcptPbctDate
+    );
 
-  if (!receivedSdc) {
+  if (!receivedSdc && !hasRecoveredReceiptFields) {
     const message = zraData.resultMsg
       ? `ZRA ${zraData.resultCd || ''}: ${zraData.resultMsg}`.trim()
       : 'ZRA did not return SDC data';

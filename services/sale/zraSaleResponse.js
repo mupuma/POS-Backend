@@ -124,7 +124,15 @@ async function buildSaleUpdatesFromZraResponse(cisInvcNo, salesResponse) {
     }
 
     const hasRequiredZraRefs = Boolean(saveSalesData.sdcId && saveSalesData.rcptNo);
-    if (!hasRequiredZraRefs) {
+    const hasRecoveredReceiptFields = hasRecoveredSdcData
+        && Boolean(saveSalesData.rcptNo)
+        && Boolean(
+            saveSalesData.rcptSign
+            || saveSalesData.intrlData
+            || saveSalesData.qrCodeUrl
+            || saveSalesData.vsdcRcptPbctDate
+        );
+    if (!hasRequiredZraRefs && !hasRecoveredReceiptFields) {
         const detail = saveSalesData.resultMsg ? ` (${saveSalesData.resultMsg})` : '';
         return {
             success: false,
@@ -133,7 +141,9 @@ async function buildSaleUpdatesFromZraResponse(cisInvcNo, salesResponse) {
         };
     }
 
-    const computedInvoiceNoRaw = generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo);
+    const computedInvoiceNoRaw = saveSalesData.sdcId
+        ? generateInvoiceNumber(saveSalesData.sdcId, saveSalesData.rcptNo)
+        : null;
 
     return {
         success: true,

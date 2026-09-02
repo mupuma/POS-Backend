@@ -259,17 +259,6 @@ async function processInitialZraSubmission({
     }
 }
 
-function queueImmediateZraSubmission(args) {
-    setImmediate(() => {
-        processInitialZraSubmission(args).catch(error => {
-            console.error('[sales] queued ZRA submission failed unexpectedly', {
-                saleId: args.saleId,
-                error: error?.message || String(error),
-            });
-        });
-    });
-}
-
 // Create new sale
 
 
@@ -573,15 +562,19 @@ router.post('/', auth, async (req, res) => {
         clearDashboardCache(req.user.store_id);
         console.log('Transaction committed successfully');
 
-        // The local transaction is the cashier-facing completion boundary.
-        // Start ZRA immediately, but never await remote I/O in this request.
-        queueImmediateZraSubmission({
+        // The local transaction is still the safety boundary, but the first
+        // cashier flow should attempt ZRA/SIDB immediately so receipt fields
+        // are available without waiting for the retry job.
+        const immediateZraResult = await processInitialZraSubmission({
             saleId: newSale.id,
             cisInvoiceNo,
             saleDataForZRA,
             saleItems,
             submittingUser: req.user,
+            timeoutMs: Number(process.env.ZRA_INITIAL_SALES_TIMEOUT_MS || process.env.ZRA_SALES_TIMEOUT_MS || 8000),
+            source: 'sales.initial_submission',
         });
+        await newSale.reload();
 
         // Build the response from values already committed in this request.
         // Re-querying every association here adds latency and is unnecessary;
@@ -645,6 +638,8 @@ router.post('/', auth, async (req, res) => {
                 zra_error: salePlain.zra_error || null,
                 receipt_no: salePlain.receipt_no || null,
                 invoice_no: salePlain.invoice_no || null,
+                immediate_zra_success: !!immediateZraResult?.success,
+                recovered_from_sidb: !!immediateZraResult?.recovered,
             },
         };
         setImmediate(() => {
@@ -659,17 +654,20 @@ router.post('/', auth, async (req, res) => {
         const processingTimeMs = Date.now() - requestStartedAt;
         res.setHeader('Server-Timing', `sale;dur=${processingTimeMs}`);
         res.status(201).json({
-            message: 'Sale completed locally. ZRA registration is processing in the background.',
+            message: salePlain.zra_status === 'sent'
+                ? 'Sale completed and ZRA receipt data captured.'
+                : 'Sale completed locally. ZRA registration is queued for retry.',
             sale: salePlain,
             processing_time_ms: processingTimeMs,
             zra_integration: {
                 success: salePlain.zra_status === 'sent',
                 queued: salePlain.zra_status !== 'sent',
+                recovered_from_sidb: !!immediateZraResult?.recovered,
                 sales_endpoint: {
                     success: salePlain.zra_status === 'sent',
                     message: salePlain.zra_status === 'sent'
                         ? 'Sales data submitted successfully to ZRA'
-                        : 'ZRA submission started in the background'
+                        : 'ZRA submission did not return receipt data in the first flow; retry remains queued'
                 }
             }
         });
